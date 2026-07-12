@@ -1,0 +1,48 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "mcp-gatehouse"
+version = "0.1.0"
+description = "Permission tiers, approval gates, and audit logging for MCP servers — the server is the gatekeeper."
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.10"
+authors = [{ name = "Nick George", email = "NicholasG.Jobs@gmail.com" }]
+keywords = [
+    "mcp",
+    "model-context-protocol",
+    "ai-agents",
+    "security",
+    "audit-log",
+    "permissions",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Libraries",
+    "Topic :: Security",
+]
+dependencies = ["mcp>=1.27,<2"]
+
+[project.scripts]
+mcp-gatehouse-demo = "mcp_gatehouse.demo:main"
+
+[project.urls]
+Homepage = "https://nickgeorgeai.com/mcp"
+Repository = "https://github.com/nickgeorgeseo/mcp-gatehouse"
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "anyio>=4"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/mcp_gatehouse"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

@@ -4,7 +4,7 @@
 
 ## Reporting a vulnerability
 
-Email **NicholasG.Jobs@gmail.com** with the details. You'll get a reply
+Email **nick@nickgeorgeai.com** with the details. You'll get a reply
 within 72 hours. Please don't open a public issue for anything exploitable —
 give me a chance to ship the fix first.
 

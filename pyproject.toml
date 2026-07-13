@@ -9,7 +9,7 @@ description = "Permission tiers, approval gates, and audit logging for MCP serve
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.10"
-authors = [{ name = "Nick George", email = "NicholasG.Jobs@gmail.com" }]
+authors = [{ name = "Nick George", email = "nick@nickgeorgeai.com" }]
 keywords = [
     "mcp",
     "model-context-protocol",

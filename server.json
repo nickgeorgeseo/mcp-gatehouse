@@ -2,7 +2,7 @@
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
   "name": "io.github.nickgeorgeseo/gatehouse",
   "title": "mcp-gatehouse",
-  "description": "Permission tiers, approval gates, and audit logging for MCP servers, enforced inside the server at the tool boundary. Ships a runnable order-desk demo: READ tools run freely, WRITE tools are audited with secret redaction, DESTRUCTIVE tools require human approval and fail closed.",
+  "description": "Permission tiers, approval gates, and audit logging for MCP servers - the server is the gatekeeper",
   "version": "0.1.0",
   "websiteUrl": "https://nickgeorgeai.com/mcp",
   "repository": {

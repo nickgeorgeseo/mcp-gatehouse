@@ -1,0 +1,24 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.nickgeorgeseo/gatehouse",
+  "title": "mcp-gatehouse",
+  "description": "Permission tiers, approval gates, and audit logging for MCP servers, enforced inside the server at the tool boundary. Ships a runnable order-desk demo: READ tools run freely, WRITE tools are audited with secret redaction, DESTRUCTIVE tools require human approval and fail closed.",
+  "version": "0.1.0",
+  "websiteUrl": "https://nickgeorgeai.com/mcp",
+  "repository": {
+    "url": "https://github.com/nickgeorgeseo/mcp-gatehouse",
+    "source": "github"
+  },
+  "packages": [
+    {
+      "registryType": "pypi",
+      "registryBaseUrl": "https://pypi.org",
+      "identifier": "mcp-gatehouse",
+      "version": "0.1.0",
+      "runtimeHint": "uvx",
+      "transport": {
+        "type": "stdio"
+      }
+    }
+  ]
+}

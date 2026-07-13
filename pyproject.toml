@@ -33,6 +33,8 @@ dependencies = ["mcp>=1.27,<2"]
 
 [project.scripts]
 mcp-gatehouse-demo = "mcp_gatehouse.demo:main"
+# Alias so `uvx mcp-gatehouse` / `pipx run mcp-gatehouse` resolve without --from.
+mcp-gatehouse = "mcp_gatehouse.demo:main"
 
 [project.urls]
 Homepage = "https://nickgeorgeai.com/mcp"

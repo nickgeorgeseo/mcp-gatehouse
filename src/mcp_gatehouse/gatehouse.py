@@ -15,6 +15,7 @@ import time
 from typing import Any, Callable, TypeVar
 
 from mcp.server.mcpserver import MCPServer
+from mcp.server.mcpserver.exceptions import ToolError
 from mcp.types import ToolAnnotations
 
 from .audit import AuditLog, NullAuditLog
@@ -23,9 +24,22 @@ from .policy import AccessTier, ApprovalRequest, Policy, redact_arguments
 F = TypeVar("F", bound=Callable[..., Any])
 
 
-class GateDenied(PermissionError):
-    """Raised when the policy blocks a call. FastMCP surfaces it to the
-    client as a tool error, so the model sees *why* it was refused."""
+class GateDenied(PermissionError, ToolError):
+    """Raised when the policy blocks a call, so the model sees *why* it was
+    refused.
+
+    Subclassing the SDK's ``ToolError`` is what makes that true. v2 sorts
+    tool exceptions into two buckets: a ``ToolError`` is an *anticipated*
+    failure, so its message reaches the model and the server logs it at
+    INFO; anything else is a crash, and the model gets only "Error
+    executing tool <name>" while the server logs a traceback at ERROR.
+
+    A denial is the most anticipated failure a gate has. Without this, a
+    policy working exactly as designed would withhold its reason from the
+    model and log an ERROR traceback on every refusal — noise that would
+    bury the real failures. ``PermissionError`` stays first in the bases so
+    existing ``except PermissionError`` handlers keep working.
+    """
 
 
 def _annotations_for(tier: AccessTier, title: str | None) -> ToolAnnotations:

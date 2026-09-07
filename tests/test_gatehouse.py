@@ -7,14 +7,14 @@ import io
 import json
 
 import pytest
-from mcp.server.fastmcp import FastMCP
-from mcp.shared.memory import create_connected_server_and_client_session
+from mcp import Client
+from mcp.server.mcpserver import MCPServer
 
 from mcp_gatehouse import AccessTier, AuditLog, Gatehouse, Policy
 
 
-def build_server(policy: Policy, log_stream: io.StringIO) -> FastMCP:
-    mcp = FastMCP("test-server")
+def build_server(policy: Policy, log_stream: io.StringIO) -> MCPServer:
+    mcp = MCPServer("test-server")
     gk = Gatehouse(mcp, policy=policy, audit=AuditLog(stream=log_stream))
 
     @gk.tool(tier=AccessTier.READ)
@@ -50,9 +50,9 @@ def events(stream: io.StringIO) -> list[dict]:
 async def test_read_tool_runs_and_audits():
     log = io.StringIO()
     server = build_server(Policy(), log)
-    async with create_connected_server_and_client_session(server) as session:
+    async with Client(server) as session:
         result = await session.call_tool("lookup", {"order_id": "4417"})
-    assert result.isError is False
+    assert result.is_error is False
     assert "order 4417" in result.content[0].text
     (event,) = events(log)
     assert event["tool"] == "lookup"
@@ -66,9 +66,9 @@ async def test_read_tool_runs_and_audits():
 async def test_destructive_fails_closed_without_approver():
     log = io.StringIO()
     server = build_server(Policy(), log)  # default: DESTRUCTIVE needs approval
-    async with create_connected_server_and_client_session(server) as session:
+    async with Client(server) as session:
         result = await session.call_tool("cancel", {"order_id": "4417"})
-    assert result.isError is True
+    assert result.is_error is True
     assert "fails closed" in result.content[0].text
     (event,) = events(log)
     assert event["outcome"] == "denied"
@@ -86,11 +86,11 @@ async def test_approver_allows_and_refuses():
 
     policy = Policy(approver=approver)
     server = build_server(policy, log)
-    async with create_connected_server_and_client_session(server) as session:
+    async with Client(server) as session:
         ok = await session.call_tool("cancel", {"order_id": "yes-please"})
         refused = await session.call_tool("cancel", {"order_id": "no-thanks"})
-    assert ok.isError is False
-    assert refused.isError is True
+    assert ok.is_error is False
+    assert refused.is_error is True
     assert "refused" in refused.content[0].text
     assert seen == ["cancel", "cancel"]
     outcomes = [e["outcome"] for e in events(log)]
@@ -105,18 +105,18 @@ async def test_async_approver_supported():
         return True
 
     server = build_server(Policy(approver=approver), log)
-    async with create_connected_server_and_client_session(server) as session:
+    async with Client(server) as session:
         result = await session.call_tool("cancel", {"order_id": "4417"})
-    assert result.isError is False
+    assert result.is_error is False
 
 
 @pytest.mark.anyio
 async def test_denylist_blocks_any_tier():
     log = io.StringIO()
     server = build_server(Policy(deny=frozenset({"lookup"})), log)
-    async with create_connected_server_and_client_session(server) as session:
+    async with Client(server) as session:
         result = await session.call_tool("lookup", {"order_id": "4417"})
-    assert result.isError is True
+    assert result.is_error is True
     assert "blocked by policy" in result.content[0].text
     (event,) = events(log)
     assert event["reason"] == "denylist"
@@ -126,7 +126,7 @@ async def test_denylist_blocks_any_tier():
 async def test_secrets_never_reach_the_log():
     log = io.StringIO()
     server = build_server(Policy(), log)
-    async with create_connected_server_and_client_session(server) as session:
+    async with Client(server) as session:
         await session.call_tool(
             "update_note",
             {"order_id": "4417", "note": "call back", "api_key": "sk-live-hunter2"},
@@ -140,9 +140,9 @@ async def test_secrets_never_reach_the_log():
 async def test_tool_errors_are_audited_and_surfaced():
     log = io.StringIO()
     server = build_server(Policy(), log)
-    async with create_connected_server_and_client_session(server) as session:
+    async with Client(server) as session:
         result = await session.call_tool("broken", {})
-    assert result.isError is True
+    assert result.is_error is True
     (event,) = events(log)
     assert event["outcome"] == "error"
     # only the exception TYPE is logged — messages can embed secrets
@@ -154,29 +154,29 @@ async def test_tool_errors_are_audited_and_surfaced():
 async def test_annotations_reflect_tiers():
     log = io.StringIO()
     server = build_server(Policy(), log)
-    async with create_connected_server_and_client_session(server) as session:
+    async with Client(server) as session:
         tools = {t.name: t for t in (await session.list_tools()).tools}
-    assert tools["lookup"].annotations.readOnlyHint is True
-    assert tools["lookup"].annotations.destructiveHint is False
-    assert tools["cancel"].annotations.destructiveHint is True
-    assert tools["update_note"].annotations.readOnlyHint is False
-    assert tools["update_note"].annotations.destructiveHint is False
+    assert tools["lookup"].annotations.read_only_hint is True
+    assert tools["lookup"].annotations.destructive_hint is False
+    assert tools["cancel"].annotations.destructive_hint is True
+    assert tools["update_note"].annotations.read_only_hint is False
+    assert tools["update_note"].annotations.destructive_hint is False
 
 
 @pytest.mark.anyio
 async def test_input_schema_survives_the_wrapper():
-    """FastMCP must still see the real signature through the guard."""
+    """MCPServer must still see the real signature through the guard."""
     log = io.StringIO()
     server = build_server(Policy(), log)
-    async with create_connected_server_and_client_session(server) as session:
+    async with Client(server) as session:
         tools = {t.name: t for t in (await session.list_tools()).tools}
-    props = tools["update_note"].inputSchema["properties"]
+    props = tools["update_note"].input_schema["properties"]
     assert set(props) == {"order_id", "note", "api_key"}
-    assert tools["update_note"].inputSchema["required"] == ["order_id", "note"]
+    assert tools["update_note"].input_schema["required"] == ["order_id", "note"]
 
 
 def test_annotations_kwarg_is_rejected():
-    gk = Gatehouse(FastMCP("x"))
+    gk = Gatehouse(MCPServer("x"))
     with pytest.raises(ValueError, match="derived from the tier"):
 
         @gk.tool(tier=AccessTier.READ, annotations={"readOnlyHint": False})

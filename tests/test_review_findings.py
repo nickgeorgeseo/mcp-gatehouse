@@ -11,8 +11,8 @@ import io
 import json
 
 import pytest
-from mcp.server.fastmcp import Context, FastMCP
-from mcp.shared.memory import create_connected_server_and_client_session
+from mcp import Client
+from mcp.server.mcpserver import Context, MCPServer
 from pydantic import BaseModel
 
 from mcp_gatehouse import AccessTier, AuditLog, Gatehouse, Policy
@@ -71,7 +71,7 @@ def test_tuples_and_sets_are_recursed():
 @pytest.mark.anyio
 async def test_model_argument_secret_never_reaches_log_end_to_end():
     log = io.StringIO()
-    mcp = FastMCP("t")
+    mcp = MCPServer("t")
     gk = Gatehouse(mcp, policy=Policy(), audit=AuditLog(stream=log))
 
     @gk.tool(tier=AccessTier.WRITE)
@@ -79,11 +79,11 @@ async def test_model_argument_secret_never_reaches_log_end_to_end():
         """Connect somewhere."""
         return "ok"
 
-    async with create_connected_server_and_client_session(mcp) as session:
+    async with Client(mcp) as session:
         result = await session.call_tool(
             "connect", {"creds": {"username": "u", "password": "hunter2"}}
         )
-    assert result.isError is False
+    assert result.is_error is False
     assert "hunter2" not in log.getvalue()
 
 
@@ -92,7 +92,7 @@ async def test_model_argument_secret_never_reaches_log_end_to_end():
 @pytest.mark.anyio
 async def test_exception_text_stays_out_of_the_audit_log():
     log = io.StringIO()
-    mcp = FastMCP("t")
+    mcp = MCPServer("t")
     gk = Gatehouse(mcp, policy=Policy(), audit=AuditLog(stream=log))
 
     @gk.tool(tier=AccessTier.READ)
@@ -100,7 +100,7 @@ async def test_exception_text_stays_out_of_the_audit_log():
         """Validate a key."""
         raise ValueError(f"invalid api key: {api_key!r}")
 
-    async with create_connected_server_and_client_session(mcp) as session:
+    async with Client(mcp) as session:
         await session.call_tool("check", {"api_key": "sk-live-SECRET"})
     (event,) = events(log)
     assert event["outcome"] == "error"
@@ -122,7 +122,7 @@ def test_unicode_line_separators_cannot_forge_records():
     assert event["tool"] == "real"
 
 
-# --- Finding 5: FastMCP's injected Context stays out of the audit trail ---
+# --- Finding 5: MCPServer's injected Context stays out of the audit trail ---
 
 @pytest.mark.anyio
 async def test_injected_context_not_recorded_or_shown_to_approver():
@@ -133,7 +133,7 @@ async def test_injected_context_not_recorded_or_shown_to_approver():
         seen.append(request.arguments)
         return True
 
-    mcp = FastMCP("t")
+    mcp = MCPServer("t")
     gk = Gatehouse(mcp, policy=Policy(approver=approver), audit=AuditLog(stream=log))
 
     @gk.tool(tier=AccessTier.DESTRUCTIVE)
@@ -141,9 +141,9 @@ async def test_injected_context_not_recorded_or_shown_to_approver():
         """Wipe a target."""
         return f"wiped {target}"
 
-    async with create_connected_server_and_client_session(mcp) as session:
+    async with Client(mcp) as session:
         result = await session.call_tool("wipe", {"target": "db"})
-    assert result.isError is False
+    assert result.is_error is False
     (event,) = events(log)
     assert event["arguments"] == {"target": "db"}
     assert seen == [{"target": "db"}]
@@ -152,7 +152,7 @@ async def test_injected_context_not_recorded_or_shown_to_approver():
 # --- Finding 6: @tool without parentheses must fail loudly ---
 
 def test_bare_decorator_raises():
-    gk = Gatehouse(FastMCP("t"))
+    gk = Gatehouse(MCPServer("t"))
     with pytest.raises(TypeError, match="parentheses"):
 
         @gk.tool

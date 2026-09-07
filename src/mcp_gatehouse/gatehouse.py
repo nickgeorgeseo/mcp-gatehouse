@@ -1,6 +1,6 @@
-"""The Gatehouse: policy enforcement + audit logging around FastMCP tools.
+"""The Gatehouse: policy enforcement + audit logging around MCPServer tools.
 
-Wrap a ``FastMCP`` server, register tools through the gatekeeper instead of
+Wrap an ``MCPServer``, register tools through the gatekeeper instead of
 directly, and every call gets: denylist enforcement, approval gates on the
 tiers you choose, redacted audit logging, and spec ``ToolAnnotations``
 (``readOnlyHint`` / ``destructiveHint``) derived from the tier — so MCP
@@ -14,7 +14,7 @@ import inspect
 import time
 from typing import Any, Callable, TypeVar
 
-from mcp.server.fastmcp import FastMCP
+from mcp.server.mcpserver import MCPServer
 from mcp.types import ToolAnnotations
 
 from .audit import AuditLog, NullAuditLog
@@ -37,11 +37,11 @@ def _annotations_for(tier: AccessTier, title: str | None) -> ToolAnnotations:
 
 
 class Gatehouse:
-    """Policy-enforcing façade over a :class:`FastMCP` server.
+    """Policy-enforcing façade over an :class:`MCPServer`.
 
     Usage::
 
-        mcp = FastMCP("orders")
+        mcp = MCPServer("orders")
         gk = Gatehouse(mcp, policy=Policy(...), audit=AuditLog(path="audit.jsonl"))
 
         @gk.tool(tier=AccessTier.READ)
@@ -53,7 +53,7 @@ class Gatehouse:
 
     def __init__(
         self,
-        server: FastMCP,
+        server: MCPServer,
         policy: Policy | None = None,
         audit: AuditLog | None = None,
     ) -> None:
@@ -68,11 +68,11 @@ class Gatehouse:
         name: str | None = None,
         title: str | None = None,
         description: str | None = None,
-        **fastmcp_kwargs: Any,
+        **tool_kwargs: Any,
     ) -> Callable[[F], F]:
         """Register a tool on the wrapped server, with enforcement.
 
-        Accepts any extra keyword arguments ``FastMCP.tool`` understands
+        Accepts any extra keyword arguments ``MCPServer.tool`` understands
         and forwards them untouched. ``annotations`` is derived from the
         tier and cannot be overridden — the hints must stay honest.
         """
@@ -80,7 +80,7 @@ class Gatehouse:
             raise TypeError(
                 "use @gatehouse.tool(...) with parentheses, not @gatehouse.tool"
             )
-        if "annotations" in fastmcp_kwargs:
+        if "annotations" in tool_kwargs:
             raise ValueError(
                 "annotations are derived from the tier; set tier=... instead"
             )
@@ -93,7 +93,7 @@ class Gatehouse:
                 title=title,
                 description=description,
                 annotations=_annotations_for(tier, title),
-                **fastmcp_kwargs,
+                **tool_kwargs,
             )(guarded)
             return fn
 
@@ -162,13 +162,13 @@ class Gatehouse:
             )
             return result
 
-        # FastMCP injects its Context object as a regular parameter. It is
+        # MCPServer injects its Context object as a regular parameter. It is
         # not a model-supplied argument, so it stays out of the audit trail
         # and out of what the approver sees.
         ctx_param = _find_context_parameter(fn)
 
         # functools.wraps preserves the signature (via __wrapped__), so
-        # FastMCP still generates the tool's input schema from the real
+        # MCPServer still generates the tool's input schema from the real
         # function — the guard is invisible to schema generation.
         @functools.wraps(fn)
         async def guarded(*args: Any, **kwargs: Any) -> Any:
@@ -183,9 +183,9 @@ class Gatehouse:
 
 
 def _find_context_parameter(fn: Callable[..., Any]) -> str | None:
-    """Name of the parameter FastMCP will inject its ``Context`` into."""
+    """Name of the parameter MCPServer will inject its ``Context`` into."""
     try:
-        from mcp.server.fastmcp import Context
+        from mcp.server.mcpserver import Context
 
         hints = inspect.get_annotations(fn, eval_str=True)
     except Exception:

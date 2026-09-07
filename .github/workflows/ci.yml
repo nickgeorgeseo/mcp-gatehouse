@@ -9,12 +9,24 @@ jobs:
   test:
     runs-on: ubuntu-latest
     strategy:
+      fail-fast: false
       matrix:
         python-version: ["3.10", "3.11", "3.12", "3.13"]
+        # "latest" resolves whatever the pin currently allows, so a new SDK
+        # release shows up here rather than in someone's server.
+        mcp-version: ["latest"]
+        include:
+          # Pin the floor of the supported range too: a change that quietly
+          # needs a newer v2 than the pin claims should fail the build.
+          - python-version: "3.12"
+            mcp-version: "2.0.0"
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
       - run: pip install -e ".[dev]"
+      - if: matrix.mcp-version != 'latest'
+        run: pip install "mcp==${{ matrix.mcp-version }}"
+      - run: pip show mcp | grep -i version
       - run: pytest -q

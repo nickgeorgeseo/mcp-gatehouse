@@ -36,10 +36,10 @@ pip install mcp-gatehouse
 ## Quickstart
 
 ```python
-from mcp.server.fastmcp import FastMCP
+from mcp.server.mcpserver import MCPServer
 from mcp_gatehouse import AccessTier, AuditLog, Gatehouse, Policy
 
-mcp = FastMCP("order-desk")
+mcp = MCPServer("order-desk")
 gatehouse = Gatehouse(
     mcp,
     policy=Policy(approver=lambda req: input(f"allow {req.tool}? [y/N] ") == "y"),
@@ -59,7 +59,7 @@ def cancel_order(order_id: str) -> str:
 mcp.run()
 ```
 
-That's the whole integration: build your `FastMCP` server exactly as the
+That's the whole integration: build your `MCPServer` exactly as the
 SDK docs show, but register tools through the gatehouse. Schema generation,
 transports, and everything else work unchanged — the guard preserves the
 function's signature.
@@ -118,10 +118,22 @@ the same server as a copyable template.
 ## Compatibility
 
 Targets the official [`mcp` Python SDK](https://github.com/modelcontextprotocol/python-sdk)
-v1.x (`mcp>=1.27,<2`) and Python 3.10+. When SDK v2 ships for the
-2026-07-28 spec revision, a v2-compatible release will follow — the
-public API here (`Gatehouse`, `Policy`, `AuditLog`, `AccessTier`) will
-not change.
+v2.x (`mcp>=2,<3`) and Python 3.10+.
+
+| `mcp-gatehouse` | SDK | Server class |
+|---|---|---|
+| `0.2.x` | `mcp>=2,<3` | `MCPServer` |
+| `0.1.x` | `mcp>=1.27,<2` | `FastMCP` |
+
+The public API (`Gatehouse`, `Policy`, `AuditLog`, `AccessTier`) is
+unchanged across that line, as promised. Porting a v1 server is two
+import edits — `FastMCP` became `MCPServer` and moved to
+`mcp.server.mcpserver`; see the SDK's
+[migration guide](https://py.sdk.modelcontextprotocol.io/v2/migration/).
+
+Staying on SDK v1 needs no action: `0.1.x` pins `mcp<2`, so pip keeps
+resolving it. That line is closed to features but still gets security
+fixes.
 
 ## Who built this
 

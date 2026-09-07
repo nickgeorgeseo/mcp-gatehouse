@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "mcp-gatehouse"
-version = "0.1.0"
+version = "0.2.0"
 description = "Permission tiers, approval gates, and audit logging for MCP servers — the server is the gatekeeper."
 readme = "README.md"
 license = "MIT"
@@ -29,7 +29,7 @@ classifiers = [
     "Topic :: Software Development :: Libraries",
     "Topic :: Security",
 ]
-dependencies = ["mcp>=1.27,<2"]
+dependencies = ["mcp>=2,<3"]
 
 [project.scripts]
 mcp-gatehouse-demo = "mcp_gatehouse.demo:main"

@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import sys
 
-from mcp.server.fastmcp import FastMCP
+from mcp.server.mcpserver import MCPServer
 
 from mcp_gatehouse import AccessTier, ApprovalRequest, AuditLog, Gatehouse, Policy
 
@@ -49,7 +49,7 @@ def terminal_approver(request: ApprovalRequest) -> bool:
         return False
 
 
-mcp = FastMCP("gatehouse-order-desk")
+mcp = MCPServer("gatehouse-order-desk")
 gatehouse = Gatehouse(
     mcp,
     policy=Policy(approver=terminal_approver),

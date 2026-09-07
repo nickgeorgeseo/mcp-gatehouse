@@ -27,4 +27,4 @@ __all__ = [
     "redact_arguments",
 ]
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"

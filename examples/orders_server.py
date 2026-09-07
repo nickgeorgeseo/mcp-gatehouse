@@ -9,7 +9,7 @@ the controlling terminal (and fail closed when there isn't one).
 
 from __future__ import annotations
 
-from mcp.server.fastmcp import FastMCP
+from mcp.server.mcpserver import MCPServer
 
 from mcp_gatehouse import AccessTier, AuditLog, Gatehouse, Policy
 from mcp_gatehouse.demo import terminal_approver
@@ -20,7 +20,7 @@ ORDERS = {
     "4418": {"customer": "Piedmont Supply", "status": "picking", "notes": []},
 }
 
-mcp = FastMCP("order-desk")
+mcp = MCPServer("order-desk")
 gatehouse = Gatehouse(
     mcp,
     policy=Policy(approver=terminal_approver),

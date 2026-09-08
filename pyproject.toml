@@ -1,5 +1,8 @@
 [build-system]
-requires = ["hatchling"]
+# Pinned: an unpinned backend silently changed the emitted
+# Metadata-Version between 0.1.0 (2.4) and 0.2.0 (2.5) with no change
+# here, which older twine then rejected. Builds should be reproducible.
+requires = ["hatchling>=1.32,<2"]
 build-backend = "hatchling.build"
 
 [project]
@@ -41,7 +44,14 @@ Homepage = "https://nickgeorgeai.com/mcp"
 Repository = "https://github.com/nickgeorgeseo/mcp-gatehouse"
 
 [project.optional-dependencies]
-dev = ["pytest>=8", "anyio>=4"]
+dev = [
+    "pytest>=8",
+    "anyio>=4",
+    "build",
+    # <7 monkeypatches packaging to cap Metadata-Version at 2.4, which
+    # rejects the 2.5 metadata hatchling emits.
+    "twine>=7",
+]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/mcp_gatehouse"]

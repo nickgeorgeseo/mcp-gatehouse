@@ -1,0 +1,84 @@
+name: Release
+
+# Tag-triggered release. The order is load-bearing: the MCP registry fetches
+# the exact version from PyPI and checks its README for the `mcp-name:` token,
+# so PyPI has to have the release before the registry entry can point at it.
+on:
+  push:
+    tags: ["v*"]
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      # OIDC, for BOTH PyPI trusted publishing and `mcp-publisher login`.
+      # No long-lived tokens are stored for either.
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      # A tag that disagrees with the metadata would publish a version nobody
+      # asked for, and the registry step would then point at the wrong one.
+      # Cheap to check, miserable to unpick after the fact.
+      - name: Tag must match pyproject and server.json
+        run: |
+          TAG="${GITHUB_REF#refs/tags/v}"
+          PYPROJECT=$(python -c "import tomllib,pathlib;print(tomllib.loads(pathlib.Path('pyproject.toml').read_text())['project']['version'])")
+          SERVER=$(python -c "import json,pathlib;d=json.loads(pathlib.Path('server.json').read_text());print(d['version'])")
+          SERVER_PKG=$(python -c "import json,pathlib;d=json.loads(pathlib.Path('server.json').read_text());print(d['packages'][0]['version'])")
+          echo "tag=$TAG pyproject=$PYPROJECT server.json=$SERVER server.json/packages=$SERVER_PKG"
+          for GOT in "$PYPROJECT" "$SERVER" "$SERVER_PKG"; do
+            if [ "$GOT" != "$TAG" ]; then
+              echo "::error::version mismatch: tag v$TAG but found $GOT"
+              exit 1
+            fi
+          done
+
+      - name: Install build tooling
+        # twine <7 monkeypatches packaging's metadata-version allowlist and caps
+        # it at 2.4, which rejects the 2.5 metadata current hatchling emits.
+        run: pip install "build" "twine>=7"
+
+      - run: pip install -e ".[dev]"
+      - run: pytest -q
+
+      - name: Build
+        run: python -m build
+
+      - name: Check artifacts
+        run: twine check dist/*
+
+      # Trusted publishing: no API token. Requires a one-time publisher config
+      # at https://pypi.org/manage/project/mcp-gatehouse/settings/publishing/
+      # for this repo + workflow + the `release` environment.
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@v1.14.2
+
+      - name: Install mcp-publisher
+        run: |
+          curl -L "https://github.com/modelcontextprotocol/registry/releases/latest/download/mcp-publisher_$(uname -s | tr '[:upper:]' '[:lower:]')_$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/').tar.gz" | tar xz mcp-publisher
+
+      # PyPI's API is read-through-cache; the registry's fetch of the brand-new
+      # version can 404 for a few seconds after upload. Retry rather than fail
+      # a release that actually succeeded.
+      - name: Wait for the new version to appear on PyPI
+        run: |
+          VERSION="${GITHUB_REF#refs/tags/v}"
+          for i in $(seq 1 30); do
+            CODE=$(curl -s -o /dev/null -w "%{http_code}" "https://pypi.org/pypi/mcp-gatehouse/$VERSION/json")
+            [ "$CODE" = "200" ] && echo "mcp-gatehouse $VERSION is on PyPI" && exit 0
+            echo "attempt $i: HTTP $CODE, waiting..."
+            sleep 10
+          done
+          echo "::error::mcp-gatehouse $VERSION never appeared on PyPI"
+          exit 1
+
+      - name: Publish to the MCP registry
+        run: |
+          ./mcp-publisher login github-oidc
+          ./mcp-publisher publish

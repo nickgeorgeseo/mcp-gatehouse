@@ -58,6 +58,16 @@ jobs:
       # for this repo + workflow + the `release` environment.
       - name: Publish to PyPI
         uses: pypa/gh-action-pypi-publish@v1.14.2
+        with:
+          # Makes the job re-runnable. A release is two publishes, and the
+          # registry one can fail on its own (transient network, a registry
+          # blip) after PyPI has already succeeded. Without this, re-running
+          # dies on the upload that already worked and the registry never
+          # catches up. PyPI refuses to overwrite an existing file either
+          # way, so this skips a no-op rather than papering over a bad
+          # upload — and the tag/version guard above already blocks the
+          # forgot-to-bump case that would otherwise reach here.
+          skip-existing: true
 
       - name: Install mcp-publisher
         run: |

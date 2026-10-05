@@ -7,7 +7,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "mcp-gatehouse"
-version = "0.2.0"
+version = "0.3.0"
 description = "Permission tiers, approval gates, and audit logging for MCP servers — the server is the gatekeeper."
 readme = "README.md"
 license = "MIT"
@@ -29,6 +29,8 @@ classifiers = [
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Typing :: Typed",
     "Topic :: Software Development :: Libraries",
     "Topic :: Security",
 ]

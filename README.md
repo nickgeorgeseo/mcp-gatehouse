@@ -30,20 +30,20 @@ pip install mcp-gatehouse
 | **Permission tiers** | Every tool is declared `READ`, `WRITE`, or `DESTRUCTIVE` — and the tier also emits honest spec `ToolAnnotations` (`readOnlyHint` / `destructiveHint`), which the wrapper won't let you override to lie. |
 | **Approval gates** | Tiers you choose require a sign-off before the tool runs. Your approver is any callable — a terminal prompt, a Slack ping, a ticket. **Fails closed:** a gated tool with no approver configured is denied, not waved through. |
 | **Audit log** | Append-only JSONL, one line per call — allowed, denied, or failed — with UTC timestamps and durations. The answer to "what did the AI actually do?" six months later. |
-| **Redaction** | Argument keys you name (`api_key`, `password`, `token`, … by default) are masked before they reach the log *or* the approver. |
+| **Redaction** | Argument keys you name (`api_key`, `password`, `token`, `client_secret`, … by default) are masked before they reach the log *or* the approver — however they're spelled: `apiKey`, `API-Key` and `api_key` are the same key. |
 | **Denylist** | Block a tool outright, whatever its tier. |
 
 ## Quickstart
 
 ```python
 from mcp.server.mcpserver import MCPServer
-from mcp_gatehouse import AccessTier, AuditLog, Gatehouse, Policy
+from mcp_gatehouse import AccessTier, AuditLog, Gatehouse, Policy, terminal_approver
 
 mcp = MCPServer("order-desk")
 gatehouse = Gatehouse(
     mcp,
-    policy=Policy(approver=lambda req: input(f"allow {req.tool}? [y/N] ") == "y"),
-    audit=AuditLog(path="audit.jsonl"),
+    policy=Policy(approver=terminal_approver),
+    audit=AuditLog(path="~/order-desk/audit.jsonl"),
 )
 
 @gatehouse.tool(tier=AccessTier.READ)
@@ -60,15 +60,32 @@ mcp.run()
 ```
 
 That's the whole integration: build your `MCPServer` exactly as the
-SDK docs show, but register tools through the gatehouse. Schema generation,
+SDK docs show, but register tools through the gatehouse. Schema generation
+(including `Annotated[..., Field(description=...)]` parameter docs),
 transports, and everything else work unchanged — the guard preserves the
-function's signature.
+function's signature. Sync tools still run in a worker thread, exactly as
+they would on a bare `MCPServer`.
+
+`terminal_approver` asks on the controlling terminal (`/dev/tty`), never
+stdin — over stdio, stdin *is* the protocol pipe, so a plain `input()`
+approver would corrupt it. An approver is any callable, sync or async,
+that takes an `ApprovalRequest` and returns `True` to allow; sync ones run
+in a worker thread, so a human taking their time doesn't stall other calls.
+If the approver raises (Slack down, ticket API timing out), the call is
+denied and the failure is logged.
 
 Under the default policy, `DESTRUCTIVE` requires approval and everything
 is audited. Gate writes too with one line:
 
 ```python
 Policy(require_approval=frozenset({AccessTier.WRITE, AccessTier.DESTRUCTIVE}), ...)
+```
+
+Add your own secret-bearing keys without losing the defaults:
+
+```python
+from mcp_gatehouse import DEFAULT_REDACT
+Policy(redact=DEFAULT_REDACT | {"card_pin"}, ...)
 ```
 
 What the audit trail looks like:
@@ -82,16 +99,33 @@ What the audit trail looks like:
 ## Try the demo
 
 The package ships a runnable order-desk server with all three tiers wired
-up and a terminal-prompt approver:
+up and a terminal-prompt approver. Add it to any MCP client that speaks
+stdio — for Claude Desktop, in `claude_desktop_config.json`:
 
-```
-mcp-gatehouse-demo
+```json
+{
+  "mcpServers": {
+    "gatehouse-demo": {
+      "command": "uvx",
+      "args": ["mcp-gatehouse", "--audit-log", "/tmp/gatehouse-audit.jsonl"]
+    }
+  }
+}
 ```
 
-Point any MCP client at it over stdio (Claude Desktop, etc.), ask the model
-to cancel an order, and watch the approval land in your terminal — and the
-verdict land in `audit.jsonl` either way. `examples/orders_server.py` is
-the same server as a copyable template.
+Or run `mcp-gatehouse-demo` yourself after `pip install mcp-gatehouse`.
+Ask the model to list the orders and cancel one, then watch the verdict
+land in the audit log either way. The audit log goes to `--audit-log`, else
+`$MCP_GATEHOUSE_AUDIT_LOG`, else `./audit.jsonl` — falling back to
+`~/.mcp-gatehouse/audit.jsonl` when the working directory isn't writable
+(desktop clients often launch servers from `/`). The server prints the
+path it chose to stderr.
+
+The approval prompt needs a terminal: a client that launches the server in
+the background has none, so `cancel_order` is denied — the gate failing
+closed, as designed. Run the server from a terminal to approve
+interactively. `examples/orders_server.py` is the same server as a copyable
+template.
 
 ## Design notes
 
@@ -108,7 +142,7 @@ the same server as a copyable template.
 - **The audit log records denials and errors**, not just successes — the
   calls that *didn't* happen are half the story.
 - **A blocking terminal approver and the stdio transport don't mix** —
-  stdout/stdin are the protocol pipe. The demo's approver prompts on
+  stdout/stdin are the protocol pipe. `terminal_approver` prompts on
   `/dev/tty` for exactly that reason (and denies when no terminal exists).
   Real deployments should approve out-of-band: Slack, a ticket, a queue.
 - **What this is not:** authentication, transport encryption, or a sandbox.
@@ -118,10 +152,12 @@ the same server as a copyable template.
 ## Compatibility
 
 Targets the official [`mcp` Python SDK](https://github.com/modelcontextprotocol/python-sdk)
-v2.x (`mcp>=2,<3`) and Python 3.10+.
+v2.x (`mcp>=2,<3`) and Python 3.10–3.14. Ships type information
+(`py.typed`). Release notes: [CHANGELOG.md](CHANGELOG.md).
 
 | `mcp-gatehouse` | SDK | Server class |
 |---|---|---|
+| `0.3.x` | `mcp>=2,<3` | `MCPServer` |
 | `0.2.x` | `mcp>=2,<3` | `MCPServer` |
 | `0.1.x` | `mcp>=1.27,<2` | `FastMCP` |
 

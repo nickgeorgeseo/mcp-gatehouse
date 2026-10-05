@@ -15,7 +15,8 @@ jobs:
       # OIDC, for BOTH PyPI trusted publishing and `mcp-publisher login`.
       # No long-lived tokens are stored for either.
       id-token: write
-      contents: read
+      # The GitHub Release at the end; nothing else here writes.
+      contents: write
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v7
@@ -38,6 +39,17 @@ jobs:
               exit 1
             fi
           done
+
+      # The release notes come from here, so an empty section would ship a
+      # release that says nothing about what changed.
+      - name: CHANGELOG must have notes for this version
+        run: |
+          VERSION="${GITHUB_REF#refs/tags/v}"
+          awk -v v="$VERSION" '$0 ~ "^## "v"( |$)" {on=1; next} /^## / {on=0} on' CHANGELOG.md > "$RUNNER_TEMP/release-notes.md"
+          if ! grep -q "[^[:space:]]" "$RUNNER_TEMP/release-notes.md"; then
+            echo "::error::CHANGELOG.md has no '## $VERSION' section"
+            exit 1
+          fi
 
       - name: Install build tooling
         # twine <7 monkeypatches packaging's metadata-version allowlist and caps
@@ -88,7 +100,26 @@ jobs:
           echo "::error::mcp-gatehouse $VERSION never appeared on PyPI"
           exit 1
 
+      # Same re-run logic as PyPI's skip-existing: the registry rejects a
+      # duplicate version, which would otherwise strand a re-run here.
       - name: Publish to the MCP registry
         run: |
+          VERSION="${GITHUB_REF#refs/tags/v}"
+          NAME=$(python -c "import json;print(json.load(open('server.json'))['name'])")
+          CODE=$(curl -s -o /dev/null -w "%{http_code}" "https://registry.modelcontextprotocol.io/v0/servers/${NAME/\//%2F}/versions/$VERSION")
+          if [ "$CODE" = "200" ]; then
+            echo "$NAME $VERSION is already on the registry; skipping"
+            exit 0
+          fi
           ./mcp-publisher login github-oidc
           ./mcp-publisher publish
+
+      # Last, so a release page only appears once both registries have it.
+      # Skipped when it already exists, keeping the job re-runnable.
+      - name: GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1 \
+            || gh release create "$GITHUB_REF_NAME" --verify-tag \
+                 --title "$GITHUB_REF_NAME" --notes-file "$RUNNER_TEMP/release-notes.md" dist/*

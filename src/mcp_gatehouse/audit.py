@@ -32,11 +32,14 @@ class AuditLog:
         if (path is None) == (stream is None):
             raise ValueError("provide exactly one of `path` or `stream`")
         self._lock = threading.Lock()
+        self.path: Path | None = None
+        """Absolute path of the log file, or ``None`` when writing to a stream."""
         if path is not None:
-            p = Path(path)
+            p = Path(path).expanduser().absolute()
             p.parent.mkdir(parents=True, exist_ok=True)
             self._stream: TextIO = p.open("a", encoding="utf-8")
             self._owns_stream = True
+            self.path = p
         else:
             assert stream is not None
             self._stream = stream

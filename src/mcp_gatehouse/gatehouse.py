@@ -14,6 +14,7 @@ import inspect
 import time
 from typing import Any, Callable, TypeVar
 
+import anyio.to_thread
 from mcp.server.mcpserver import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 from mcp.types import ToolAnnotations
@@ -141,9 +142,21 @@ class Gatehouse:
                         )
                 else:
                     request = ApprovalRequest(tool=tool_name, tier=tier, arguments=safe_args)
-                    verdict = policy.approver(request)
-                    if inspect.isawaitable(verdict):
-                        verdict = await verdict
+                    try:
+                        verdict = await _call(policy.approver, request)
+                    except Exception as exc:
+                        # An approver that can't answer (Slack down, ticket
+                        # API timing out) is a refusal, not a crash — and it
+                        # belongs in the trail. Type only, as with tool errors.
+                        audit.record(
+                            tool=tool_name, tier=tier.value, outcome="denied",
+                            reason=f"approver error: {type(exc).__name__}",
+                            arguments=safe_args,
+                        )
+                        raise GateDenied(
+                            f"'{tool_name}' could not be approved: the approver "
+                            "failed. The gate fails closed."
+                        ) from exc
                     if not verdict:
                         audit.record(
                             tool=tool_name, tier=tier.value, outcome="denied",
@@ -151,14 +164,12 @@ class Gatehouse:
                         )
                         raise GateDenied(f"'{tool_name}' was refused by the approver.")
 
-        async def run(arguments: dict[str, Any], call: Callable[[], Any]) -> Any:
+        async def run(arguments: dict[str, Any], args: tuple, kwargs: dict[str, Any]) -> Any:
             await enforce(arguments)
             safe_args = redact_arguments(arguments, policy.redact)
             start = time.perf_counter()
             try:
-                result = call()
-                if inspect.isawaitable(result):
-                    result = await result
+                result = await _call(fn, *args, **kwargs)
             except Exception as exc:
                 # Only the exception TYPE goes in the log. Exception messages
                 # routinely embed argument values ("invalid api key: sk-…"),
@@ -191,9 +202,33 @@ class Gatehouse:
             arguments = dict(bound.arguments)
             if ctx_param is not None:
                 arguments.pop(ctx_param, None)
-            return await run(arguments, lambda: fn(*args, **kwargs))
+            return await run(arguments, args, kwargs)
 
         return guarded
+
+
+async def _call(fn: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
+    """Await an async callable; run a sync one in a worker thread.
+
+    MCPServer offloads sync tools to a thread itself, but all it sees is the
+    guard, which is async — so the offload has to happen here. Otherwise a
+    blocking tool, or an approver waiting on a human, stalls every other
+    request on the server until it returns.
+    """
+    if _is_async_callable(fn):
+        return await fn(*args, **kwargs)
+    result = await anyio.to_thread.run_sync(functools.partial(fn, *args, **kwargs))
+    if inspect.isawaitable(result):
+        result = await result
+    return result
+
+
+def _is_async_callable(fn: Any) -> bool:
+    while isinstance(fn, functools.partial):
+        fn = fn.func
+    return inspect.iscoroutinefunction(fn) or inspect.iscoroutinefunction(
+        getattr(fn, "__call__", None)
+    )
 
 
 def _find_context_parameter(fn: Callable[..., Any]) -> str | None:

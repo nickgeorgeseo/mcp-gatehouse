@@ -43,10 +43,23 @@ class ApprovalRequest:
 Approver = Callable[[ApprovalRequest], Union[bool, Awaitable[bool]]]
 
 #: Argument keys that are masked in audit logs and approval requests by
-#: default. Matched case-insensitively against exact key names.
+#: default. Matched against whole key names, ignoring case, ``_`` and ``-``
+#: — so ``api_key`` also covers ``apiKey``, ``API-Key`` and ``apikey``.
 DEFAULT_REDACT: frozenset[str] = frozenset(
-    {"password", "token", "secret", "api_key", "apikey", "authorization", "ssn"}
+    {
+        "password", "passwd", "passphrase",
+        "token", "access_token", "refresh_token", "id_token",
+        "secret", "client_secret",
+        "api_key", "x_api_key", "private_key",
+        "authorization", "cookie", "set_cookie",
+        "ssn",
+    }
 )
+
+
+def _normalize_key(key: str) -> str:
+    """``API-Key``, ``api_key`` and ``apiKey`` all name the same secret."""
+    return key.lower().replace("_", "").replace("-", "")
 
 
 @dataclass(frozen=True)
@@ -69,7 +82,9 @@ class Policy:
     :class:`ApprovalRequest`, returns ``True`` to allow."""
 
     redact: frozenset[str] = field(default_factory=lambda: DEFAULT_REDACT)
-    """Argument keys (case-insensitive) masked in logs and approvals."""
+    """Argument keys masked in logs and approvals. Whole-name matches,
+    ignoring case, ``_`` and ``-``. To extend rather than replace the
+    defaults: ``redact=DEFAULT_REDACT | {"pin"}``."""
 
     fail_closed: bool = True
     """If a tier requires approval and no approver is set: ``True`` denies
@@ -86,7 +101,8 @@ REDACTED = "«redacted»"
 def redact_arguments(arguments: dict[str, Any], keys: frozenset[str]) -> dict[str, Any]:
     """Return a deep copy of ``arguments`` with sensitive values masked.
 
-    Matching is by exact key name, case-insensitive, at any nesting depth.
+    Matching is by whole key name at any nesting depth, ignoring case,
+    ``_`` and ``-`` (``apiKey`` matches ``api_key``).
     Structured values are unwrapped so nested keys are reachable: mappings
     and sequences are recursed, dataclasses and Pydantic models are
     converted to dicts first. Anything else that isn't a plain JSON
@@ -97,14 +113,14 @@ def redact_arguments(arguments: dict[str, Any], keys: frozenset[str]) -> dict[st
     import dataclasses as _dc
     from collections.abc import Mapping, Sequence
 
-    lowered = {k.lower() for k in keys}
+    lowered = {_normalize_key(k) for k in keys}
 
     def scrub(value: Any) -> Any:
         if value is None or isinstance(value, (str, int, float, bool)):
             return value
         if isinstance(value, Mapping):
             return {
-                str(k): (REDACTED if str(k).lower() in lowered else scrub(v))
+                str(k): (REDACTED if _normalize_key(str(k)) in lowered else scrub(v))
                 for k, v in value.items()
             }
         if isinstance(value, (list, tuple, set, frozenset)) or (

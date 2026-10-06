@@ -1,0 +1,8 @@
+version: 2
+updates:
+  # The workflows pin every action to a full commit SHA, so a moved tag can't
+  # change what runs. Dependabot is what keeps those pins from going stale.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly

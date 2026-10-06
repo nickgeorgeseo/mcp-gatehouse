@@ -49,7 +49,7 @@ def test_pydantic_model_secrets_are_redacted():
 
 def test_dataclass_secrets_are_redacted():
     safe = redact_arguments(
-        {"creds": DcCreds(username="u", token="t-secret")}, DEFAULT_REDACT
+        {"creds": DcCreds(username="u", token="t-tok")}, DEFAULT_REDACT
     )
     assert safe["creds"]["token"] == REDACTED
 

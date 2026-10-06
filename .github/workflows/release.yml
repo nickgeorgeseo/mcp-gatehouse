@@ -18,8 +18,8 @@ jobs:
       # The GitHub Release at the end; nothing else here writes.
       contents: write
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-python@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7
         with:
           python-version: "3.12"
 
@@ -69,7 +69,7 @@ jobs:
       # at https://pypi.org/manage/project/mcp-gatehouse/settings/publishing/
       # for this repo + workflow + the `release` environment.
       - name: Publish to PyPI
-        uses: pypa/gh-action-pypi-publish@v1.14.2
+        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33  # v1.14.2
         with:
           # Makes the job re-runnable. A release is two publishes, and the
           # registry one can fail on its own (transient network, a registry

@@ -4,7 +4,7 @@
   "title": "mcp-gatehouse",
   "description": "Permission tiers, approval gates, and audit logging for MCP servers - the server is the gatekeeper",
   "version": "0.3.0",
-  "websiteUrl": "https://nickgeorgeai.com/mcp",
+  "websiteUrl": "https://nickgeorgeai.com/open-source/mcp-gatehouse",
   "repository": {
     "url": "https://github.com/nickgeorgeseo/mcp-gatehouse",
     "source": "github"

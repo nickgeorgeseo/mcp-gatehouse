@@ -177,6 +177,8 @@ fixes.
 production for a mid-market reverse logistics-tech company, and build them
 for businesses at [nickgeorgeai.com](https://nickgeorgeai.com). This
 library is the permission-and-audit discipline from those builds, extracted.
+Why I built it, and how it works in plain words, is on the
+[project page](https://nickgeorgeai.com/open-source/mcp-gatehouse).
 
 If you're an owner or operator wondering what MCP even is, start with the
 plain-English guide: [What is an MCP server?](https://nickgeorgeai.com/mcp)

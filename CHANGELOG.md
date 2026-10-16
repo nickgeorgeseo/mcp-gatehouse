@@ -3,6 +3,11 @@
 All notable changes to `mcp-gatehouse`. The public API (`Gatehouse`,
 `Policy`, `AuditLog`, `AccessTier`) stays compatible within a minor line.
 
+## Unreleased
+
+- The package Homepage and the MCP Registry `websiteUrl` now point to the
+  project page, https://nickgeorgeai.com/open-source/mcp-gatehouse, instead of the general MCP guide.
+
 ## 0.3.0 — 2026-10-05
 
 ### Fixed

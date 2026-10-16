@@ -42,7 +42,7 @@ mcp-gatehouse-demo = "mcp_gatehouse.demo:main"
 mcp-gatehouse = "mcp_gatehouse.demo:main"
 
 [project.urls]
-Homepage = "https://nickgeorgeai.com/mcp"
+Homepage = "https://nickgeorgeai.com/open-source/mcp-gatehouse"
 Repository = "https://github.com/nickgeorgeseo/mcp-gatehouse"
 
 [project.optional-dependencies]

@@ -8,6 +8,8 @@
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![mcp-gatehouse MCP server](https://glama.ai/mcp/servers/nickgeorgeseo/mcp-gatehouse/badges/score.svg)](https://glama.ai/mcp/servers/nickgeorgeseo/mcp-gatehouse)
 
+[![Gatehouse MCP server](https://mcprush.com/badge/gatehouse-mcp/card.svg)](https://mcprush.com/to/gatehouse-mcp?ref=badge)
+
 **Permission tiers, approval gates, and audit logging for MCP servers.**
 The server is the gatekeeper: you decide what an AI can read, what it can
 write, and what's off-limits — and every action gets logged.

@@ -3,6 +3,20 @@
 All notable changes to `mcp-gatehouse`. The public API (`Gatehouse`,
 `Policy`, `AuditLog`, `AccessTier`) stays compatible within a minor line.
 
+## Unreleased
+
+### Fixed
+
+- **Cancelled calls are audited.** When the client gave up or the server
+  shut down while a call waited on its approver or ran its tool, the call
+  left no line in the log: cancellation is a `BaseException`, so it went
+  straight past the gate's `except Exception` audit paths. It is now
+  recorded as `outcome: "cancelled"`, with `reason: "awaiting approval"`
+  (the tool never ran) or `reason: "tool running"` plus `duration_ms` (the
+  tool may have done part of its work). The cancellation is re-raised
+  unchanged. Sync tools behave as before: a worker thread can't be
+  interrupted, so the tool finishes and is logged as `ok` or `error`.
+
 ## 0.3.1 — 2026-10-16
 
 No code changes. Metadata only.

@@ -38,6 +38,10 @@ class ApprovalRequest:
     tool: str
     tier: AccessTier
     arguments: dict[str, Any]
+    deadline: float | None = None
+    """``time.monotonic()`` value at which the gate stops waiting and denies
+    the call, or ``None`` for no limit. An approver that blocks — a prompt,
+    a poll — should give up by then: past it, its answer is ignored."""
 
 
 Approver = Callable[[ApprovalRequest], Union[bool, Awaitable[bool]]]
@@ -90,6 +94,16 @@ class Policy:
     """If a tier requires approval and no approver is set: ``True`` denies
     the call, ``False`` lets it through. Leave this alone unless you have
     a very good reason."""
+
+    approval_timeout: float | None = None
+    """Seconds to wait for the approver before denying the call. ``None``
+    waits as long as the approver takes. Running out of time is a denial,
+    so the gate still fails closed."""
+
+    def __post_init__(self) -> None:
+        # `not > 0` rather than `<= 0`, so NaN is rejected too.
+        if self.approval_timeout is not None and not self.approval_timeout > 0:
+            raise ValueError("approval_timeout must be a positive number of seconds, or None")
 
     def needs_approval(self, tier: AccessTier) -> bool:
         return tier in self.require_approval

@@ -72,9 +72,22 @@ they would on a bare `MCPServer`.
 stdin — over stdio, stdin *is* the protocol pipe, so a plain `input()`
 approver would corrupt it. An approver is any callable, sync or async,
 that takes an `ApprovalRequest` and returns `True` to allow; sync ones run
-in a worker thread, so a human taking their time doesn't stall other calls.
-If the approver raises (Slack down, ticket API timing out), the call is
-denied and the failure is logged.
+in a worker thread from a pool of their own, so a human taking their time
+doesn't stall other calls, and a pile of pending approvals can't take the
+threads your sync tools need. If the approver raises (Slack down, ticket
+API timing out), the call is denied and the failure is logged.
+
+Give approvals a deadline so a sign-off nobody gives doesn't hang the call:
+
+```python
+Policy(approver=terminal_approver, approval_timeout=120)
+```
+
+Past it, the call is denied and logged as `approval timed out`. Approvers
+see the deadline as `request.deadline` (a `time.monotonic()` value), and
+`terminal_approver` withdraws its prompt when it passes. A sync approver
+that ignores it finishes in the background and its answer is dropped. With
+no timeout set, the gate waits as long as the approver takes.
 
 Under the default policy, `DESTRUCTIVE` requires approval and everything
 is audited. Gate writes too with one line:
@@ -133,10 +146,13 @@ land in the audit log either way. The audit log goes to `--audit-log`, else
 (desktop clients often launch servers from `/`). The server prints the
 path it chose to stderr.
 
-The approval prompt needs a terminal: a client that launches the server in
-the background has none, so `cancel_order` is denied — the gate failing
-closed, as designed. Run the server from a terminal to approve
-interactively. `examples/orders_server.py` is the same server as a copyable
+The approval prompt needs a terminal of its own: a client that launches
+the server in the background has none, and a client with a full-screen
+terminal UI is using its terminal, so in both cases `cancel_order` is
+denied — the gate failing closed, as designed. To approve interactively,
+start the client that launches the server from an ordinary terminal
+session that isn't running a full-screen program. An unanswered prompt is
+denied after two minutes. `examples/orders_server.py` is the same server as a copyable
 template.
 
 ## Design notes
@@ -156,7 +172,8 @@ template.
   call cut off halfway may still have done something.
 - **A blocking terminal approver and the stdio transport don't mix** —
   stdout/stdin are the protocol pipe. `terminal_approver` prompts on
-  `/dev/tty` for exactly that reason (and denies when no terminal exists).
+  `/dev/tty` for exactly that reason, and denies when there's no terminal
+  or a full-screen program has it in raw mode.
   Real deployments should approve out-of-band: Slack, a ticket, a queue.
 - **What this is not:** authentication, transport encryption, or a sandbox.
   It's a gate inside your server, not a perimeter around it. See
@@ -170,6 +187,7 @@ v2.x (`mcp>=2,<3`) and Python 3.10–3.14. Ships type information
 
 | `mcp-gatehouse` | SDK | Server class |
 |---|---|---|
+| `0.4.x` | `mcp>=2,<3` | `MCPServer` |
 | `0.3.x` | `mcp>=2,<3` | `MCPServer` |
 | `0.2.x` | `mcp>=2,<3` | `MCPServer` |
 | `0.1.x` | `mcp>=1.27,<2` | `FastMCP` |

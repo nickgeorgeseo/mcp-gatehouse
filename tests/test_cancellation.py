@@ -107,6 +107,43 @@ async def test_cancelled_while_awaiting_approval(interrupt):
 
 @pytest.mark.anyio
 @interruptions
+async def test_cancelled_while_a_sync_approver_waits(interrupt):
+    """A sync approver runs in a worker thread the gate gives up on when
+    the call is cancelled, so this is logged like an async one. The thread
+    itself can't be stopped: it is released at the end of the test."""
+    started = threading.Event()
+    released = threading.Event()
+    ran = []
+
+    def slow_human(request) -> bool:
+        started.set()
+        return released.wait(timeout=10)
+
+    log = io.StringIO()
+    mcp = MCPServer("t")
+    gk = Gatehouse(mcp, policy=Policy(approver=slow_human), audit=AuditLog(stream=log))
+
+    @gk.tool(tier=AccessTier.DESTRUCTIVE)
+    def refund(order_id: str, api_key: str) -> str:
+        ran.append(order_id)
+        return "refunded"
+
+    try:
+        await interrupt(mcp, started)
+    finally:
+        released.set()
+
+    assert ran == []
+    (event,) = events(log)
+    del event["ts"]
+    assert event == {
+        "tool": "refund", "tier": "destructive", "outcome": "cancelled",
+        "reason": "awaiting approval", "arguments": LOGGED_ARGUMENTS,
+    }
+
+
+@pytest.mark.anyio
+@interruptions
 async def test_cancelled_inside_an_async_tool(interrupt):
     started = threading.Event()
 

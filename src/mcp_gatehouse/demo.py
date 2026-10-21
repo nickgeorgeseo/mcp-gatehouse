@@ -55,11 +55,15 @@ def build_server(audit: AuditLog, approver: Approver | None = terminal_approver)
         instructions=(
             "A demo order desk behind mcp-gatehouse. Reads run freely; "
             "add_note is logged; cancel_order needs a human's approval on "
-            "the server's terminal and is denied if nobody approves. Every "
-            "call, allowed or denied, is written to an audit log."
+            "the server's terminal and is denied if nobody approves within "
+            "two minutes. Every call, allowed or denied, is written to an "
+            "audit log."
         ),
     )
-    gatehouse = Gatehouse(mcp, policy=Policy(approver=approver), audit=audit)
+    # A prompt nobody answers is denied and logged after two minutes, rather
+    # than left hanging until the client gives up.
+    policy = Policy(approver=approver, approval_timeout=120)
+    gatehouse = Gatehouse(mcp, policy=policy, audit=audit)
 
     @gatehouse.tool(tier=AccessTier.READ)
     def list_orders() -> str:
@@ -101,8 +105,9 @@ def build_server(audit: AuditLog, approver: Approver | None = terminal_approver)
     @gatehouse.tool(tier=AccessTier.DESTRUCTIVE)
     def cancel_order(order_id: OrderId) -> str:
         """Cancel an order. Irreversible, so it is gated: a human must approve
-        on the server's terminal before it runs. If they refuse, or there is
-        no terminal, the call is denied and the refusal is logged. To record
+        on the server's terminal before it runs. If they refuse, don't answer
+        within two minutes, or there is no terminal to ask on, the call is
+        denied and the refusal is logged. To record
         information without cancelling, use add_note."""
         if order_id not in ORDERS:
             return f"no order {order_id}"

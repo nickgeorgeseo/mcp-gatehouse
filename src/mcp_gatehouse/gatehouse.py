@@ -9,6 +9,7 @@ clients see honest hints without you hand-writing them.
 
 from __future__ import annotations
 
+import copy
 import functools
 import inspect
 import time
@@ -24,6 +25,11 @@ from .audit import AuditLog, NullAuditLog
 from .policy import AccessTier, ApprovalRequest, Policy, redact_arguments
 
 F = TypeVar("F", bound=Callable[..., Any])
+
+# Worker threads for sync approvers, kept apart from anyio's default pool.
+# Sync tools draw on that pool; approvers wait on people. If they shared it,
+# a stack of pending sign-offs would leave no thread for a plain read.
+_APPROVER_THREADS = 40
 
 
 class GateDenied(PermissionError, ToolError):
@@ -76,6 +82,7 @@ class Gatehouse:
         self.server = server
         self.policy = policy or Policy()
         self.audit = audit or NullAuditLog()
+        self._approver_limiter = anyio.CapacityLimiter(_APPROVER_THREADS)
 
     def tool(
         self,
@@ -116,71 +123,93 @@ class Gatehouse:
         return decorator
 
     def _guard(self, fn: Callable[..., Any], tool_name: str, tier: AccessTier) -> Callable[..., Any]:
-        policy, audit = self.policy, self.audit
+        policy, audit, approver_limiter = self.policy, self.audit, self._approver_limiter
+        signature = inspect.signature(fn)
 
-        async def enforce(arguments: dict[str, Any]) -> None:
-            """Raise GateDenied unless the policy allows this call."""
-            safe_args = redact_arguments(arguments, policy.redact)
+        async def enforce(safe_args: dict[str, Any]) -> None:
+            """Raise GateDenied unless the policy allows this call.
 
-            if tool_name in policy.deny:
+            Gets the redacted arguments only: the raw ones never reach the
+            log or the approver.
+            """
+
+            def denied(reason: str, message: str) -> GateDenied:
+                """Record the denial; return the error that tells the model why."""
                 audit.record(
                     tool=tool_name, tier=tier.value, outcome="denied",
-                    reason="denylist", arguments=safe_args,
+                    reason=reason, arguments=safe_args,
                 )
-                raise GateDenied(f"'{tool_name}' is blocked by policy.")
+                return GateDenied(message)
 
-            if policy.needs_approval(tier):
-                if policy.approver is None:
-                    if policy.fail_closed:
-                        audit.record(
-                            tool=tool_name, tier=tier.value, outcome="denied",
-                            reason="approval required, no approver configured",
-                            arguments=safe_args,
-                        )
-                        raise GateDenied(
-                            f"'{tool_name}' ({tier.value}) requires approval and "
-                            "no approver is configured. The gate fails closed."
-                        )
-                else:
-                    request = ApprovalRequest(tool=tool_name, tier=tier, arguments=safe_args)
-                    try:
-                        verdict = await _call(policy.approver, request)
-                    except Exception as exc:
-                        # An approver that can't answer (Slack down, ticket
-                        # API timing out) is a refusal, not a crash — and it
-                        # belongs in the trail. Type only, as with tool errors.
-                        audit.record(
-                            tool=tool_name, tier=tier.value, outcome="denied",
-                            reason=f"approver error: {type(exc).__name__}",
-                            arguments=safe_args,
-                        )
-                        raise GateDenied(
-                            f"'{tool_name}' could not be approved: the approver "
-                            "failed. The gate fails closed."
-                        ) from exc
-                    except anyio.get_cancelled_exc_class():
-                        # The client gave up, or the server is shutting down.
-                        # Cancellation is a BaseException, so the clause above
-                        # never sees it. Log it, then let it carry on as is:
-                        # swallowing it would keep a cancelled task running.
-                        audit.record(
-                            tool=tool_name, tier=tier.value, outcome="cancelled",
-                            reason="awaiting approval", arguments=safe_args,
-                        )
-                        raise
-                    if not verdict:
-                        audit.record(
-                            tool=tool_name, tier=tier.value, outcome="denied",
-                            reason="approver refused", arguments=safe_args,
-                        )
-                        raise GateDenied(f"'{tool_name}' was refused by the approver.")
+            if tool_name in policy.deny:
+                raise denied("denylist", f"'{tool_name}' is blocked by policy.")
+
+            if not policy.needs_approval(tier):
+                return
+
+            if policy.approver is None:
+                if not policy.fail_closed:
+                    return
+                raise denied(
+                    "approval required, no approver configured",
+                    f"'{tool_name}' ({tier.value}) requires approval and "
+                    "no approver is configured. The gate fails closed.",
+                )
+
+            timeout = policy.approval_timeout
+            request = ApprovalRequest(
+                tool=tool_name,
+                tier=tier,
+                # Its own copy: nothing the approver does to these can change
+                # what the audit log records.
+                arguments=copy.deepcopy(safe_args),
+                deadline=None if timeout is None else time.monotonic() + timeout,
+            )
+            try:
+                # move_on_after, not fail_after: an approver that raises
+                # TimeoutError itself (a Slack call timing out) is an approver
+                # error, not the gate's deadline.
+                with anyio.move_on_after(timeout) as waiting:
+                    approved = await _call(
+                        functools.partial(policy.approver, request),
+                        limiter=approver_limiter,
+                        abandon_on_cancel=True,
+                    )
+            except Exception as exc:
+                # An approver that can't answer (Slack down, ticket API timing
+                # out) is a refusal, not a crash — and it belongs in the trail.
+                # Type only, as with tool errors.
+                raise denied(
+                    f"approver error: {type(exc).__name__}",
+                    f"'{tool_name}' could not be approved: the approver "
+                    "failed. The gate fails closed.",
+                ) from exc
+            except anyio.get_cancelled_exc_class():
+                # The client gave up, or the server is shutting down.
+                # Cancellation is a BaseException, so the clause above never
+                # sees it, and the gate's own timeout never gets this far:
+                # move_on_after catches that one. Log it, then let it carry
+                # on as is: swallowing it would keep a cancelled task running.
+                audit.record(
+                    tool=tool_name, tier=tier.value, outcome="cancelled",
+                    reason="awaiting approval", arguments=safe_args,
+                )
+                raise
+            if waiting.cancelled_caught:
+                raise denied(
+                    "approval timed out",
+                    f"'{tool_name}' was not approved within {timeout:g}s. "
+                    "The gate fails closed.",
+                )
+            if not approved:
+                raise denied("approver refused", f"'{tool_name}' was refused by the approver.")
 
         async def run(arguments: dict[str, Any], args: tuple, kwargs: dict[str, Any]) -> Any:
-            await enforce(arguments)
             safe_args = redact_arguments(arguments, policy.redact)
+            await enforce(safe_args)
             start = time.perf_counter()
             try:
-                result = await _call(fn, *args, **kwargs)
+                result = await _call(functools.partial(fn, *args, **kwargs))
             except Exception as exc:
                 # Only the exception TYPE goes in the log. Exception messages
                 # routinely embed argument values ("invalid api key: sk-…"),
@@ -214,10 +243,11 @@ class Gatehouse:
 
         # functools.wraps preserves the signature (via __wrapped__), so
         # MCPServer still generates the tool's input schema from the real
-        # function — the guard is invisible to schema generation.
+        # function — the guard is invisible to schema generation. The
+        # signature is computed once, above, not on every call.
         @functools.wraps(fn)
         async def guarded(*args: Any, **kwargs: Any) -> Any:
-            bound = inspect.signature(fn).bind(*args, **kwargs)
+            bound = signature.bind(*args, **kwargs)
             bound.apply_defaults()
             arguments = dict(bound.arguments)
             if ctx_param is not None:
@@ -227,17 +257,31 @@ class Gatehouse:
         return guarded
 
 
-async def _call(fn: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
+async def _call(
+    fn: Callable[[], Any],
+    *,
+    limiter: anyio.CapacityLimiter | None = None,
+    abandon_on_cancel: bool = False,
+) -> Any:
     """Await an async callable; run a sync one in a worker thread.
 
     MCPServer offloads sync tools to a thread itself, but all it sees is the
     guard, which is async — so the offload has to happen here. Otherwise a
     blocking tool, or an approver waiting on a human, stalls every other
     request on the server until it returns.
+
+    ``fn`` takes no arguments (bind them with ``functools.partial``), so
+    these options can't collide with a tool's own parameter names.
+    ``limiter`` picks the thread pool (anyio's default when ``None``).
+    ``abandon_on_cancel`` lets a timeout stop waiting on a thread that is
+    still blocked; Python can't stop the thread, so it finishes in the
+    background and its result is dropped.
     """
     if _is_async_callable(fn):
-        return await fn(*args, **kwargs)
-    result = await anyio.to_thread.run_sync(functools.partial(fn, *args, **kwargs))
+        return await fn()
+    result = await anyio.to_thread.run_sync(
+        fn, limiter=limiter, abandon_on_cancel=abandon_on_cancel
+    )
     if inspect.isawaitable(result):
         result = await result
     return result

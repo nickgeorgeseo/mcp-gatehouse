@@ -3,19 +3,31 @@
 All notable changes to `mcp-gatehouse`. The public API (`Gatehouse`,
 `Policy`, `AuditLog`, `AccessTier`) stays compatible within a minor line.
 
-## Unreleased
+## 0.4.0 — 2026-10-21
 
 ### Fixed
 
-- **Cancelled calls are audited.** When the client gave up or the server
-  shut down while a call waited on its approver or ran its tool, the call
-  left no line in the log: cancellation is a `BaseException`, so it went
-  straight past the gate's `except Exception` audit paths. It is now
-  recorded as `outcome: "cancelled"`, with `reason: "awaiting approval"`
-  (the tool never ran) or `reason: "tool running"` plus `duration_ms` (the
-  tool may have done part of its work). The cancellation is re-raised
-  unchanged. Sync tools behave as before: a worker thread can't be
-  interrupted, so the tool finishes and is logged as `ok` or `error`.
+- `terminal_approver` now prompts. It used to deny every call without
+  asking, on macOS and Linux.
+- `terminal_approver` denies instead of prompting when a full-screen
+  program, such as an MCP client's terminal UI, is using the terminal.
+- Pending approvals no longer block sync tools: approvers have their own
+  thread pool.
+- Cancelled calls are logged as `outcome: "cancelled"`. A call cancelled
+  during approval or while an async tool ran used to leave no record.
+
+### Added
+
+- `Policy(approval_timeout=seconds)`: an unanswered approval is denied and
+  logged as `approval timed out`. Off by default.
+- `ApprovalRequest.deadline`, so an approver knows when the gate stops
+  waiting.
+
+### Changed
+
+- Less work per call: the signature is read once and arguments are
+  redacted once.
+- The demo denies an approval left unanswered for two minutes.
 
 ## 0.3.1 — 2026-10-16
 

@@ -31,7 +31,7 @@ pip install mcp-gatehouse
 |---|---|
 | **Permission tiers** | Every tool is declared `READ`, `WRITE`, or `DESTRUCTIVE` — and the tier also emits honest spec `ToolAnnotations` (`readOnlyHint` / `destructiveHint`), which the wrapper won't let you override to lie. |
 | **Approval gates** | Tiers you choose require a sign-off before the tool runs. Your approver is any callable — a terminal prompt, a Slack ping, a ticket. **Fails closed:** a gated tool with no approver configured is denied, not waved through. |
-| **Audit log** | Append-only JSONL, one line per call — allowed, denied, or failed — with UTC timestamps and durations. The answer to "what did the AI actually do?" six months later. |
+| **Audit log** | Append-only JSONL, one line per call — allowed, denied, failed, or cancelled — with UTC timestamps and durations. The answer to "what did the AI actually do?" six months later. |
 | **Redaction** | Argument keys you name (`api_key`, `password`, `token`, `client_secret`, … by default) are masked before they reach the log *or* the approver — however they're spelled: `apiKey`, `API-Key` and `api_key` are the same key. |
 | **Denylist** | Block a tool outright, whatever its tier. |
 
@@ -109,7 +109,17 @@ What the audit trail looks like:
 {"ts": "2026-07-16T14:02:11+00:00", "tool": "lookup_order", "tier": "read", "outcome": "ok", "arguments": {"order_id": "4417"}, "duration_ms": 0.42}
 {"ts": "2026-07-16T14:02:38+00:00", "tool": "add_note", "tier": "write", "outcome": "ok", "arguments": {"order_id": "4417", "note": "call back", "api_key": "«redacted»"}, "duration_ms": 1.08}
 {"ts": "2026-07-16T14:03:05+00:00", "tool": "cancel_order", "tier": "destructive", "outcome": "denied", "reason": "approver refused", "arguments": {"order_id": "4417"}}
+{"ts": "2026-07-16T14:05:40+00:00", "tool": "cancel_order", "tier": "destructive", "outcome": "cancelled", "reason": "awaiting approval", "arguments": {"order_id": "4418"}}
 ```
+
+`outcome` is `ok`, `denied` (`reason` says why), `error` (the tool
+raised; `reason` is the exception type), or `cancelled`: the client gave
+up, or the server shut down, before the call finished. `reason` says
+when. `awaiting approval` means the tool never ran. `tool running` comes
+with `duration_ms`, and the tool may have done part of its work. A sync
+tool can't be stopped partway: its worker thread runs to the end, and the
+line says `ok` or `error` as usual. The gate only writes the line; the
+cancellation goes on as it would without it.
 
 ## Try the demo
 
@@ -157,8 +167,9 @@ template.
   than passed through, and exception *messages* stay out of the log —
   only the exception type is recorded, because error text loves to embed
   the very values you just redacted.
-- **The audit log records denials and errors**, not just successes — the
-  calls that *didn't* happen are half the story.
+- **The audit log records denials, errors and cancellations**, not just
+  successes — the calls that *didn't* happen are half the story, and a
+  call cut off halfway may still have done something.
 - **A blocking terminal approver and the stdio transport don't mix** —
   stdout/stdin are the protocol pipe. `terminal_approver` prompts on
   `/dev/tty` for exactly that reason, and denies when there's no terminal

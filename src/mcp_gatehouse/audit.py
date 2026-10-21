@@ -1,8 +1,8 @@
 """Append-only JSONL audit log.
 
-One line per tool call — allowed, denied, or failed — with UTC timestamps
-and redacted arguments. The point is a trail you can grep six months later
-when someone asks "what did the AI actually do?"
+One line per tool call — allowed, denied, failed, or cancelled — with UTC
+timestamps and redacted arguments. The point is a trail you can grep six
+months later when someone asks "what did the AI actually do?"
 """
 
 from __future__ import annotations

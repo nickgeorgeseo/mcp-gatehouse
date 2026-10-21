@@ -7,47 +7,27 @@ All notable changes to `mcp-gatehouse`. The public API (`Gatehouse`,
 
 ### Fixed
 
-- **`terminal_approver` actually prompts.** It opened `/dev/tty` in text
-  `r+` mode, which requires a seekable file. A terminal isn't one, so on
-  macOS and Linux the open raised, the approver took that for "no
-  terminal", and every gated call was denied without a prompt being shown.
-  It now opens the terminal unbuffered, as `getpass` does.
-- **`terminal_approver` stays off a terminal a full-screen program is
-  using.** A server launched by an MCP client with a terminal UI can open
-  that client's terminal, which the UI keeps in raw mode. A prompt there
-  would draw over the client's screen, fight it for keystrokes, and never
-  see a complete answer. It now denies instead, with a note on stderr.
-- **Pending approvals can no longer starve sync tools.** Sync approvers ran
-  on anyio's default worker-thread pool (40 threads), the same one sync
-  tools use. With 40 approvals waiting on people, a sync tool, even a
-  `READ`, had no thread to run on and hung until someone answered.
-  Approvers now get a pool of their own.
+- `terminal_approver` now prompts. It used to deny every call without
+  asking, on macOS and Linux.
+- `terminal_approver` denies instead of prompting when a full-screen
+  program, such as an MCP client's terminal UI, is using the terminal.
+- Pending approvals no longer block sync tools: approvers have their own
+  thread pool.
+- Cancelled calls are logged as `outcome: "cancelled"`. A call cancelled
+  during approval or while an async tool ran used to leave no record.
 
 ### Added
 
-- `Policy(approval_timeout=seconds)`: if the approver hasn't answered in
-  time, the call is denied and audited as `reason: "approval timed out"`.
-  The default, `None`, waits as long as the approver takes, as before. An
-  approver that raises `TimeoutError` itself is still recorded as
-  `approver error: TimeoutError`.
-- `ApprovalRequest.deadline`: the `time.monotonic()` value at which the
-  gate gives up, or `None`. `terminal_approver` honors it: a prompt
-  nobody answers is withdrawn, and one waiting behind another prompt gives
-  up without being shown.
+- `Policy(approval_timeout=seconds)`: an unanswered approval is denied and
+  logged as `approval timed out`. Off by default.
+- `ApprovalRequest.deadline`, so an approver knows when the gate stops
+  waiting.
 
 ### Changed
 
-- Less work per call: the tool's signature is read once at registration
-  instead of on every call, and arguments are redacted once per call
-  instead of twice. The approver still gets its own copy, so it can't
-  change what the audit log records.
-- When a gated call times out or is cancelled, the gate stops waiting on a
-  sync approver instead of blocking until it returns. Python can't stop
-  the thread, so the approver finishes in the background and its answer
-  is ignored.
-- The demo denies an approval nobody answers within two minutes
-  (`approval_timeout=120`), so the call is logged instead of hanging until
-  the client gives up.
+- Less work per call: the signature is read once and arguments are
+  redacted once.
+- The demo denies an approval left unanswered for two minutes.
 
 ## 0.3.1 — 2026-10-16
 

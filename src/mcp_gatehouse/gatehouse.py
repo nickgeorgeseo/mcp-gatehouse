@@ -184,6 +184,17 @@ class Gatehouse:
                     f"'{tool_name}' could not be approved: the approver "
                     "failed. The gate fails closed.",
                 ) from exc
+            except anyio.get_cancelled_exc_class():
+                # The client gave up, or the server is shutting down.
+                # Cancellation is a BaseException, so the clause above never
+                # sees it, and the gate's own timeout never gets this far:
+                # move_on_after catches that one. Log it, then let it carry
+                # on as is: swallowing it would keep a cancelled task running.
+                audit.record(
+                    tool=tool_name, tier=tier.value, outcome="cancelled",
+                    reason="awaiting approval", arguments=safe_args,
+                )
+                raise
             if waiting.cancelled_caught:
                 raise denied(
                     "approval timed out",
@@ -207,6 +218,15 @@ class Gatehouse:
                 audit.record(
                     tool=tool_name, tier=tier.value, outcome="error",
                     reason=type(exc).__name__, arguments=safe_args,
+                    duration_ms=round((time.perf_counter() - start) * 1000, 2),
+                )
+                raise
+            except anyio.get_cancelled_exc_class():
+                # Cancelled mid-run, as in enforce. The tool may have done
+                # part of its work, which is exactly what the trail is for.
+                audit.record(
+                    tool=tool_name, tier=tier.value, outcome="cancelled",
+                    reason="tool running", arguments=safe_args,
                     duration_ms=round((time.perf_counter() - start) * 1000, 2),
                 )
                 raise

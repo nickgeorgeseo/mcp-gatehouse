@@ -1,5 +1,7 @@
 # mcp-gatehouse
 
+**Project page & docs:** [nickgeorgeai.com/open-source/mcp-gatehouse](https://nickgeorgeai.com/open-source/mcp-gatehouse) · [PyPI](https://pypi.org/project/mcp-gatehouse/)
+
 <!-- mcp-name: io.github.nickgeorgeseo/gatehouse -->
 
 [![CI](https://github.com/nickgeorgeseo/mcp-gatehouse/actions/workflows/ci.yml/badge.svg)](https://github.com/nickgeorgeseo/mcp-gatehouse/actions/workflows/ci.yml)

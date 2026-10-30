@@ -3,6 +3,19 @@
 All notable changes to `mcp-gatehouse`. The public API (`Gatehouse`,
 `Policy`, `AuditLog`, `AccessTier`) stays compatible within a minor line.
 
+## Unreleased
+
+### Fixed
+
+- The README said starting the client from an ordinary terminal lets you
+  approve the demo's prompt. Not for clients built on the MCP Python SDK:
+  its stdio client starts servers in a session of their own, with no
+  controlling terminal, so `terminal_approver` always denies there. The
+  README now says which clients can prompt.
+- `terminal_approver`'s stderr denial says when the server has no
+  controlling terminal although stderr is one, instead of a bare
+  "no terminal for approval".
+
 ## 0.4.0 — 2026-10-21
 
 ### Fixed

@@ -7,6 +7,7 @@ import io
 import json
 import os
 import select
+import subprocess
 import sys
 import threading
 import time
@@ -386,3 +387,56 @@ def test_terminal_prompt_stops_waiting_for_a_busy_terminal(operator):
     with approvers._tty_lock:
         assert terminal_approver(request(time.monotonic() + 0.1)) is False
     assert screen(operator) == ""
+
+
+# A client on a real terminal starts the approver's server, the way the MCP
+# Python SDK's stdio client does (start_new_session=True) or not. Run from a
+# helper process so pytest itself never forks.
+_SESSION_HARNESS = r'''
+import os, pty, sys, time
+
+SERVER = """
+import time
+from mcp_gatehouse import AccessTier, ApprovalRequest, terminal_approver
+request = ApprovalRequest(tool="cancel", tier=AccessTier.DESTRUCTIVE, arguments={}, deadline=time.monotonic() + 0.5)
+print("allowed:", terminal_approver(request), flush=True)
+"""
+CLIENT = "import subprocess, sys; subprocess.run([sys.executable, '-c', %r], start_new_session=%s, timeout=20)"
+
+pid, fd = pty.fork()  # the child gets the pty as its controlling terminal
+if pid == 0:
+    os.execv(sys.executable, [sys.executable, "-c", CLIENT % (SERVER, sys.argv[1])])
+shown, end = b"", time.monotonic() + 20
+while time.monotonic() < end:
+    try:
+        chunk = os.read(fd, 4096)
+    except OSError:  # EIO once the client and server have both exited
+        break
+    if not chunk:
+        break
+    shown += chunk
+os.waitpid(pid, 0)
+sys.stdout.write(shown.decode())
+'''
+
+
+@needs_pty
+@pytest.mark.parametrize("own_session", [False, True])
+def test_terminal_prompt_needs_the_clients_session(own_session):
+    """Started in the client's session, the server prompts on the client's
+    terminal. Started in a session of its own, it has no controlling
+    terminal although its stderr is that terminal, so it denies, and says
+    why: the README once promised a prompt here."""
+    src = os.path.dirname(os.path.dirname(approvers.__file__))
+    env = {**os.environ, "PYTHONPATH": os.pathsep.join(filter(None, [src, os.environ.get("PYTHONPATH")]))}
+    shown = subprocess.run(
+        [sys.executable, "-c", _SESSION_HARNESS, str(own_session)],
+        env=env, capture_output=True, text=True, timeout=60, check=True,
+    ).stdout
+    assert "allowed: False" in shown
+    if own_session:
+        assert "approval needed" not in shown
+        assert "no controlling terminal" in shown
+    else:
+        assert "approval needed" in shown
+        assert "timed out, denied" in shown

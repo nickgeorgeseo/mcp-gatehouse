@@ -148,13 +148,25 @@ land in the audit log either way. The audit log goes to `--audit-log`, else
 (desktop clients often launch servers from `/`). The server prints the
 path it chose to stderr.
 
-The approval prompt needs a terminal of its own: a client that launches
-the server in the background has none, and a client with a full-screen
-terminal UI is using its terminal, so in both cases `cancel_order` is
-denied — the gate failing closed, as designed. To approve interactively,
-start the client that launches the server from an ordinary terminal
-session that isn't running a full-screen program. An unanswered prompt is
-denied after two minutes. `examples/orders_server.py` is the same server as a copyable
+The approval prompt needs the server to have a terminal it can ask on,
+and whether it gets one depends on how the client starts it:
+
+- **TypeScript SDK clients** (the `StdioClientTransport` in 1.x and 2.x)
+  keep the server in the client's terminal session. Start such a client
+  from an ordinary terminal, one not running a full-screen program, and
+  the prompt appears there. An unanswered prompt is denied after two
+  minutes.
+- **Python SDK clients** (`stdio_client` in 1.x and 2.x), and anything
+  built on them, start every server in a session of its own. The server
+  has no controlling terminal even when you run the client from one, so
+  it can't prompt: `cancel_order` is denied, and stderr says why.
+- **Desktop apps** that launch servers in the background give them no
+  terminal, and **full-screen terminal UIs** are using theirs. Denied
+  too.
+
+Every denial is the gate failing closed, as designed. Where the prompt
+can't reach you, approve out-of-band instead: an approver is any callable,
+so it can post to Slack, open a ticket or wait on a queue. `examples/orders_server.py` is the same server as a copyable
 template.
 
 ## Design notes

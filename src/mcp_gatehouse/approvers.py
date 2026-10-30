@@ -7,6 +7,7 @@ returns ``True`` to allow — these are the ones worth not rewriting.
 from __future__ import annotations
 
 import io
+import os
 import select
 import sys
 import threading
@@ -29,7 +30,8 @@ def terminal_approver(request: ApprovalRequest) -> bool:
 
     When it can't ask properly, the gate fails closed. That covers no
     terminal (Windows, a container, a client that launched the server
-    detached); a terminal held in raw mode by a full-screen program, such
+    detached, as the MCP Python SDK's stdio client does even when it runs
+    in a terminal); a terminal held in raw mode by a full-screen program, such
     as an MCP client's own UI, where a prompt would garble the screen and
     fight it for keystrokes; and no answer by ``request.deadline``, which
     ``Policy.approval_timeout`` sets.
@@ -61,7 +63,7 @@ def terminal_approver(request: ApprovalRequest) -> bool:
                     return False
             return tty.readline().strip().lower() == "y"
     except OSError:
-        _report_denial(request, "no terminal for approval")
+        _report_denial(request, _no_terminal_reason())
         return False
     finally:
         _tty_lock.release()
@@ -88,6 +90,23 @@ def _in_line_mode(tty: TextIO) -> bool:
         return bool(termios.tcgetattr(tty.fileno())[3] & termios.ICANON)
     except termios.error:
         return False
+
+
+def _no_terminal_reason() -> str:
+    """Why /dev/tty wouldn't open, as far as the server can tell.
+
+    The surprising case: stderr is a terminal, so the client runs in one,
+    but the server has no controlling terminal. The client started it in a
+    session of its own, which is what the MCP Python SDK's stdio client
+    does (``start_new_session=True``). A process outside the terminal's
+    session can't open /dev/tty, so there is nowhere to ask.
+    """
+    if sys.platform != "win32" and os.isatty(2):
+        return (
+            "no controlling terminal (the client likely started the server in a session "
+            "of its own, as the MCP Python SDK's stdio client does)"
+        )
+    return "no terminal for approval"
 
 
 def _report_denial(request: ApprovalRequest, why: str) -> None:

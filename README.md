@@ -32,7 +32,7 @@ pip install mcp-gatehouse
 | | |
 |---|---|
 | **Permission tiers** | Every tool is declared `READ`, `WRITE`, or `DESTRUCTIVE` — and the tier also emits honest spec `ToolAnnotations` (`readOnlyHint` / `destructiveHint`), which the wrapper won't let you override to lie. |
-| **Approval gates** | Tiers you choose require a sign-off before the tool runs. Your approver is any callable — a terminal prompt, a Slack ping, a ticket. **Fails closed:** a gated tool with no approver configured is denied, not waved through. |
+| **Approval gates** | Tiers you choose require a sign-off before the tool runs, asked right in the MCP client (Claude Code, Cursor, VS Code) or by any callable you write: a terminal prompt, a Slack ping, a ticket. **Fails closed:** a gated tool with no approver configured is denied, not waved through. |
 | **Audit log** | Append-only JSONL, one line per call — allowed, denied, failed, or cancelled — with UTC timestamps and durations. The answer to "what did the AI actually do?" six months later. |
 | **Redaction** | Argument keys you name (`api_key`, `password`, `token`, `client_secret`, … by default) are masked before they reach the log *or* the approver — however they're spelled: `apiKey`, `API-Key` and `api_key` are the same key. |
 | **Denylist** | Block a tool outright, whatever its tier. |
@@ -41,12 +41,15 @@ pip install mcp-gatehouse
 
 ```python
 from mcp.server.mcpserver import MCPServer
-from mcp_gatehouse import AccessTier, AuditLog, Gatehouse, Policy, terminal_approver
+from mcp_gatehouse import (
+    AccessTier, AuditLog, ElicitationApprover, Gatehouse, Policy, terminal_approver,
+)
 
 mcp = MCPServer("order-desk")
 gatehouse = Gatehouse(
     mcp,
-    policy=Policy(approver=terminal_approver),
+    # Ask in the client's own UI; prompt on the terminal if it can't show a form.
+    policy=Policy(approver=ElicitationApprover(fallback=terminal_approver)),
     audit=AuditLog(path="~/order-desk/audit.jsonl"),
 )
 
@@ -69,6 +72,38 @@ SDK docs show, but register tools through the gatehouse. Schema generation
 transports, and everything else work unchanged — the guard preserves the
 function's signature. Sync tools still run in a worker thread, exactly as
 they would on a bare `MCPServer`.
+
+### Approve in the client
+
+`ElicitationApprover` puts the question in front of the person using the
+MCP client, as a form with one box to tick, showing the tool, its tier and
+its arguments (secrets already masked). MCP calls this elicitation. Claude
+Code, Cursor and VS Code support it. The model can't answer the form, and
+you run nothing beside the server.
+
+It works under both protocol revisions in use:
+
+- **Up to 2025-11-25** the form goes to the client mid-call and the gate
+  waits for it, under `approval_timeout` like any approver.
+- **From 2026-07-28** there's no channel for that. The call hands the
+  question back to the client and runs when the client calls again with
+  the answer. The SDK seals that round's state and binds it to the tool
+  and its exact arguments. The gate also checks that the answer is to the
+  question it asked, that it arrived within `approval_timeout` (an hour if
+  none is set), and that each approval runs its call only once.
+
+Anything but a ticked box (decline, cancel, closing the form, an unticked
+box, a malformed answer) is a refusal. When the client can't be asked, the
+`fallback` decides; with no fallback, the call is denied. A tool that runs
+its own multi-round input flow, through `Resolve(...)` parameters or by
+returning `InputRequiredResult`, gets the fallback too, since one call has
+one such channel. Single-use is tracked per process.
+
+Elicitation trusts the client to show the form to a person. A client or
+hook set to accept forms on its own can approve too. When the approval
+must come from outside the client, use an out-of-band approver instead.
+
+### Other approvers
 
 `terminal_approver` asks on the controlling terminal (`/dev/tty`), never
 stdin — over stdio, stdin *is* the protocol pipe, so a plain `input()`
@@ -115,7 +150,11 @@ What the audit trail looks like:
 ```
 
 `outcome` is `ok`, `denied` (`reason` says why), `error` (the tool
-raised; `reason` is the exception type), or `cancelled`: the client gave
+raised; `reason` is the exception type), `pending`, or `cancelled`.
+`pending` is a call whose approval was asked in the client over the
+2026-07-28 round trip: the verdict follows on a line of its own when the
+client comes back, so a `pending` line with nothing after it is a question
+nobody answered. `cancelled` means the client gave
 up, or the server shut down, before the call finished. `reason` says
 when. `awaiting approval` means the tool never ran. `tool running` comes
 with `duration_ms`, and the tool may have done part of its work. A sync
@@ -126,8 +165,15 @@ cancellation goes on as it would without it.
 ## Try the demo
 
 The package ships a runnable order-desk server with all three tiers wired
-up and a terminal-prompt approver. Add it to any MCP client that speaks
-stdio — for Claude Desktop, in `claude_desktop_config.json`:
+up. Approvals are asked in the client when it can show a form, with a
+terminal prompt as the fallback. Add it to any MCP client that speaks
+stdio. For Claude Code:
+
+```bash
+claude mcp add gatehouse-demo -- uvx mcp-gatehouse --audit-log /tmp/gatehouse-audit.jsonl
+```
+
+For Claude Desktop, in `claude_desktop_config.json`:
 
 ```json
 {
@@ -148,8 +194,13 @@ land in the audit log either way. The audit log goes to `--audit-log`, else
 (desktop clients often launch servers from `/`). The server prints the
 path it chose to stderr.
 
-The approval prompt needs the server to have a terminal it can ask on,
-and whether it gets one depends on how the client starts it:
+In a client that supports elicitation (Claude Code, Cursor, VS Code),
+`cancel_order` brings up an approval form in the client: tick the box to
+let it run. An approval nobody gives is denied after two minutes.
+
+Other clients get the terminal fallback, which needs the server to have a
+terminal it can ask on. Whether it gets one depends on how the client
+starts it:
 
 - **TypeScript SDK clients** (the `StdioClientTransport` in 1.x and 2.x)
   keep the server in the client's terminal session. Start such a client
@@ -187,8 +238,9 @@ template.
 - **A blocking terminal approver and the stdio transport don't mix** —
   stdout/stdin are the protocol pipe. `terminal_approver` prompts on
   `/dev/tty` for exactly that reason, and denies when there's no terminal
-  or a full-screen program has it in raw mode.
-  Real deployments should approve out-of-band: Slack, a ticket, a queue.
+  or a full-screen program has it in raw mode. Asking in the client
+  (elicitation) sidesteps the terminal entirely. When the approval must
+  not come from the client, approve out-of-band: Slack, a ticket, a queue.
 - **What this is not:** authentication, transport encryption, or a sandbox.
   It's a gate inside your server, not a perimeter around it. See
   [SECURITY.md](SECURITY.md).

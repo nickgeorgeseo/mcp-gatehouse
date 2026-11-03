@@ -1,10 +1,12 @@
 """A copyable template: the demo order-desk server, spelled out.
 
 This is the same server `mcp-gatehouse-demo` runs — copy it and swap the
-ORDERS dict for your real system. The approver comes from the package
-because prompting a human is trickier than it looks: over the stdio
-transport, stdout/stdin are the protocol pipe, so the prompt must go to
-the controlling terminal (and fail closed when there isn't one).
+ORDERS dict for your real system. The approvers come from the package
+because asking a human is trickier than it looks. The first choice asks
+in the client's own UI (MCP elicitation), which works differently under
+each protocol revision. The fallback prompts on the controlling terminal,
+never stdin: over the stdio transport, stdout/stdin are the protocol
+pipe. Both fail closed when there is nobody to ask.
 """
 
 from __future__ import annotations
@@ -15,7 +17,14 @@ from typing import Annotated
 from mcp.server.mcpserver import MCPServer
 from pydantic import Field
 
-from mcp_gatehouse import AccessTier, AuditLog, Gatehouse, Policy, terminal_approver
+from mcp_gatehouse import (
+    AccessTier,
+    AuditLog,
+    ElicitationApprover,
+    Gatehouse,
+    Policy,
+    terminal_approver,
+)
 
 # A stand-in for your real system of record.
 ORDERS = {
@@ -30,7 +39,7 @@ OrderId = Annotated[
 mcp = MCPServer("order-desk")
 gatehouse = Gatehouse(
     mcp,
-    policy=Policy(approver=terminal_approver),
+    policy=Policy(approver=ElicitationApprover(fallback=terminal_approver)),
     # Anchored to this file, not the working directory: desktop clients
     # often launch servers from `/`, where a relative path isn't writable.
     audit=AuditLog(path=Path(__file__).with_name("audit.jsonl")),

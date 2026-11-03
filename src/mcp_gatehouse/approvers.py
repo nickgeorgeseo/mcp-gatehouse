@@ -155,12 +155,11 @@ class _ApprovalForm(BaseModel):
 
 
 def _default_message(request: ApprovalRequest) -> str:
-    arguments = json.dumps(request.arguments, indent=2, ensure_ascii=False, default=str)
-    return (
-        f"The AI wants to run {request.tool} ({request.tier.value}).\n\n"
-        f"Arguments:\n{arguments}\n\n"
-        "Approve this call?"
-    )
+    # Two lines, arguments on the second. Clients show only the start of a
+    # long message (Claude Code folds it after three lines), and what is
+    # being approved must never be in the folded part.
+    arguments = json.dumps(request.arguments, ensure_ascii=False, default=str)
+    return f"The AI wants to run {request.tool} ({request.tier.value}) with:\n{arguments}"
 
 
 class ElicitationApprover:

@@ -265,6 +265,7 @@ v2.x (`mcp>=2,<3`) and Python 3.10–3.14. Ships type information
 
 | `mcp-gatehouse` | SDK | Server class |
 |---|---|---|
+| `0.5.x` | `mcp>=2,<3` | `MCPServer` |
 | `0.4.x` | `mcp>=2,<3` | `MCPServer` |
 | `0.3.x` | `mcp>=2,<3` | `MCPServer` |
 | `0.2.x` | `mcp>=2,<3` | `MCPServer` |

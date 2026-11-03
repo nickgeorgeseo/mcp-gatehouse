@@ -3,7 +3,7 @@
 All notable changes to `mcp-gatehouse`. The public API (`Gatehouse`,
 `Policy`, `AuditLog`, `AccessTier`) stays compatible within a minor line.
 
-## Unreleased
+## 0.5.0 — 2026-11-02
 
 ### Added
 

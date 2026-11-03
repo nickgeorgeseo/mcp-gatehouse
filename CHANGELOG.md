@@ -5,6 +5,29 @@ All notable changes to `mcp-gatehouse`. The public API (`Gatehouse`,
 
 ## Unreleased
 
+### Added
+
+- `ElicitationApprover`: approval asked in the MCP client's own UI (MCP
+  elicitation), as a one-box form showing the tool, its tier and its
+  redacted arguments. It works under both protocol eras: mid-call over
+  the back-channel up to 2025-11-25, and as an `InputRequiredResult`
+  round trip from 2026-07-28. The round trip binds the approval to the
+  call's exact arguments, enforces `approval_timeout`, and lets each
+  approval run its call only once. A client that can't be asked hands
+  over to `fallback`, or the call is denied.
+- Audit outcome `pending`: the approval was asked in the client over the
+  round trip, and the verdict follows on its own line.
+
+### Changed
+
+- The demo asks for `cancel_order`'s approval in the client when it can,
+  so it works in Claude Code, Cursor and VS Code, and falls back to the
+  terminal prompt elsewhere. `examples/orders_server.py` does the same.
+- Registered tools that take no `Context` get a hidden `gatehouse_context`
+  parameter, kept out of the tool's input schema, so the gate can reach
+  the client. A tool parameter with that name is now refused at
+  registration.
+
 ### Fixed
 
 - The README said starting the client from an ordinary terminal lets you

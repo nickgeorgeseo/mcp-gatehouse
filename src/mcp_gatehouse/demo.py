@@ -6,8 +6,10 @@ wire it into any MCP client over stdio. Four tools, three tiers:
 - ``list_orders`` / ``lookup_order`` (READ) run freely.
 - ``add_note`` (WRITE) runs freely under the default policy — but every
   call lands in the audit log, with the ``api_key`` argument redacted.
-- ``cancel_order`` (DESTRUCTIVE) requires approval. The demo approver is a
-  terminal prompt: the model asks, *you* decide, the verdict gets logged.
+- ``cancel_order`` (DESTRUCTIVE) requires approval. The demo asks you in
+  the client's own UI when the client supports elicitation (Claude Code,
+  Cursor, VS Code), and on the server's terminal otherwise: the model
+  asks, *you* decide, the verdict gets logged.
 
 The audit log goes to ``--audit-log PATH``, else ``$MCP_GATEHOUSE_AUDIT_LOG``,
 else ``./audit.jsonl`` — falling back to ``~/.mcp-gatehouse/audit.jsonl``
@@ -27,9 +29,12 @@ from mcp.server.mcpserver import MCPServer
 from pydantic import Field
 
 from mcp_gatehouse import AccessTier, Approver, AuditLog, Gatehouse, Policy, __version__
-from mcp_gatehouse.approvers import terminal_approver
+from mcp_gatehouse.approvers import ElicitationApprover, terminal_approver
 
-__all__ = ["build_server", "main", "terminal_approver"]
+__all__ = ["DEMO_APPROVER", "build_server", "main", "terminal_approver"]
+
+#: Ask in the client when it can; else prompt on the server's terminal.
+DEMO_APPROVER = ElicitationApprover(fallback=terminal_approver)
 
 AUDIT_ENV_VAR = "MCP_GATEHOUSE_AUDIT_LOG"
 FALLBACK_AUDIT_PATH = Path.home() / ".mcp-gatehouse" / "audit.jsonl"
@@ -45,7 +50,7 @@ OrderId = Annotated[
 ]
 
 
-def build_server(audit: AuditLog, approver: Approver | None = terminal_approver) -> MCPServer:
+def build_server(audit: AuditLog, approver: Approver | None = DEMO_APPROVER) -> MCPServer:
     """The order-desk server, wired through a gatehouse. Nothing happens at
     import time — no server, no log file — until you call this."""
     mcp = MCPServer(
@@ -54,13 +59,14 @@ def build_server(audit: AuditLog, approver: Approver | None = terminal_approver)
         website_url="https://github.com/nickgeorgeseo/mcp-gatehouse",
         instructions=(
             "A demo order desk behind mcp-gatehouse. Reads run freely; "
-            "add_note is logged; cancel_order needs a human's approval on "
-            "the server's terminal and is denied if nobody approves within "
-            "two minutes. Every call, allowed or denied, is written to an "
-            "audit log."
+            "add_note is logged; cancel_order needs a human's approval, "
+            "asked in this client when it supports elicitation and on the "
+            "server's terminal otherwise, and is denied if nobody approves "
+            "within two minutes. Every call, allowed or denied, is written "
+            "to an audit log."
         ),
     )
-    # A prompt nobody answers is denied and logged after two minutes, rather
+    # An approval nobody gives is denied and logged after two minutes, rather
     # than left hanging until the client gives up.
     policy = Policy(approver=approver, approval_timeout=120)
     gatehouse = Gatehouse(mcp, policy=policy, audit=audit)
@@ -105,10 +111,11 @@ def build_server(audit: AuditLog, approver: Approver | None = terminal_approver)
     @gatehouse.tool(tier=AccessTier.DESTRUCTIVE)
     def cancel_order(order_id: OrderId) -> str:
         """Cancel an order. Irreversible, so it is gated: a human must approve
-        on the server's terminal before it runs. If they refuse, don't answer
-        within two minutes, or there is no terminal to ask on, the call is
-        denied and the refusal is logged. To record
-        information without cancelling, use add_note."""
+        before it runs, in this client's approval form if it shows one, else
+        on the server's terminal. If they refuse, don't answer within two
+        minutes, or there is nowhere to ask, the call is denied and the
+        refusal is logged. To record information without cancelling, use
+        add_note."""
         if order_id not in ORDERS:
             return f"no order {order_id}"
         ORDERS[order_id]["status"] = "cancelled"

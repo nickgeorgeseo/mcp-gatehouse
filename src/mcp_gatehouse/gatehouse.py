@@ -17,10 +17,11 @@ from typing import Any, Callable, TypeVar
 
 import anyio
 import anyio.to_thread
-from mcp.server.mcpserver import MCPServer
+from mcp.server.mcpserver import Context, MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
-from mcp.types import ToolAnnotations
+from mcp.types import InputRequiredResult, ToolAnnotations
 
+from .approvers import ElicitationApprover
 from .audit import AuditLog, NullAuditLog
 from .policy import AccessTier, ApprovalRequest, Policy, redact_arguments
 
@@ -30,6 +31,11 @@ F = TypeVar("F", bound=Callable[..., Any])
 # Sync tools draw on that pool; approvers wait on people. If they shared it,
 # a stack of pending sign-offs would leave no thread for a plain read.
 _APPROVER_THREADS = 40
+
+# The parameter the guard adds, out of the tool's schema, so MCPServer hands
+# it the call's Context when the tool takes none itself. Asking the client
+# for approval needs one. No leading underscore: MCPServer rejects those.
+_CONTEXT_PARAM = "gatehouse_context"
 
 
 class GateDenied(PermissionError, ToolError):
@@ -125,9 +131,15 @@ class Gatehouse:
     def _guard(self, fn: Callable[..., Any], tool_name: str, tier: AccessTier) -> Callable[..., Any]:
         policy, audit, approver_limiter = self.policy, self.audit, self._approver_limiter
         signature = inspect.signature(fn)
+        # A tool that resolves or returns its own InputRequiredResult owns the
+        # call's one multi-round channel, so the gate can't ask over it.
+        round_trip = not _runs_own_rounds(fn)
 
-        async def enforce(safe_args: dict[str, Any]) -> None:
+        async def enforce(safe_args: dict[str, Any], context: Context | None) -> InputRequiredResult | None:
             """Raise GateDenied unless the policy allows this call.
+
+            Returns an ``InputRequiredResult`` instead when the approval is
+            being asked in the client and the call must wait for its answer.
 
             Gets the redacted arguments only: the raw ones never reach the
             log or the approver.
@@ -165,15 +177,43 @@ class Gatehouse:
                 arguments=copy.deepcopy(safe_args),
                 deadline=None if timeout is None else time.monotonic() + timeout,
             )
+            ask = functools.partial(policy.approver, request)
+            if isinstance(policy.approver, ElicitationApprover):
+                elicitor = policy.approver
+                transport = elicitor.transport(context, round_trip=round_trip)
+                if transport == "round-trip":
+                    verdict = elicitor.answer(request, context)
+                    if verdict is None:
+                        # The call ends here for now, and the client calls
+                        # again with the answer. If it never does, this line
+                        # is the record that it was asked.
+                        audit.record(
+                            tool=tool_name, tier=tier.value, outcome="pending",
+                            reason="approval asked in client", arguments=safe_args,
+                        )
+                        return elicitor.question(request, timeout)
+                    allowed, reason = verdict
+                    if not allowed:
+                        raise denied(reason, _refusal(tool_name, reason))
+                    return None
+                if transport == "back-channel":
+                    ask = functools.partial(elicitor.ask, request, context)
+                elif elicitor.fallback is not None:
+                    ask = functools.partial(elicitor.fallback, request)
+                else:
+                    raise denied(
+                        "approval required, client cannot be asked",
+                        f"'{tool_name}' ({tier.value}) requires approval, and this "
+                        "client can't be asked for it (no form elicitation). "
+                        "The gate fails closed.",
+                    )
             try:
                 # move_on_after, not fail_after: an approver that raises
                 # TimeoutError itself (a Slack call timing out) is an approver
                 # error, not the gate's deadline.
                 with anyio.move_on_after(timeout) as waiting:
                     approved = await _call(
-                        functools.partial(policy.approver, request),
-                        limiter=approver_limiter,
-                        abandon_on_cancel=True,
+                        ask, limiter=approver_limiter, abandon_on_cancel=True
                     )
             except Exception as exc:
                 # An approver that can't answer (Slack down, ticket API timing
@@ -202,11 +242,16 @@ class Gatehouse:
                     "The gate fails closed.",
                 )
             if not approved:
-                raise denied("approver refused", f"'{tool_name}' was refused by the approver.")
+                raise denied("approver refused", _refusal(tool_name, "approver refused"))
+            return None
 
-        async def run(arguments: dict[str, Any], args: tuple, kwargs: dict[str, Any]) -> Any:
+        async def run(
+            arguments: dict[str, Any], args: tuple, kwargs: dict[str, Any], context: Context | None
+        ) -> Any:
             safe_args = redact_arguments(arguments, policy.redact)
-            await enforce(safe_args)
+            question = await enforce(safe_args, context)
+            if question is not None:
+                return question
             start = time.perf_counter()
             try:
                 result = await _call(functools.partial(fn, *args, **kwargs))
@@ -247,14 +292,60 @@ class Gatehouse:
         # signature is computed once, above, not on every call.
         @functools.wraps(fn)
         async def guarded(*args: Any, **kwargs: Any) -> Any:
+            context = kwargs.pop(_CONTEXT_PARAM, None) if ctx_param is None else None
             bound = signature.bind(*args, **kwargs)
             bound.apply_defaults()
             arguments = dict(bound.arguments)
             if ctx_param is not None:
-                arguments.pop(ctx_param, None)
-            return await run(arguments, args, kwargs)
+                context = arguments.pop(ctx_param, None)
+            return await run(arguments, args, kwargs, context)
+
+        if ctx_param is None:
+            # The tool takes no Context, so the guard asks for one under a
+            # name of its own. __signature__ wins over __wrapped__, and its
+            # Context annotation keeps the parameter out of the schema.
+            if _CONTEXT_PARAM in signature.parameters:
+                raise ValueError(
+                    f"'{_CONTEXT_PARAM}' is a parameter name mcp-gatehouse reserves; "
+                    "rename the tool's parameter"
+                )
+            # Evaluated here, where fn's own globals resolve string annotations:
+            # MCPServer takes a __signature__ as it is and evaluates nothing.
+            try:
+                exposed = inspect.signature(fn, eval_str=True)
+            except Exception:
+                exposed = signature
+            params = list(exposed.parameters.values())
+            hidden = inspect.Parameter(
+                _CONTEXT_PARAM, inspect.Parameter.KEYWORD_ONLY, default=None, annotation=Context
+            )
+            at = len(params) - (bool(params) and params[-1].kind is inspect.Parameter.VAR_KEYWORD)
+            guarded.__signature__ = exposed.replace(parameters=[*params[:at], hidden, *params[at:]])
+            # A copy: wraps() shares fn's own dict, which must stay untouched.
+            guarded.__annotations__ = {**getattr(fn, "__annotations__", {}), _CONTEXT_PARAM: Context}
 
         return guarded
+
+
+def _refusal(tool_name: str, reason: str) -> str:
+    """What the model is told when an approval comes back no."""
+    if reason == "approval timed out":
+        return f"'{tool_name}' was not approved in time. The gate fails closed."
+    if reason == "approval already used":
+        return f"'{tool_name}': that approval was already used. Each approval runs one call."
+    if reason.startswith("approver error"):
+        return f"'{tool_name}' could not be approved: the approver failed. The gate fails closed."
+    return f"'{tool_name}' was refused by the approver."
+
+
+def _runs_own_rounds(fn: Callable[..., Any]) -> bool:
+    """Does the tool drive the call's multi-round input flow itself?"""
+    try:
+        from mcp.server.mcpserver.resolve import find_resolved_parameters, returns_input_required
+
+        return bool(find_resolved_parameters(fn)) or returns_input_required(fn)
+    except Exception:
+        return True  # can't tell, so stay off the channel: the fallback decides
 
 
 async def _call(

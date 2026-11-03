@@ -27,6 +27,12 @@ proxy, no external policy service, no dependencies beyond the official
 pip install mcp-gatehouse
 ```
 
+[![mcp-gatehouse demo on YouTube: the install, tiers, a cancel refused and one approved, and the audit log](https://img.youtube.com/vi/9_S4NAPcYjM/maxresdefault.jpg)](https://youtu.be/9_S4NAPcYjM)
+
+The [1:21 demo](https://youtu.be/9_S4NAPcYjM) runs the package's demo
+server in a terminal: the install, the one-decorator change, a cancel
+refused and one approved, and the audit log they left. No sound.
+
 ## What you get
 
 | | |

@@ -13,7 +13,9 @@ import copy
 import functools
 import inspect
 import time
-from typing import Any, Callable, TypeVar
+import warnings
+from collections.abc import Callable, Mapping
+from typing import Any, TypeVar, overload
 
 import anyio
 import anyio.to_thread
@@ -23,9 +25,12 @@ from mcp.types import InputRequiredResult, ToolAnnotations
 
 from .approvers import ElicitationApprover
 from .audit import AuditLog, NullAuditLog
-from .policy import AccessTier, ApprovalRequest, Policy, redact_arguments
+from .policy import AccessTier, ApprovalRequest, Policy, _as_tier, redact_arguments
 
 F = TypeVar("F", bound=Callable[..., Any])
+
+# Tells "no tier given" apart from any tier, so the gate can say so.
+_NO_TIER: Any = object()
 
 # Worker threads for sync approvers, kept apart from anyio's default pool.
 # Sync tools draw on that pool; approvers wait on people. If they shared it,
@@ -56,12 +61,41 @@ class GateDenied(PermissionError, ToolError):
     """
 
 
-def _annotations_for(tier: AccessTier, title: str | None) -> ToolAnnotations:
-    return ToolAnnotations(
-        title=title,
-        readOnlyHint=tier is AccessTier.READ,
-        destructiveHint=tier is AccessTier.DESTRUCTIVE,
-    )
+def _annotations_for(
+    tier: AccessTier, title: str | None, given: ToolAnnotations | Mapping[str, Any] | None = None
+) -> ToolAnnotations:
+    """The tool's spec hints: ``readOnlyHint`` / ``destructiveHint`` from the
+    tier, anything else (``idempotentHint``, ``openWorldHint``) from ``given``.
+
+    The tier's two hints aren't up for negotiation. ``given`` may repeat
+    them, but one that contradicts the tier is refused: a client trusts
+    those hints, so they must say what the gate enforces.
+    """
+    derived = {"read_only_hint": tier is AccessTier.READ, "destructive_hint": tier is AccessTier.DESTRUCTIVE}
+    if given is None:
+        base = ToolAnnotations()
+    elif isinstance(given, ToolAnnotations):
+        base = given
+    elif isinstance(given, Mapping):
+        fields = ToolAnnotations.model_fields
+        known = set(fields) | {f.alias for f in fields.values() if f.alias}
+        unknown = sorted(set(map(str, given)) - known)
+        if unknown:
+            # Pydantic would drop these without a word; a misspelled hint
+            # should not quietly vanish.
+            raise ValueError(f"unknown tool annotation(s) {unknown}; known: {sorted(known)}")
+        base = ToolAnnotations.model_validate(dict(given))
+    else:
+        raise TypeError(f"annotations must be a ToolAnnotations or a mapping, not {type(given).__name__}")
+    for hint, value in derived.items():
+        claimed = getattr(base, hint)
+        if claimed is not None and claimed != value:
+            alias = ToolAnnotations.model_fields[hint].alias or hint
+            raise ValueError(
+                f"annotations {alias}={claimed} contradicts tier {tier.value!r}, which sets it to {value}; "
+                "change the tier instead"
+            )
+    return base.model_copy(update={**derived, "title": title if title is not None else base.title})
 
 
 class Gatehouse:
@@ -72,11 +106,15 @@ class Gatehouse:
         mcp = MCPServer("orders")
         gk = Gatehouse(mcp, policy=Policy(...), audit=AuditLog(path="audit.jsonl"))
 
-        @gk.tool(tier=AccessTier.READ)
+        @gk.read
         def lookup_order(order_id: str) -> str: ...
 
-        @gk.tool(tier=AccessTier.DESTRUCTIVE)
+        @gk.destructive
         def cancel_order(order_id: str) -> str: ...
+
+    ``@gk.tool(tier=...)`` is the long form, and ``gk.add_tool(fn, tier=...)``
+    registers without a decorator. Each returns (or keeps) your function
+    unwrapped: calling it directly, in a unit test say, skips the gate.
     """
 
     def __init__(
@@ -92,41 +130,109 @@ class Gatehouse:
 
     def tool(
         self,
-        tier: AccessTier = AccessTier.READ,
+        tier: AccessTier | str = _NO_TIER,
         *,
         name: str | None = None,
         title: str | None = None,
         description: str | None = None,
+        annotations: ToolAnnotations | Mapping[str, Any] | None = None,
         **tool_kwargs: Any,
     ) -> Callable[[F], F]:
         """Register a tool on the wrapped server, with enforcement.
 
+        ``tier`` is an :class:`AccessTier` or its name (``"write"``). Leaving
+        it out still registers the tool as ``READ``, with a ``FutureWarning``:
+        that's ungated, and tells clients the tool is read-only, whatever it
+        does. A future release will require it.
+
         Accepts any extra keyword arguments ``MCPServer.tool`` understands
-        and forwards them untouched. ``annotations`` is derived from the
-        tier and cannot be overridden — the hints must stay honest.
+        and forwards them untouched. ``annotations`` may set the hints the
+        tier doesn't decide (``idempotentHint``, ``openWorldHint``); the
+        tier sets ``readOnlyHint`` and ``destructiveHint``, and an
+        ``annotations`` value contradicting them is refused, so the hints
+        stay honest.
         """
         if callable(tier):
             raise TypeError(
-                "use @gatehouse.tool(...) with parentheses, not @gatehouse.tool"
+                "use @gatehouse.tool(...) with parentheses, not @gatehouse.tool "
+                "(or @gatehouse.read / .write / .destructive, which take either)"
             )
-        if "annotations" in tool_kwargs:
-            raise ValueError(
-                "annotations are derived from the tier; set tier=... instead"
-            )
+        unclassified = tier is _NO_TIER
+        resolved = AccessTier.READ if unclassified else _as_tier(tier)
+        # Checked now, not on the first call: a mistake here should stop the
+        # server starting, not surface as a crash mid-conversation.
+        tool_annotations = _annotations_for(resolved, title, annotations)
 
         def decorator(fn: F) -> F:
             tool_name = name or fn.__name__
-            guarded = self._guard(fn, tool_name, tier)
+            if unclassified:
+                warnings.warn(
+                    f"mcp-gatehouse: tool {tool_name!r} has no tier, so it is registered as READ: "
+                    "it runs without approval and clients are told it is read-only. Pass tier=... "
+                    "(or use @gatehouse.read / .write / .destructive). A future release will require it.",
+                    FutureWarning,
+                    stacklevel=2,
+                )
+            guarded = self._guard(fn, tool_name, resolved)
             self.server.tool(
                 name=tool_name,
                 title=title,
                 description=description,
-                annotations=_annotations_for(tier, title),
+                annotations=tool_annotations,
                 **tool_kwargs,
             )(guarded)
             return fn
 
         return decorator
+
+    def add_tool(self, fn: Callable[..., Any], tier: AccessTier | str, **tool_kwargs: Any) -> None:
+        """Register ``fn`` as a gated tool without a decorator, the way
+        ``MCPServer.add_tool`` does: in a loop, or for a function defined
+        elsewhere. Takes the same keyword arguments as :meth:`tool`."""
+        self.tool(tier, **tool_kwargs)(fn)
+
+    @overload
+    def read(self, fn: F, /) -> F: ...
+    @overload
+    def read(self, fn: None = None, /, **tool_kwargs: Any) -> Callable[[F], F]: ...
+    def read(self, fn: F | None = None, /, **tool_kwargs: Any) -> F | Callable[[F], F]:
+        """Register a ``READ`` tool: looks things up, never changes state.
+        Use as ``@gatehouse.read`` or ``@gatehouse.read(name=..., ...)``."""
+        return self._tier_decorator(AccessTier.READ, fn, tool_kwargs)
+
+    @overload
+    def write(self, fn: F, /) -> F: ...
+    @overload
+    def write(self, fn: None = None, /, **tool_kwargs: Any) -> Callable[[F], F]: ...
+    def write(self, fn: F | None = None, /, **tool_kwargs: Any) -> F | Callable[[F], F]:
+        """Register a ``WRITE`` tool: creates or updates, reversible with
+        effort. Use as ``@gatehouse.write`` or ``@gatehouse.write(...)``."""
+        return self._tier_decorator(AccessTier.WRITE, fn, tool_kwargs)
+
+    @overload
+    def destructive(self, fn: F, /) -> F: ...
+    @overload
+    def destructive(self, fn: None = None, /, **tool_kwargs: Any) -> Callable[[F], F]: ...
+    def destructive(self, fn: F | None = None, /, **tool_kwargs: Any) -> F | Callable[[F], F]:
+        """Register a ``DESTRUCTIVE`` tool: deletes, sends or pays. Gated
+        under the default policy. Use as ``@gatehouse.destructive`` or
+        ``@gatehouse.destructive(...)``."""
+        return self._tier_decorator(AccessTier.DESTRUCTIVE, fn, tool_kwargs)
+
+    def _tier_decorator(
+        self, tier: AccessTier, fn: F | None, tool_kwargs: dict[str, Any]
+    ) -> F | Callable[[F], F]:
+        if "tier" in tool_kwargs:
+            raise TypeError(f"@gatehouse.{tier.value} sets the tier itself; use @gatehouse.tool(tier=...) to pass one")
+        decorator: Callable[[F], F] = self.tool(tier, **tool_kwargs)
+        if fn is None:
+            return decorator
+        if not callable(fn):
+            raise TypeError(
+                f"@gatehouse.{tier.value}(...) takes keyword arguments only "
+                f"(name=..., title=...), not {type(fn).__name__}"
+            )
+        return decorator(fn)
 
     def _guard(self, fn: Callable[..., Any], tool_name: str, tier: AccessTier) -> Callable[..., Any]:
         policy, audit, approver_limiter = self.policy, self.audit, self._approver_limiter

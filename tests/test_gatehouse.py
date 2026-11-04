@@ -176,8 +176,10 @@ async def test_input_schema_survives_the_wrapper():
 
 
 def test_annotations_kwarg_is_rejected():
+    """Annotations may add hints the tier doesn't decide, but never
+    contradict the ones it does (see test_inputs.py)."""
     gk = Gatehouse(MCPServer("x"))
-    with pytest.raises(ValueError, match="derived from the tier"):
+    with pytest.raises(ValueError, match="contradicts tier 'read'"):
 
         @gk.tool(tier=AccessTier.READ, annotations={"readOnlyHint": False})
         def sneaky() -> str:

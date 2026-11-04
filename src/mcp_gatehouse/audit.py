@@ -13,7 +13,25 @@ import json
 import os
 import threading
 from pathlib import Path
-from typing import Any, TextIO
+from typing import Any, Protocol, TextIO, runtime_checkable
+
+
+@runtime_checkable
+class AuditSink(Protocol):
+    """Anything the gate can hand its audit events to.
+
+    One method: ``record(**event)``, called once per outcome with ``tool``,
+    ``tier``, ``outcome`` and the redacted ``arguments``, plus ``reason``
+    and ``duration_ms`` where they apply. Send them to a database, a SIEM
+    or your logging stack by writing a class with that method.
+
+    A sink that raises doesn't change the call: the failure is logged (at
+    ERROR, on the ``mcp_gatehouse`` logger) and the call's result stands.
+    By the time most records are written the tool has already run, and
+    telling the model it failed would invite it to run it again.
+    """
+
+    def record(self, **event: Any) -> None: ...
 
 
 class AuditLog:
@@ -52,8 +70,7 @@ class AuditLog:
         friends, so a crafted argument value can never split one record
         into two for line-aware readers. One ``\\n`` per record, always.
         """
-        event = {"ts": _dt.datetime.now(_dt.timezone.utc).isoformat(), **event}
-        line = json.dumps(event, ensure_ascii=True, default=str)
+        line = _line(event)
         with self._lock:
             self._stream.write(line + "\n")
             self._stream.flush()
@@ -69,11 +86,48 @@ class AuditLog:
         self.close()
 
 
+def _line(event: dict[str, Any]) -> str:
+    """One record as the file holds it: a ``ts`` first, then the event."""
+    stamped = {"ts": _dt.datetime.now(_dt.timezone.utc).isoformat(), **event}
+    return json.dumps(stamped, ensure_ascii=True, default=str)
+
+
 class NullAuditLog(AuditLog):
     """An audit log that swallows everything. For tests and dry runs."""
 
     def __init__(self) -> None:
         super().__init__(stream=io.StringIO())
 
-    def record(self, **event: Any) -> None:  # noqa: D102 — intentionally inert
+    def record(self, **event: Any) -> None:
         pass
+
+
+class MemoryAuditLog(AuditLog):
+    """Keeps every record in memory, in :attr:`events`. For tests::
+
+        audit = MemoryAuditLog()
+        gatehouse = Gatehouse(mcp, audit=audit)
+        ...
+        assert audit.outcomes() == [("denied", "approver refused")]
+
+    Each event is exactly what a line of the JSONL file would parse back
+    to, ``ts`` included, so a test written against it holds for the file.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(stream=io.StringIO())
+        self.events: list[dict[str, Any]] = []
+        """Every record so far, oldest first."""
+
+    def record(self, **event: Any) -> None:
+        parsed = json.loads(_line(event))
+        with self._lock:
+            self.events.append(parsed)
+
+    def outcomes(self) -> list[tuple[str, str | None]]:
+        """``(outcome, reason)`` for each record, oldest first."""
+        return [(e["outcome"], e.get("reason")) for e in self.events]
+
+    def clear(self) -> None:
+        with self._lock:
+            self.events.clear()

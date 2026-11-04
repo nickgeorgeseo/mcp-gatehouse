@@ -12,6 +12,8 @@ from __future__ import annotations
 import copy
 import functools
 import inspect
+import logging
+import os
 import time
 import warnings
 from collections.abc import Callable, Mapping
@@ -24,10 +26,12 @@ from mcp.server.mcpserver.exceptions import ToolError
 from mcp.types import InputRequiredResult, ToolAnnotations
 
 from .approvers import ElicitationApprover
-from .audit import AuditLog, NullAuditLog
+from .audit import AuditLog, AuditSink, NullAuditLog
 from .policy import AccessTier, ApprovalRequest, Policy, _as_tier, redact_arguments
 
 F = TypeVar("F", bound=Callable[..., Any])
+
+_log = logging.getLogger("mcp_gatehouse")
 
 # Tells "no tier given" apart from any tier, so the gate can say so.
 _NO_TIER: Any = object()
@@ -121,11 +125,25 @@ class Gatehouse:
         self,
         server: MCPServer,
         policy: Policy | None = None,
-        audit: AuditLog | None = None,
+        audit: AuditSink | str | os.PathLike[str] | None = None,
     ) -> None:
+        """``audit`` is an :class:`AuditLog`, any :class:`AuditSink`, or a
+        path, which opens an ``AuditLog`` there. ``None`` keeps no log.
+
+        ``policy`` and ``audit`` are read on every call, so assigning a new
+        one to ``gatehouse.policy`` or ``gatehouse.audit`` takes effect on
+        the next call to any tool, registered before or after.
+        """
         self.server = server
-        self.policy = policy or Policy()
-        self.audit = audit or NullAuditLog()
+        self.policy: Policy = policy or Policy()
+        if isinstance(audit, (str, os.PathLike)):
+            audit = AuditLog(path=audit)
+        elif audit is not None and not callable(getattr(audit, "record", None)):
+            raise TypeError(
+                f"audit must be an AuditLog, a path, or an object with a record(**event) method; "
+                f"got {type(audit).__name__}"
+            )
+        self.audit: AuditSink = audit if audit is not None else NullAuditLog()
         self._approver_limiter = anyio.CapacityLimiter(_APPROVER_THREADS)
 
     def tool(
@@ -235,13 +253,15 @@ class Gatehouse:
         return decorator(fn)
 
     def _guard(self, fn: Callable[..., Any], tool_name: str, tier: AccessTier) -> Callable[..., Any]:
-        policy, audit, approver_limiter = self.policy, self.audit, self._approver_limiter
+        approver_limiter = self._approver_limiter
         signature = inspect.signature(fn)
         # A tool that resolves or returns its own InputRequiredResult owns the
         # call's one multi-round channel, so the gate can't ask over it.
         round_trip = not _runs_own_rounds(fn)
 
-        async def enforce(safe_args: dict[str, Any], context: Context | None) -> InputRequiredResult | None:
+        async def enforce(
+            policy: Policy, audit: AuditSink, safe_args: dict[str, Any], context: Context | None
+        ) -> InputRequiredResult | None:
             """Raise GateDenied unless the policy allows this call.
 
             Returns an ``InputRequiredResult`` instead when the approval is
@@ -253,8 +273,8 @@ class Gatehouse:
 
             def denied(reason: str, message: str) -> GateDenied:
                 """Record the denial; return the error that tells the model why."""
-                audit.record(
-                    tool=tool_name, tier=tier.value, outcome="denied",
+                _record(
+                    audit, tool=tool_name, tier=tier.value, outcome="denied",
                     reason=reason, arguments=safe_args,
                 )
                 return GateDenied(message)
@@ -263,11 +283,11 @@ class Gatehouse:
                 raise denied("denylist", f"'{tool_name}' is blocked by policy.")
 
             if not policy.needs_approval(tier):
-                return
+                return None
 
             if policy.approver is None:
                 if not policy.fail_closed:
-                    return
+                    return None
                 raise denied(
                     "approval required, no approver configured",
                     f"'{tool_name}' ({tier.value}) requires approval and "
@@ -283,7 +303,7 @@ class Gatehouse:
                 arguments=copy.deepcopy(safe_args),
                 deadline=None if timeout is None else time.monotonic() + timeout,
             )
-            ask = functools.partial(policy.approver, request)
+            ask: Callable[[], Any] = functools.partial(policy.approver, request)
             if isinstance(policy.approver, ElicitationApprover):
                 elicitor = policy.approver
                 transport = elicitor.transport(context, round_trip=round_trip)
@@ -293,8 +313,8 @@ class Gatehouse:
                         # The call ends here for now, and the client calls
                         # again with the answer. If it never does, this line
                         # is the record that it was asked.
-                        audit.record(
-                            tool=tool_name, tier=tier.value, outcome="pending",
+                        _record(
+                            audit, tool=tool_name, tier=tier.value, outcome="pending",
                             reason="approval asked in client", arguments=safe_args,
                         )
                         return elicitor.question(request, timeout)
@@ -336,8 +356,8 @@ class Gatehouse:
                 # sees it, and the gate's own timeout never gets this far:
                 # move_on_after catches that one. Log it, then let it carry
                 # on as is: swallowing it would keep a cancelled task running.
-                audit.record(
-                    tool=tool_name, tier=tier.value, outcome="cancelled",
+                _record(
+                    audit, tool=tool_name, tier=tier.value, outcome="cancelled",
                     reason="awaiting approval", arguments=safe_args,
                 )
                 raise
@@ -352,10 +372,14 @@ class Gatehouse:
             return None
 
         async def run(
-            arguments: dict[str, Any], args: tuple, kwargs: dict[str, Any], context: Context | None
+            arguments: dict[str, Any], args: tuple[Any, ...], kwargs: dict[str, Any], context: Context | None
         ) -> Any:
+            # Read once per call, not at registration: replacing
+            # gatehouse.policy or gatehouse.audit takes effect on the next
+            # call, and one call never sees two policies.
+            policy, audit = self.policy, self.audit
             safe_args = redact_arguments(arguments, policy.redact)
-            question = await enforce(safe_args, context)
+            question = await enforce(policy, audit, safe_args, context)
             if question is not None:
                 return question
             start = time.perf_counter()
@@ -364,10 +388,11 @@ class Gatehouse:
             except Exception as exc:
                 # Only the exception TYPE goes in the log. Exception messages
                 # routinely embed argument values ("invalid api key: sk-…"),
-                # which would defeat redaction. The client still receives the
-                # full message through the normal tool-error path.
-                audit.record(
-                    tool=tool_name, tier=tier.value, outcome="error",
+                # which would defeat redaction. The client gets what the SDK
+                # gives it either way: a ToolError's message, or for anything
+                # else just "Error executing tool <name>".
+                _record(
+                    audit, tool=tool_name, tier=tier.value, outcome="error",
                     reason=type(exc).__name__, arguments=safe_args,
                     duration_ms=round((time.perf_counter() - start) * 1000, 2),
                 )
@@ -375,14 +400,14 @@ class Gatehouse:
             except anyio.get_cancelled_exc_class():
                 # Cancelled mid-run, as in enforce. The tool may have done
                 # part of its work, which is exactly what the trail is for.
-                audit.record(
-                    tool=tool_name, tier=tier.value, outcome="cancelled",
+                _record(
+                    audit, tool=tool_name, tier=tier.value, outcome="cancelled",
                     reason="tool running", arguments=safe_args,
                     duration_ms=round((time.perf_counter() - start) * 1000, 2),
                 )
                 raise
-            audit.record(
-                tool=tool_name, tier=tier.value, outcome="ok", arguments=safe_args,
+            _record(
+                audit, tool=tool_name, tier=tier.value, outcome="ok", arguments=safe_args,
                 duration_ms=round((time.perf_counter() - start) * 1000, 2),
             )
             return result
@@ -431,6 +456,25 @@ class Gatehouse:
             guarded.__annotations__ = {**getattr(fn, "__annotations__", {}), _CONTEXT_PARAM: Context}
 
         return guarded
+
+
+def _record(audit: AuditSink, **event: Any) -> None:
+    """Hand one event to the sink. If the sink fails, say so loudly and
+    carry on: the record is lost either way, and the call's outcome must
+    not change with it.
+
+    That matters most after the tool ran. A sink that raised there (a full
+    disk, a database down) turned a call that had done its work into an
+    error, so the model was told it failed, and might well run it again: a
+    second refund. And a denial lost its reason and logged a crash.
+    """
+    try:
+        audit.record(**event)
+    except Exception:
+        _log.error(
+            "mcp-gatehouse: the audit sink failed to record %r (outcome %r); this record is lost",
+            event.get("tool"), event.get("outcome"), exc_info=True,
+        )
 
 
 def _refusal(tool_name: str, reason: str) -> str:

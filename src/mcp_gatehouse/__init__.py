@@ -8,7 +8,7 @@ write, and what's off-limits — and every action gets logged.
 from importlib.metadata import PackageNotFoundError, version
 
 from .approvers import ElicitationApprover, terminal_approver
-from .audit import AuditLog, NullAuditLog
+from .audit import AuditLog, AuditSink, MemoryAuditLog, NullAuditLog
 from .gatehouse import GateDenied, Gatehouse
 from .policy import (
     DEFAULT_REDACT,
@@ -25,9 +25,11 @@ __all__ = [
     "ApprovalRequest",
     "Approver",
     "AuditLog",
+    "AuditSink",
     "ElicitationApprover",
     "GateDenied",
     "Gatehouse",
+    "MemoryAuditLog",
     "NullAuditLog",
     "Policy",
     "redact_arguments",

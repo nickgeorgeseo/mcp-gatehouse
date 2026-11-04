@@ -23,12 +23,12 @@ import argparse
 import os
 import sys
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Any
 
 from mcp.server.mcpserver import MCPServer
 from pydantic import Field
 
-from mcp_gatehouse import AccessTier, Approver, AuditLog, Gatehouse, Policy, __version__
+from mcp_gatehouse import Approver, AuditLog, Gatehouse, Policy, __version__
 from mcp_gatehouse.approvers import ElicitationApprover, terminal_approver
 
 __all__ = ["DEMO_APPROVER", "build_server", "main", "terminal_approver"]
@@ -40,7 +40,7 @@ AUDIT_ENV_VAR = "MCP_GATEHOUSE_AUDIT_LOG"
 FALLBACK_AUDIT_PATH = Path.home() / ".mcp-gatehouse" / "audit.jsonl"
 
 # A stand-in for your real system of record.
-ORDERS = {
+ORDERS: dict[str, dict[str, Any]] = {
     "4417": {"customer": "Blue Ridge Cabinets", "status": "packed", "notes": []},
     "4418": {"customer": "Piedmont Supply", "status": "picking", "notes": []},
 }
@@ -71,7 +71,7 @@ def build_server(audit: AuditLog, approver: Approver | None = DEMO_APPROVER) -> 
     policy = Policy(approver=approver, approval_timeout=120)
     gatehouse = Gatehouse(mcp, policy=policy, audit=audit)
 
-    @gatehouse.tool(tier=AccessTier.READ)
+    @gatehouse.read
     def list_orders() -> str:
         """List every order on the desk as `id · customer · status`, one per
         line. Read-only. Start here to find the order ID that lookup_order,
@@ -80,7 +80,7 @@ def build_server(audit: AuditLog, approver: Approver | None = DEMO_APPROVER) -> 
             f"{oid} · {o['customer']} · {o['status']}" for oid, o in ORDERS.items()
         )
 
-    @gatehouse.tool(tier=AccessTier.READ)
+    @gatehouse.read
     def lookup_order(order_id: OrderId) -> str:
         """Look up one order's customer, status and notes. Read-only; changes
         nothing. Returns `no order <id>` if the ID doesn't exist."""
@@ -90,7 +90,7 @@ def build_server(audit: AuditLog, approver: Approver | None = DEMO_APPROVER) -> 
         notes = "; ".join(order["notes"]) or "none"
         return f"{order_id} · {order['customer']} · {order['status']} · notes: {notes}"
 
-    @gatehouse.tool(tier=AccessTier.WRITE)
+    @gatehouse.write
     def add_note(
         order_id: OrderId,
         note: Annotated[str, Field(description="Free-text note to append, e.g. 'customer asked for a callback'.")],
@@ -108,7 +108,7 @@ def build_server(audit: AuditLog, approver: Approver | None = DEMO_APPROVER) -> 
         ORDERS[order_id]["notes"].append(note)
         return f"note added to {order_id}"
 
-    @gatehouse.tool(tier=AccessTier.DESTRUCTIVE)
+    @gatehouse.destructive
     def cancel_order(order_id: OrderId) -> str:
         """Cancel an order. Irreversible, so it is gated: a human must approve
         before it runs, in this client's approval form if it shows one, else
@@ -141,8 +141,11 @@ def open_audit_log(path: str | None = None) -> AuditLog:
 
 
 def main(argv: list[str] | None = None) -> None:
+    # Both entry points run this; name whichever was used (`uvx mcp-gatehouse`
+    # said "mcp-gatehouse-demo" in --version and --help).
+    invoked = Path(sys.argv[0]).name
     parser = argparse.ArgumentParser(
-        prog="mcp-gatehouse-demo",
+        prog=invoked if invoked.startswith("mcp-gatehouse") else "mcp-gatehouse-demo",
         description="Demo MCP server (stdio): an order desk behind a gatehouse.",
     )
     parser.add_argument(

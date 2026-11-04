@@ -12,22 +12,15 @@ pipe. Both fail closed when there is nobody to ask.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Any
 
 from mcp.server.mcpserver import MCPServer
 from pydantic import Field
 
-from mcp_gatehouse import (
-    AccessTier,
-    AuditLog,
-    ElicitationApprover,
-    Gatehouse,
-    Policy,
-    terminal_approver,
-)
+from mcp_gatehouse import ElicitationApprover, Gatehouse, Policy, terminal_approver
 
 # A stand-in for your real system of record.
-ORDERS = {
+ORDERS: dict[str, dict[str, Any]] = {
     "4417": {"customer": "Blue Ridge Cabinets", "status": "packed", "notes": []},
     "4418": {"customer": "Piedmont Supply", "status": "picking", "notes": []},
 }
@@ -40,20 +33,21 @@ mcp = MCPServer("order-desk")
 gatehouse = Gatehouse(
     mcp,
     policy=Policy(approver=ElicitationApprover(fallback=terminal_approver)),
-    # Anchored to this file, not the working directory: desktop clients
-    # often launch servers from `/`, where a relative path isn't writable.
-    audit=AuditLog(path=Path(__file__).with_name("audit.jsonl")),
+    # A path opens an AuditLog there. Anchored to this file, not the working
+    # directory: desktop clients often launch servers from `/`, where a
+    # relative path isn't writable.
+    audit=Path(__file__).with_name("audit.jsonl"),
 )
 
 
-@gatehouse.tool(tier=AccessTier.READ)
+@gatehouse.read
 def list_orders() -> str:
     """List every order as `id · customer · status`, one per line.
     Read-only. Start here to find an order ID."""
     return "\n".join(f"{oid} · {o['customer']} · {o['status']}" for oid, o in ORDERS.items())
 
 
-@gatehouse.tool(tier=AccessTier.READ)
+@gatehouse.read
 def lookup_order(order_id: OrderId) -> str:
     """Look up one order's customer, status and notes. Read-only."""
     order = ORDERS.get(order_id)
@@ -63,7 +57,7 @@ def lookup_order(order_id: OrderId) -> str:
     return f"{order_id} · {order['customer']} · {order['status']} · notes: {notes}"
 
 
-@gatehouse.tool(tier=AccessTier.WRITE)
+@gatehouse.write
 def add_note(
     order_id: OrderId,
     note: Annotated[str, Field(description="Free-text note to append.")],
@@ -77,7 +71,7 @@ def add_note(
     return f"note added to {order_id}"
 
 
-@gatehouse.tool(tier=AccessTier.DESTRUCTIVE)
+@gatehouse.destructive
 def cancel_order(order_id: OrderId) -> str:
     """Cancel an order. Irreversible, so a human must approve first — the
     gate fails closed. To record information instead, use add_note."""

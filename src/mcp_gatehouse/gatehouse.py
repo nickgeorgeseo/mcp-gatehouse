@@ -451,7 +451,9 @@ class Gatehouse:
                 _CONTEXT_PARAM, inspect.Parameter.KEYWORD_ONLY, default=None, annotation=Context
             )
             at = len(params) - (bool(params) and params[-1].kind is inspect.Parameter.VAR_KEYWORD)
-            guarded.__signature__ = exposed.replace(parameters=[*params[:at], hidden, *params[at:]])
+            guarded.__signature__ = exposed.replace(  # type: ignore[attr-defined]  # read by inspect.signature
+                parameters=[*params[:at], hidden, *params[at:]]
+            )
             # A copy: wraps() shares fn's own dict, which must stay untouched.
             guarded.__annotations__ = {**getattr(fn, "__annotations__", {}), _CONTEXT_PARAM: Context}
 

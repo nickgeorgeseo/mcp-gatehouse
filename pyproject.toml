@@ -53,10 +53,22 @@ dev = [
     # <7 monkeypatches packaging to cap Metadata-Version at 2.4, which
     # rejects the 2.5 metadata hatchling emits.
     "twine>=7",
+    # The package ships py.typed; CI holds its annotations to that.
+    "mypy>=2,<3",
 ]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/mcp_gatehouse"]
 
+[tool.hatch.build.targets.sdist]
+# The README's demo GIF (300 KB, linked by URL) and CI config aren't
+# source; tests, examples and server.json stay.
+exclude = ["/docs", "/.github"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+
+[tool.mypy]
+# The floor of requires-python, so 3.11+-only typing fails here first.
+python_version = "3.10"
+files = ["src/mcp_gatehouse", "examples/orders_server.py"]

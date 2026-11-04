@@ -304,6 +304,65 @@ async def test_tool_that_takes_a_context_still_gets_it(connect):
     assert events(stream)[-1]["arguments"] == {"order_id": "1"}
 
 
+# Written as source and compiled without this file's `from __future__ import
+# annotations`, so each hint is the real object as well as its string form.
+OPTIONAL_CONTEXT_HINTS = [
+    "Optional[Context]",
+    "Union[Context, None]",
+    "Context | None",
+    "Annotated[Context, 'injected']",
+    "Context[Any, Any] | None",
+]
+
+
+def _tool_with_hint(hint: str, as_string: bool, ran: list):
+    quoted = repr(hint) if as_string else hint
+    source = (
+        "from typing import Annotated, Any, Optional, Union\n"
+        "from mcp.server.mcpserver import Context\n"
+        f"def purge(order_id: str, ctx: {quoted} = None) -> str:\n"
+        "    ran.append(type(ctx).__name__)\n"
+        "    return 'purged'\n"
+    )
+    namespace: dict[str, Any] = {"ran": ran}
+    exec(compile(source, "<purge>", "exec", dont_inherit=True), namespace)
+    return namespace["purge"]
+
+
+@pytest.mark.parametrize("connect", [ROUND_TRIP, BACK_CHANNEL], ids=["round-trip", "back-channel"])
+@pytest.mark.parametrize("as_string", [False, True], ids=["hint", "string-hint"])
+@pytest.mark.parametrize("hint", OPTIONAL_CONTEXT_HINTS)
+async def test_optional_context_is_found_like_the_sdk_finds_it(hint, as_string, connect):
+    """The gate used to miss these, while the SDK injected into them. Its
+    hidden parameter then reached the model-visible schema, ctx reached
+    the audit log, and approval in the client was always denied."""
+    stream, ran = io.StringIO(), []
+    mcp = MCPServer("optional-ctx")
+    gatehouse = Gatehouse(mcp, policy=Policy(approver=ElicitationApprover()), audit=AuditLog(stream=stream))
+    gatehouse.add_tool(_tool_with_hint(hint, as_string, ran), tier=AccessTier.DESTRUCTIVE)
+
+    async with Client(mcp, elicitation_callback=answering(*APPROVE), **connect) as client:
+        (tool,) = (await client.list_tools()).tools
+        result = await client.call_tool("purge", {"order_id": "1"})
+
+    assert set(tool.input_schema["properties"]) == {"order_id"}
+    assert not result.is_error, result.content[0].text
+    assert ran == ["Context"]
+    assert all(e["arguments"] == {"order_id": "1"} for e in events(stream))
+
+
+@pytest.mark.parametrize("hint", [*OPTIONAL_CONTEXT_HINTS, "Context", "int", "Optional[int]"])
+def test_fallback_detection_agrees_with_the_sdk(hint):
+    """Used only if the SDK's helper moves; it must give the SDK's answer."""
+    from mcp.server.mcpserver.utilities.context_injection import find_context_parameter
+
+    from mcp_gatehouse.gatehouse import _sdk_find_context_parameter
+
+    for as_string in (False, True):
+        fn = _tool_with_hint(hint, as_string, [])
+        assert _sdk_find_context_parameter(fn) == find_context_parameter(fn)
+
+
 def test_reserved_parameter_name_is_refused():
     gatehouse = Gatehouse(MCPServer("reserved"))
     with pytest.raises(ValueError, match="reserves"):

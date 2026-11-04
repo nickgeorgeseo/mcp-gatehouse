@@ -493,18 +493,38 @@ def _is_async_callable(fn: Any) -> bool:
 
 
 def _find_context_parameter(fn: Callable[..., Any]) -> str | None:
-    """Name of the parameter MCPServer will inject its ``Context`` into."""
-    try:
-        from mcp.server.mcpserver import Context
+    """Name of the parameter MCPServer will inject its ``Context`` into.
 
-        hints = inspect.get_annotations(fn, eval_str=True)
+    Asks the SDK itself, so the two can't disagree. They used to: the gate
+    missed ``ctx: Context | None = None``, which the SDK injects into, so
+    the gate added its own hidden parameter. The SDK, seeing ``ctx``
+    first, then treated that one as an ordinary argument: it showed up in
+    the tool's schema for the model to fill, ``ctx`` went into the audit
+    log, and approval in the client was always denied, because the gate
+    never got the Context.
+    """
+    try:
+        from mcp.server.mcpserver.utilities.context_injection import find_context_parameter
+    except ImportError:  # moved in some later SDK: mirror what it did
+        find_context_parameter = _sdk_find_context_parameter
+    try:
+        return find_context_parameter(fn)
+    except Exception:
+        return None
+
+
+def _sdk_find_context_parameter(fn: Callable[..., Any]) -> str | None:
+    """The SDK's rule (mcp 2.0-2.3): the first parameter whose resolved
+    hint is a ``Context`` subclass, directly or inside a union such as
+    ``Optional[Context]``. ``Annotated`` is unwrapped by get_type_hints."""
+    import typing
+
+    try:
+        hints = typing.get_type_hints(fn)
     except Exception:
         return None
     for param_name, annotation in hints.items():
-        if param_name == "return":
-            continue
-        if annotation is Context or (
-            inspect.isclass(annotation) and issubclass(annotation, Context)
-        ):
+        candidates = (annotation, *typing.get_args(annotation)) if typing.get_origin(annotation) else (annotation,)
+        if any(inspect.isclass(c) and issubclass(c, Context) for c in candidates):
             return param_name
     return None

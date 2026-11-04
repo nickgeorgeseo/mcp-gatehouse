@@ -45,32 +45,30 @@ refused and one approved, and the audit log they left. No sound.
 |---|---|
 | **Permission tiers** | Every tool is declared `READ`, `WRITE`, or `DESTRUCTIVE` — and the tier also emits honest spec `ToolAnnotations` (`readOnlyHint` / `destructiveHint`), which the wrapper won't let you override to lie. |
 | **Approval gates** | Tiers you choose require a sign-off before the tool runs, asked right in the MCP client (Claude Code, Cursor, VS Code) or by any callable you write: a terminal prompt, a Slack ping, a ticket. **Fails closed:** a gated tool with no approver configured is denied, not waved through. |
-| **Audit log** | Append-only JSONL, one line per call — allowed, denied, failed, or cancelled — with UTC timestamps and durations. The answer to "what did the AI actually do?" six months later. |
-| **Redaction** | Argument keys you name (`api_key`, `password`, `token`, `client_secret`, … by default) are masked before they reach the log *or* the approver — however they're spelled: `apiKey`, `API-Key` and `api_key` are the same key. |
+| **Audit log** | Append-only JSONL, one line per call — allowed, denied, failed, or cancelled — with UTC timestamps and durations. Or send the events anywhere: a sink is one method. The answer to "what did the AI actually do?" six months later. |
+| **Redaction** | Argument keys you name (`api_key`, `password`, `token`, `client_secret`, … by default) are masked before they reach the log *or* the approver — however they're spelled, and whatever comes before them: `token` covers `github_token` and `authToken`, not `token_count`. |
 | **Denylist** | Block a tool outright, whatever its tier. |
 
 ## Quickstart
 
 ```python
 from mcp.server.mcpserver import MCPServer
-from mcp_gatehouse import (
-    AccessTier, AuditLog, ElicitationApprover, Gatehouse, Policy, terminal_approver,
-)
+from mcp_gatehouse import ElicitationApprover, Gatehouse, Policy, terminal_approver
 
 mcp = MCPServer("order-desk")
 gatehouse = Gatehouse(
     mcp,
     # Ask in the client's own UI; prompt on the terminal if it can't show a form.
     policy=Policy(approver=ElicitationApprover(fallback=terminal_approver)),
-    audit=AuditLog(path="~/order-desk/audit.jsonl"),
+    audit="~/order-desk/audit.jsonl",
 )
 
-@gatehouse.tool(tier=AccessTier.READ)
+@gatehouse.read
 def lookup_order(order_id: str) -> str:
     """Look up an order's status."""
     ...
 
-@gatehouse.tool(tier=AccessTier.DESTRUCTIVE)
+@gatehouse.destructive
 def cancel_order(order_id: str) -> str:
     """Cancel an order. Runs only if the approver says yes."""
     ...
@@ -84,6 +82,21 @@ SDK docs show, but register tools through the gatehouse. Schema generation
 transports, and everything else work unchanged — the guard preserves the
 function's signature. Sync tools still run in a worker thread, exactly as
 they would on a bare `MCPServer`.
+
+`@gatehouse.write` is the middle tier. Each takes the same keywords as
+`@mcp.tool` (`@gatehouse.write(name="annotate", title=...)`), and so does
+the long form, `@gatehouse.tool(tier="write")`. To register without a
+decorator, in a loop say: `gatehouse.add_tool(fn, tier="destructive")`.
+You get your function back unwrapped, so calling it directly, in a unit
+test, skips the gate. Hints the tier doesn't decide, `idempotentHint` and
+`openWorldHint`, go in `annotations=` as usual; one that contradicts the
+tier is refused.
+
+A tier the gate can't read stops the server starting, rather than letting
+a call through: `tier="destroy"` is an error, and so is `deny="drop_db"`
+where a collection belongs. A tool registered with no tier at all is
+`READ`, with a warning, since that's ungated and tells clients it's
+read-only. A future release will require the tier.
 
 ### Approve in the client
 
@@ -142,8 +155,12 @@ Under the default policy, `DESTRUCTIVE` requires approval and everything
 is audited. Gate writes too with one line:
 
 ```python
-Policy(require_approval=frozenset({AccessTier.WRITE, AccessTier.DESTRUCTIVE}), ...)
+Policy(require_approval={"write", "destructive"}, ...)
 ```
+
+Tiers can be `AccessTier` members or their names, in any collection.
+The gate reads `gatehouse.policy` on every call, so replacing it (to deny
+a tool mid-incident, say) applies from the next call.
 
 Add your own secret-bearing keys without losing the defaults:
 
@@ -151,6 +168,36 @@ Add your own secret-bearing keys without losing the defaults:
 from mcp_gatehouse import DEFAULT_REDACT
 Policy(redact=DEFAULT_REDACT | {"card_pin"}, ...)
 ```
+
+A key masks an argument when it names it whole, ignoring case, `_` and
+`-` (`api_key` is `apiKey` is `API-Key`), or when the argument's name
+ends in its words: `card_pin` also masks `backup_card_pin` and
+`cardPin`, and `token` masks `github_token`. Words, not letters, so
+`token` leaves `token_count` and `max_tokens` alone, and `pin` doesn't
+touch `spin`. Values the scrubber can't take apart (bytes, arbitrary
+objects) are logged as an opaque placeholder.
+
+### Where the audit goes
+
+`audit=` takes a path, an `AuditLog`, or any object with a
+`record(**event)` method, so the events can go to a database or your
+logging stack instead of a file. `MemoryAuditLog` keeps them in a list,
+for tests:
+
+```python
+from mcp_gatehouse import MemoryAuditLog
+
+audit = MemoryAuditLog()
+gatehouse = Gatehouse(mcp, audit=audit)  # default policy: no approver
+# ... call a destructive tool ...
+assert audit.outcomes() == [("denied", "approval required, no approver configured")]
+```
+
+If the sink fails (a full disk, a database down), the call's result
+stands and the failure is logged at ERROR on the `mcp_gatehouse` logger.
+Most lines are written after the tool ran: losing one is bad, but telling
+the model a refund that went through had failed, so it tries again, is
+worse.
 
 What the audit trail looks like:
 
@@ -229,8 +276,9 @@ starts it:
 
 Every denial is the gate failing closed, as designed. Where the prompt
 can't reach you, approve out-of-band instead: an approver is any callable,
-so it can post to Slack, open a ticket or wait on a queue. `examples/orders_server.py` is the same server as a copyable
-template.
+so it can post to Slack, open a ticket or wait on a queue.
+
+`examples/orders_server.py` is the same server as a copyable template.
 
 ## Design notes
 

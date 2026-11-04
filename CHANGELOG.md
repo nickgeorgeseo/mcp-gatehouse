@@ -3,6 +3,68 @@
 All notable changes to `mcp-gatehouse`. The public API (`Gatehouse`,
 `Policy`, `AuditLog`, `AccessTier`) stays compatible within a minor line.
 
+## Unreleased
+
+### Fixed
+
+- **Configuration the gate couldn't read failed open.** `tier="destructive"`
+  ran the tool with no approval, then crashed writing the audit line: no
+  record, and an error that invited the model to retry.
+  `Policy(require_approval={"destructive"})` gated nothing.
+  `Policy(redact="api_key")` logged `api_key` in clear. Tiers are now read
+  by name too (`"write"`, any case), checked when the tool is registered
+  or the `Policy` is built, and anything unreadable is an error there.
+- `Policy(deny="cancel_order")` blocked every tool whose name is a
+  substring of it, and `require_approval=AccessTier.DESTRUCTIVE` crashed
+  every call without an audit line. A single string or tier where a
+  collection belongs is now refused, with the fix in the message, as are
+  non-string names and a non-callable approver.
+- **Tools taking `ctx: Context | None = None` couldn't be approved in the
+  client.** The gate missed that `Context` (and `Optional[Context]`,
+  `Annotated[Context, ...]`) while the SDK injected into it, so the gate's
+  hidden `gatehouse_context` parameter showed up in the tool's schema,
+  `ctx` was written to the audit log, and approval in the client was
+  always denied. The gate now finds the `Context` with the SDK's own rule.
+- **Redaction missed the names secrets go by**: `github_token`,
+  `db_password`, `openai_api_key`, `auth_token` and the like reached the
+  log and the approval form in clear. A key now also masks names that end
+  in its words (`token` masks `authToken`, not `token_count`; `pin` masks
+  `card_pin`, not `spin`). New defaults: `secret_key`,
+  `secret_access_key`, `credential`, `credentials`. This only ever masks
+  more; pass an explicit `Policy(redact=...)` if you relied on one of
+  these appearing in the log.
+- `bytearray` and `memoryview` arguments were logged byte by byte. They're
+  opaque now, like `bytes`.
+- An audit sink that raised (disk full) turned a call that ran into an
+  error, so the model was told a completed call had failed, and a denial
+  lost its reason. The failure is now logged at ERROR on the
+  `mcp_gatehouse` logger and the call's result stands.
+- Assigning `gatehouse.policy` (or `.audit`) after registering tools did
+  nothing. Both are now read on every call.
+- `mcp-gatehouse --version` and `--help` called themselves
+  `mcp-gatehouse-demo`.
+
+### Added
+
+- `@gatehouse.read`, `@gatehouse.write` and `@gatehouse.destructive`, with
+  or without parentheses.
+- `gatehouse.add_tool(fn, tier=...)`, to register without a decorator.
+- `annotations=` sets the hints the tier doesn't decide (`idempotentHint`,
+  `openWorldHint`). Contradicting the tier's own hints is still refused;
+  a misspelled hint is refused instead of dropped.
+- `Gatehouse(audit=...)` takes a path, or any object with a
+  `record(**event)` method (the new `AuditSink` protocol).
+- `MemoryAuditLog`, which keeps records in `.events`, for tests.
+- CI type-checks the package with mypy against Python 3.10.
+
+### Changed
+
+- `@gatehouse.tool()` with no tier still registers the tool as `READ`, but
+  now warns (`FutureWarning`): that's ungated and tells clients the tool is
+  read-only. A future release will require the tier.
+- The demo and `examples/orders_server.py` use the tier decorators.
+- The sdist no longer ships `docs/` or `.github/`.
+
 ## 0.5.0 — 2026-11-02
 
 ### Added

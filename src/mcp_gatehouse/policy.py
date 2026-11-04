@@ -9,7 +9,7 @@ reach the audit log.
 from __future__ import annotations
 
 import enum
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Collection
 from dataclasses import dataclass, field
 from typing import Any, Union
 
@@ -25,6 +25,48 @@ class AccessTier(enum.Enum):
 
     DESTRUCTIVE = "destructive"
     """Deletes, sends, or pays. Hard or impossible to take back."""
+
+
+def _as_tier(value: object) -> AccessTier:
+    """An :class:`AccessTier` from the enum itself or its value (``"write"``).
+
+    Anything else is an error, raised where the tier is written down. A
+    tier the gate can't read must never be treated as some other tier: a
+    string that matched no member used to slip past the approval check.
+    """
+    if isinstance(value, AccessTier):
+        return value
+    if isinstance(value, str):
+        try:
+            return AccessTier(value.strip().lower())
+        except ValueError:
+            pass
+        raise ValueError(
+            f"unknown access tier {value!r}; use one of "
+            + ", ".join(repr(t.value) for t in AccessTier)
+            + " (or AccessTier.READ / .WRITE / .DESTRUCTIVE)"
+        )
+    raise TypeError(f"an access tier is an AccessTier or its name as a string, not {type(value).__name__}")
+
+
+def _as_collection(name: str, value: object) -> frozenset[Any]:
+    """A frozenset from any collection, refusing the single values that
+    iterate into nonsense: ``"api_key"`` would mean the keys ``a``, ``p``,
+    ``i``… and ``"cancel_order"`` would block every tool whose name is a
+    substring of it. Refused rather than guessed at, with the fix."""
+    if isinstance(value, (str, bytes)):
+        raise TypeError(f"Policy({name}=...) takes a collection, not a single string: use {name}={{{value!r}}}")
+    if isinstance(value, AccessTier):
+        raise TypeError(
+            f"Policy({name}=...) takes a collection of tiers, not a single tier: "
+            f"use {name}={{AccessTier.{value.name}}}"
+        )
+    try:
+        return frozenset(value)  # type: ignore[call-overload]
+    except TypeError:
+        raise TypeError(
+            f"Policy({name}=...) takes a collection (a set, list or tuple), not {type(value).__name__}"
+        ) from None
 
 
 @dataclass(frozen=True)
@@ -75,20 +117,23 @@ class Policy:
     (fail closed) rather than waved through.
     """
 
-    require_approval: frozenset[AccessTier] = frozenset({AccessTier.DESTRUCTIVE})
-    """Tiers that need the approver's sign-off before the tool runs."""
+    require_approval: Collection[AccessTier | str] = frozenset({AccessTier.DESTRUCTIVE})
+    """Tiers that need the approver's sign-off before the tool runs. Any
+    collection of tiers, as ``AccessTier`` members or their names:
+    ``{"write", "destructive"}``. Stored as a ``frozenset[AccessTier]``."""
 
-    deny: frozenset[str] = frozenset()
-    """Tool names that are blocked outright, whatever their tier."""
+    deny: Collection[str] = frozenset()
+    """Tool names that are blocked outright, whatever their tier. Any
+    collection of names; stored as a ``frozenset``."""
 
     approver: Approver | None = None
     """Callable (sync or async) that decides gated calls. Receives an
     :class:`ApprovalRequest`, returns ``True`` to allow."""
 
-    redact: frozenset[str] = field(default_factory=lambda: DEFAULT_REDACT)
-    """Argument keys masked in logs and approvals. Whole-name matches,
-    ignoring case, ``_`` and ``-``. To extend rather than replace the
-    defaults: ``redact=DEFAULT_REDACT | {"pin"}``."""
+    redact: Collection[str] = field(default_factory=lambda: DEFAULT_REDACT)
+    """Argument keys masked in logs and approvals, ignoring case, ``_`` and
+    ``-``. See :func:`redact_arguments` for how keys match. To extend
+    rather than replace the defaults: ``redact=DEFAULT_REDACT | {"pin"}``."""
 
     fail_closed: bool = True
     """If a tier requires approval and no approver is set: ``True`` denies
@@ -101,12 +146,27 @@ class Policy:
     so the gate still fails closed."""
 
     def __post_init__(self) -> None:
+        # Normalised here, once, so every check downstream compares like with
+        # like. A tier written as "destructive" against a set of enum members
+        # matched nothing, and the gate waved the call through.
+        tiers = frozenset(_as_tier(t) for t in _as_collection("require_approval", self.require_approval))
+        object.__setattr__(self, "require_approval", tiers)
+        for name in ("deny", "redact"):
+            names = _as_collection(name, getattr(self, name))
+            wrong = sorted({type(n).__name__ for n in names if not isinstance(n, str)})
+            if wrong:
+                raise TypeError(f"Policy({name}=...) takes strings; got {', '.join(wrong)}")
+            object.__setattr__(self, name, names)
+        if self.approver is not None and not callable(self.approver):
+            raise TypeError(
+                f"Policy(approver=...) takes a callable (sync or async), not {type(self.approver).__name__}"
+            )
         # `not > 0` rather than `<= 0`, so NaN is rejected too.
         if self.approval_timeout is not None and not self.approval_timeout > 0:
             raise ValueError("approval_timeout must be a positive number of seconds, or None")
 
-    def needs_approval(self, tier: AccessTier) -> bool:
-        return tier in self.require_approval
+    def needs_approval(self, tier: AccessTier | str) -> bool:
+        return _as_tier(tier) in self.require_approval
 
 
 REDACTED = "«redacted»"

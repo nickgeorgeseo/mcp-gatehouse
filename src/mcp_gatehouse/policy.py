@@ -9,6 +9,8 @@ reach the audit log.
 from __future__ import annotations
 
 import enum
+import functools
+import re
 from collections.abc import Awaitable, Callable, Collection
 from dataclasses import dataclass, field
 from typing import Any, Union
@@ -89,14 +91,17 @@ class ApprovalRequest:
 Approver = Callable[[ApprovalRequest], Union[bool, Awaitable[bool]]]
 
 #: Argument keys that are masked in audit logs and approval requests by
-#: default. Matched against whole key names, ignoring case, ``_`` and ``-``
-#: — so ``api_key`` also covers ``apiKey``, ``API-Key`` and ``apikey``.
+#: default. A key covers every spelling of itself (``api_key`` covers
+#: ``apiKey``, ``API-Key`` and ``apikey``) and any name it ends, word for
+#: word (``token`` covers ``github_token`` and ``authToken``, not
+#: ``token_count``). See :func:`redact_arguments`.
 DEFAULT_REDACT: frozenset[str] = frozenset(
     {
         "password", "passwd", "passphrase",
         "token", "access_token", "refresh_token", "id_token",
-        "secret", "client_secret",
+        "secret", "client_secret", "secret_key", "secret_access_key",
         "api_key", "x_api_key", "private_key",
+        "credential", "credentials",
         "authorization", "cookie", "set_cookie",
         "ssn",
     }
@@ -106,6 +111,45 @@ DEFAULT_REDACT: frozenset[str] = frozenset(
 def _normalize_key(key: str) -> str:
     """``API-Key``, ``api_key`` and ``apiKey`` all name the same secret."""
     return key.lower().replace("_", "").replace("-", "")
+
+
+_SEPARATORS = re.compile(r"[\W_]+")
+# Before a capital that follows a lower-case letter or digit (apiKey), and
+# between an acronym and the word after it (APIKey, openAIApiKey).
+_CAMEL_BREAK = re.compile(r"(?<=[a-z0-9])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])")
+
+
+def _words(key: str) -> tuple[str, ...]:
+    """``openAIApiKey`` and ``OPENAI_API_KEY`` → words ending ``api``, ``key``."""
+    words: list[str] = []
+    for part in _SEPARATORS.split(key):
+        words.extend(w.lower() for w in _CAMEL_BREAK.sub(" ", part).split())
+    return tuple(words)
+
+
+@functools.lru_cache(maxsize=64)
+def _secret_matcher(keys: frozenset[str]) -> Callable[[str], bool]:
+    """Whether an argument name is one of ``keys``, built once per key set.
+
+    Two ways to match, and either masks:
+
+    - the whole name, ignoring case, ``_`` and ``-`` (``apikey`` is
+      ``api_key``), as it always has;
+    - the name's last words (``github_token`` ends in ``token``,
+      ``openAIApiKey`` in ``api key``). Words, not letters: ``pin`` masks
+      ``card_pin`` but not ``spin``, and ``token`` leaves ``token_count``
+      and ``max_tokens`` alone.
+    """
+    whole = {_normalize_key(k) for k in keys}
+    tails = {w for w in map(_words, keys) if w}
+
+    def is_secret(name: str) -> bool:
+        if _normalize_key(name) in whole:
+            return True
+        words = _words(name)
+        return any(words[-len(tail):] == tail for tail in tails if len(tail) <= len(words))
+
+    return is_secret
 
 
 @dataclass(frozen=True)
@@ -172,34 +216,40 @@ class Policy:
 REDACTED = "«redacted»"
 
 
-def redact_arguments(arguments: dict[str, Any], keys: frozenset[str]) -> dict[str, Any]:
+def redact_arguments(arguments: dict[str, Any], keys: Collection[str]) -> dict[str, Any]:
     """Return a deep copy of ``arguments`` with sensitive values masked.
 
-    Matching is by whole key name at any nesting depth, ignoring case,
-    ``_`` and ``-`` (``apiKey`` matches ``api_key``).
+    A key in ``keys`` masks an argument, at any nesting depth, when it
+    names it whole, ignoring case, ``_`` and ``-`` (``api_key`` masks
+    ``apiKey``), or when the argument's name ends in its words
+    (``token`` masks ``github_token`` and ``authToken``, but not
+    ``token_count``; ``pin`` masks ``card_pin``, not ``spin``).
+
     Structured values are unwrapped so nested keys are reachable: mappings
     and sequences are recursed, dataclasses and Pydantic models are
     converted to dicts first. Anything else that isn't a plain JSON
-    primitive is replaced with an opaque placeholder — a repr can carry a
-    secret, so unknown objects never pass through verbatim. The gate fails
-    closed here too.
+    primitive, bytes included, is replaced with an opaque placeholder — a
+    repr can carry a secret, so unknown objects never pass through
+    verbatim. The gate fails closed here too.
     """
     import dataclasses as _dc
     from collections.abc import Mapping, Sequence
 
-    lowered = {_normalize_key(k) for k in keys}
+    is_secret = _secret_matcher(frozenset(keys))
 
     def scrub(value: Any) -> Any:
         if value is None or isinstance(value, (str, int, float, bool)):
             return value
+        if isinstance(value, (bytes, bytearray, memoryview)):
+            # Before the Sequence check: bytearray and memoryview are
+            # sequences, and were logged as their contents, byte by byte.
+            return f"«opaque:{type(value).__name__}»"
         if isinstance(value, Mapping):
             return {
-                str(k): (REDACTED if _normalize_key(str(k)) in lowered else scrub(v))
+                str(k): (REDACTED if is_secret(str(k)) else scrub(v))
                 for k, v in value.items()
             }
-        if isinstance(value, (list, tuple, set, frozenset)) or (
-            isinstance(value, Sequence) and not isinstance(value, bytes)
-        ):
+        if isinstance(value, (list, tuple, set, frozenset, Sequence)):
             return [scrub(v) for v in value]
         if _dc.is_dataclass(value) and not isinstance(value, type):
             return scrub(_dc.asdict(value))

@@ -317,3 +317,10 @@ def test_annotations_of_the_wrong_type_are_refused():
     gatehouse = Gatehouse(MCPServer("t"))
     with pytest.raises(TypeError, match="ToolAnnotations or a mapping"):
         gatehouse.read(annotations=["readOnlyHint"])  # type: ignore[arg-type]
+
+
+def test_an_infinite_timeout_is_refused_with_the_fix():
+    """inf passed the positive check, then broke the terminal prompt's lock,
+    which can't wait forever. None is how to say "no limit"."""
+    with pytest.raises(ValueError, match="None"):
+        Policy(approval_timeout=float("inf"))

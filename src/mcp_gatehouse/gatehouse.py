@@ -38,6 +38,7 @@ from .audit import AuditLog, AuditSink, NullAuditLog, Outcome, Reason
 from .policy import AccessTier, ApprovalRequest, Policy, _as_tier, redact_arguments
 
 F = TypeVar("F", bound=Callable[..., Any])
+_T = TypeVar("_T")
 
 _log = logging.getLogger("mcp_gatehouse")
 
@@ -388,14 +389,15 @@ class _ToolGate:
         ends with the question, and the client's next call brings the
         answer. A client that can't be asked leaves it to the fallback.
         """
-        transport = approver.transport(context, round_trip=self.can_round_trip)
+        transport = call.approver_step(approver.transport, context, round_trip=self.can_round_trip)
         if transport == "round-trip":
-            answer = approver.answer(request, context)
+            answer = call.approver_step(approver.answer, request, context)
             if answer is None:
+                question = call.approver_step(approver.question, request, call.timeout)
                 # The first round. If the client never comes back, this line
                 # is the record that it was asked.
                 call.record(Outcome.PENDING, Reason.ASKED_IN_CLIENT)
-                return approver.question(request, call.timeout)
+                return question
             allowed, reason = answer
             if not allowed:
                 raise call.deny(reason)
@@ -433,10 +435,14 @@ class _ToolGate:
         # An approver that honours request.deadline gives up just as the
         # gate's own timer fires, and either can finish first. A "no" at
         # the deadline is the deadline, not a person refusing.
-        if waiting.cancelled_caught or (not approved and _past(request.deadline)):
+        if waiting.cancelled_caught or (approved is not True and _past(request.deadline)):
             raise call.deny(Reason.TIMED_OUT)
-        if not approved:
+        if approved is False:
             raise call.deny(Reason.REFUSED)
+        if approved is not True:
+            # Only True approves. Anything truthy would otherwise do: an API
+            # response the approver returned by mistake, a 1, even "no".
+            raise call.deny(Reason.approver_error(f"returned {type(approved).__name__}, not True or False"))
 
     async def _run(self, call: _Call, args: tuple[Any, ...], kwargs: dict[str, Any]) -> Any:
         """Run the tool and record how it went."""
@@ -488,6 +494,14 @@ class _Call:
         """Record a denial; return the error that tells the model why."""
         self.record(Outcome.DENIED, reason)
         return GateDenied(_denial_message(self, reason))
+
+    def approver_step(self, step: Callable[..., _T], *args: Any, **kwargs: Any) -> _T:
+        """Run one of the approver's own steps. If it raises, that's the
+        approver failing: a denial on the record, not a crash without one."""
+        try:
+            return step(*args, **kwargs)
+        except Exception as exc:
+            raise self.deny(Reason.approver_error(type(exc).__name__)) from exc
 
 
 def _denial_message(call: _Call, reason: str) -> str:

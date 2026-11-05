@@ -11,6 +11,7 @@ from __future__ import annotations
 import dataclasses
 import enum
 import functools
+import math
 import re
 from collections.abc import Awaitable, Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -231,9 +232,14 @@ class Policy:
             raise TypeError(
                 f"Policy(approver=...) takes a callable (sync or async), not {type(self.approver).__name__}"
             )
-        # `not > 0` rather than `<= 0`, so NaN is rejected too.
-        if self.approval_timeout is not None and not self.approval_timeout > 0:
-            raise ValueError("approval_timeout must be a positive number of seconds, or None")
+        # `not > 0` rather than `<= 0`, so NaN is refused too. Infinity is
+        # refused as well: a thread lock or select() can't wait forever, and
+        # None already means no limit.
+        timeout = self.approval_timeout
+        if timeout is not None and not (timeout > 0 and math.isfinite(timeout)):
+            raise ValueError(
+                "approval_timeout must be a positive, finite number of seconds, or None to wait without limit"
+            )
 
     def needs_approval(self, tier: AccessTier | str) -> bool:
         return _as_tier(tier) in self.require_approval
@@ -275,7 +281,9 @@ def redact_arguments(arguments: dict[str, Any], keys: Collection[str]) -> dict[s
         if isinstance(value, (list, tuple, set, frozenset, Sequence)):
             return [scrub(v) for v in value]
         if dataclasses.is_dataclass(value) and not isinstance(value, type):
-            return scrub(dataclasses.asdict(value))
+            # Field by field, not dataclasses.asdict(), which deep-copies every
+            # value and raises on one that can't be copied (a lock, a client).
+            return scrub({f.name: getattr(value, f.name, None) for f in dataclasses.fields(value)})
         model_dump = getattr(value, "model_dump", None)  # pydantic v2
         if callable(model_dump):
             try:

@@ -459,3 +459,56 @@ async def test_direct_call_tool_has_no_client_to_ask(fallback):
             await mcp.call_tool("cancel_order", ARGUMENTS)
         assert ran == []
         assert events(stream)[-1]["outcome"] == "denied"
+
+
+# --- what the person is shown --------------------------------------------------
+
+
+@pytest.mark.parametrize("connect", [ROUND_TRIP, BACK_CHANNEL], ids=["round-trip", "back-channel"])
+async def test_the_form_shows_invisible_characters_as_escapes(connect):
+    """The arguments come from the model, and the person approving reads
+    them. Bidi overrides and zero-width characters would let a crafted
+    value display as something other than what is being approved: escape
+    them. Readable text, accents and all, stays as it is."""
+    stream, ran, asked = io.StringIO(), [], []
+    mcp = build(Policy(approver=ElicitationApprover()), stream, ran)
+    tricky = {"order_id": "4417‮0001", "api_key": "", "note": "café​"}
+    async with Client(mcp, elicitation_callback=answering(*APPROVE, asked=asked), **connect) as client:
+        mcp_tool = (await client.list_tools()).tools[0].name
+        await client.call_tool(mcp_tool, {"order_id": tricky["order_id"]})
+    (form,) = asked
+    assert "‮" not in form.message and "\\u202e" in form.message
+    assert "4417" in form.message
+
+
+def test_the_default_message_keeps_readable_text_and_escapes_the_rest():
+    from mcp_gatehouse.approvers import _default_message
+
+    request = ApprovalRequest(
+        tool="t", tier=AccessTier.WRITE, arguments={"note": "café ünïcode 中文 ​⁦x⁩   tab\there"}
+    )
+    message = _default_message(request)
+    assert "café ünïcode 中文" in message
+    for hidden in ("​", "⁦", "⁩", " ", "\t"):
+        assert hidden not in message
+    assert "\\u200b" in message and "\\u2066" in message and "\\t" in message
+
+
+# --- the approver's own machinery failing ---------------------------------------
+
+
+@pytest.mark.parametrize("connect", [ROUND_TRIP, BACK_CHANNEL], ids=["round-trip", "back-channel"])
+async def test_a_message_function_that_raises_is_an_audited_denial(connect):
+    """A custom message= that raises is the approver failing: a denial on
+    the record, not a crash that leaves no line."""
+    stream, ran = io.StringIO(), []
+
+    def broken_message(request):
+        raise KeyError("customer_name")
+
+    mcp = build(Policy(approver=ElicitationApprover(message=broken_message)), stream, ran)
+    async with Client(mcp, elicitation_callback=answering(*APPROVE), **connect) as client:
+        result = await client.call_tool("cancel_order", ARGUMENTS)
+    assert result.is_error and "the approver failed" in result.content[0].text
+    assert ran == []
+    assert outcomes(stream) == [("denied", "approver error: KeyError")]

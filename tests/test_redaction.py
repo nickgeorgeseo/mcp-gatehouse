@@ -194,3 +194,26 @@ def test_a_model_whose_dump_fails_is_opaque():
 
     safe = redact_arguments({"thing": Fragile(secret="sk-live")}, DEFAULT_REDACT)
     assert safe == {"thing": "«opaque:Fragile»"}
+
+
+def test_a_dataclass_holding_something_uncopyable_is_still_scrubbed():
+    """dataclasses.asdict deep-copies every field, and some values can't be
+    copied: redaction raised, and the call failed before it was logged."""
+    import dataclasses
+    import threading
+
+    @dataclasses.dataclass
+    class Inner:
+        token: str
+
+    @dataclasses.dataclass
+    class Job:
+        name: str
+        password: str
+        lock: object
+        inner: Inner
+
+    safe = redact_arguments({"job": Job("nightly", "hunter2", threading.Lock(), Inner("t-1"))}, DEFAULT_REDACT)
+    assert safe == {
+        "job": {"name": "nightly", "password": REDACTED, "lock": "«opaque:lock»", "inner": {"token": REDACTED}}
+    }

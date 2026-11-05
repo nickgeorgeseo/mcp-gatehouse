@@ -14,7 +14,7 @@ import time
 import anyio
 import anyio.to_thread
 import pytest
-from audit_helpers import events
+from audit_helpers import events, outcomes
 from mcp import Client
 from mcp.server.mcpserver import MCPServer
 
@@ -478,3 +478,47 @@ async def test_sync_approver_returning_a_coroutine_is_awaited(verdict):
         result = await client.call_tool("cancel", {"order_id": "1"})
     assert result.is_error is (not verdict)
     assert ran == (["1"] if verdict else [])
+
+
+# --- only True approves --------------------------------------------------------
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("is_async", [False, True], ids=["sync", "async"])
+@pytest.mark.parametrize(
+    ("answer", "reason"),
+    [
+        (True, None),
+        (False, "approver refused"),
+        ({"ok": False, "error": "channel_not_found"}, "approver error: returned dict, not True or False"),
+        ("no", "approver error: returned str, not True or False"),
+        (1, "approver error: returned int, not True or False"),
+        (None, "approver error: returned NoneType, not True or False"),
+    ],
+    ids=["True", "False", "a-response-dict", "the-string-no", "one", "None"],
+)
+async def test_only_true_approves(answer, reason, is_async):
+    """An approver that returned a Slack API response, a string or a 1
+    approved the call: they're truthy. Only True approves, and anything
+    else but False is the approver's bug, said plainly in the log."""
+
+    def sync(request):
+        return answer
+
+    async def async_(request):
+        return answer
+
+    log, ran = io.StringIO(), []
+    mcp = MCPServer("t")
+    gk = Gatehouse(mcp, policy=Policy(approver=async_ if is_async else sync), audit=AuditLog(stream=log))
+
+    @gk.destructive
+    def refund(order_id: str) -> str:
+        ran.append(order_id)
+        return "refunded"
+
+    async with Client(mcp) as client:
+        result = await client.call_tool("refund", {"order_id": "1"})
+    assert ran == (["1"] if answer is True else [])
+    assert result.is_error is (answer is not True)
+    assert outcomes(log) == [("ok", None) if answer is True else ("denied", reason)]

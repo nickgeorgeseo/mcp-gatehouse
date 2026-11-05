@@ -160,8 +160,22 @@ def _default_message(request: ApprovalRequest) -> str:
     # Two lines, arguments on the second. Clients show only the start of a
     # long message (Claude Code folds it after three lines), and what is
     # being approved must never be in the folded part.
-    arguments = json.dumps(request.arguments, ensure_ascii=False, default=str)
+    arguments = _visible(json.dumps(request.arguments, ensure_ascii=False, default=str))
     return f"The AI wants to run {request.tool} ({request.tier.value}) with:\n{arguments}"
+
+
+def _visible(text: str) -> str:
+    """``text`` with every character that doesn't print shown as an escape.
+
+    The arguments come from the model, and a person reads them to decide.
+    Bidi overrides, zero-width characters and line separators would let a
+    crafted value display as something other than what is being approved
+    (digits reordered, words hidden). Readable text, accents and all, stays
+    as it is. The terminal prompt prints ``repr()``, which does the same.
+    """
+    return "".join(
+        c if c.isprintable() else (f"\\u{ord(c):04x}" if ord(c) <= 0xFFFF else f"\\U{ord(c):08x}") for c in text
+    )
 
 
 class ElicitationApprover:

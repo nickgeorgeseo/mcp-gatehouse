@@ -5,10 +5,11 @@
 # tool-definition quality, and run coherence checks.
 #
 # The image runs the bundled demo server (`mcp-gatehouse-demo`): an order-desk
-# MCP server that wires three tools through the gatehouse at READ / WRITE /
+# MCP server that wires four tools through the gatehouse at READ / WRITE /
 # DESTRUCTIVE tiers, with honest readOnlyHint / destructiveHint annotations.
-# There is no terminal in the container, so the DESTRUCTIVE tool's approval
-# gate fails closed by design — the server still starts and exposes every tool.
+# There is no terminal in the container. A client that can show MCP's approval
+# form (elicitation) can approve the DESTRUCTIVE tool; for any other client its
+# gate fails closed by design. Either way the server starts and lists every tool.
 
 FROM python:3.12-slim
 

@@ -75,7 +75,9 @@ def terminal_approver(request: ApprovalRequest) -> bool:
                     tty.write("\n(timed out, denied)\n")
                     tty.flush()
                     return False
-            return tty.readline().strip().lower() == "y"
+            # "y" or "yes", any case. Anything else, Enter included, is a no:
+            # the prompt says [y/N]. A "yes" used to be refused.
+            return tty.readline().strip().lower() in ("y", "yes")
     except OSError:
         _report_denial(request, _no_terminal_reason())
         return False

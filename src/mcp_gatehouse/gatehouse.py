@@ -361,7 +361,12 @@ class Gatehouse:
                     reason="awaiting approval", arguments=safe_args,
                 )
                 raise
-            if waiting.cancelled_caught:
+            # An approver that honours request.deadline gives up as the gate's
+            # own timer fires, so either can finish first. A "no" at the
+            # deadline is the deadline, not a person refusing: without this,
+            # an unanswered terminal prompt was logged, and reported to the
+            # model, as refused whenever the approver won the race.
+            if waiting.cancelled_caught or (not approved and _past(request.deadline)):
                 raise denied(
                     "approval timed out",
                     f"'{tool_name}' was not approved within {timeout:g}s. "
@@ -458,6 +463,15 @@ class Gatehouse:
             guarded.__annotations__ = {**getattr(fn, "__annotations__", {}), _CONTEXT_PARAM: Context}
 
         return guarded
+
+
+# A sleep or select can wake a hair before the instant it was given, so a
+# "no" this close to the deadline counts as the deadline.
+_DEADLINE_SLACK = 0.05
+
+
+def _past(deadline: float | None) -> bool:
+    return deadline is not None and time.monotonic() >= deadline - _DEADLINE_SLACK
 
 
 def _record(audit: AuditSink, **event: Any) -> None:

@@ -354,12 +354,40 @@ def test_terminal_prompt_withdraws_at_its_deadline(operator):
     assert "timed out, denied" in shown
 
 
+def within(seconds: float, fn, *args):
+    """Run fn in a thread and fail, rather than hang the suite, if it
+    doesn't return in time: a terminal read that never completes would
+    otherwise stall CI until the job times out."""
+    result: list = []
+    worker = threading.Thread(target=lambda: result.append(fn(*args)), daemon=True)
+    worker.start()
+    worker.join(seconds)
+    assert not worker.is_alive(), f"{fn.__name__} did not return within {seconds}s"
+    return result[0]
+
+
 @needs_pty
 @pytest.mark.parametrize("timeout", [None, 5])
 def test_terminal_prompt_takes_an_answer(operator, timeout):
     os.write(operator, b"y\n")
     deadline = None if timeout is None else time.monotonic() + timeout
-    assert terminal_approver(request(deadline)) is True
+    assert within(10, terminal_approver, request(deadline)) is True
+
+
+@needs_pty
+@pytest.mark.parametrize(
+    ("typed", "allowed"),
+    [
+        (b"y\n", True), (b"Y\n", True), (b"yes\n", True), (b"YES\n", True), (b"  y  \n", True),
+        (b"\n", False), (b"n\n", False), (b"no\n", False), (b"yep\n", False), (b"y please\n", False),
+        (b"ok\n", False), (b"1\n", False),
+    ],
+)
+def test_terminal_prompt_only_a_yes_approves(operator, typed, allowed):
+    """[y/N]: the default is no, so Enter refuses, and so does anything
+    that isn't plainly y or yes."""
+    os.write(operator, typed)
+    assert within(10, terminal_approver, request(time.monotonic() + 5)) is allowed
 
 
 @needs_pty
@@ -374,10 +402,57 @@ def test_terminal_prompt_stays_off_a_full_screen_programs_terminal(pty_pair, cap
     tty.setraw(terminal)
     os.write(operator, b"y\r")
     start = time.monotonic()
-    assert terminal_approver(request(time.monotonic() + 5)) is False
+    # Guarded: prompting in raw mode blocks in readline for good.
+    assert within(10, terminal_approver, request(time.monotonic() + 5)) is False
     assert time.monotonic() - start < 1
     assert screen(operator) == ""
     assert "full-screen program" in capsys.readouterr().err
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("run", range(5))
+async def test_an_approver_that_gives_up_at_the_deadline_is_a_timeout(run):
+    """An approver that honours request.deadline, as the README asks,
+    returns False right as the gate's own timer fires. Whichever won the
+    race decided the record: on an idle machine the approver did, and an
+    unanswered prompt was logged, and reported, as a person refusing."""
+
+    def patient(request: ApprovalRequest) -> bool:
+        time.sleep(max(0.0, request.deadline - time.monotonic()))
+        return False
+
+    log, ran = io.StringIO(), []
+    mcp = MCPServer("t")
+    gk = Gatehouse(mcp, policy=Policy(approver=patient, approval_timeout=0.3), audit=AuditLog(stream=log))
+
+    @gk.destructive
+    def cancel(order_id: str) -> str:
+        ran.append(order_id)
+        return "cancelled"
+
+    async with Client(mcp) as client:
+        result = await client.call_tool("cancel", {"order_id": "1"})
+    assert result.is_error and "not approved within 0.3s" in result.content[0].text
+    assert ran == []
+    assert [(e["outcome"], e["reason"]) for e in events(log)] == [("denied", "approval timed out")]
+
+
+@needs_pty
+@pytest.mark.anyio
+async def test_an_unanswered_terminal_prompt_is_logged_as_a_timeout(operator):
+    log = io.StringIO()
+    mcp = MCPServer("t")
+    gk = Gatehouse(mcp, policy=Policy(approver=terminal_approver, approval_timeout=0.3), audit=AuditLog(stream=log))
+
+    @gk.destructive
+    def cancel(order_id: str) -> str:
+        return "cancelled"
+
+    async with Client(mcp) as client:
+        result = await client.call_tool("cancel", {"order_id": "1"})
+    assert "approval needed" in screen(operator)
+    assert result.is_error and "not approved within" in result.content[0].text
+    assert [(e["outcome"], e["reason"]) for e in events(log)] == [("denied", "approval timed out")]
 
 
 @needs_pty

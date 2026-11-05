@@ -65,13 +65,17 @@ def build(audit: object, policy: Policy | None = None, ran: list | None = None) 
 
 async def test_memory_log_holds_what_the_file_would(tmp_path):
     memory, path = MemoryAuditLog(), tmp_path / "audit.jsonl"
-    for audit in (memory, AuditLog(path=path)):
-        mcp, _ = build(audit, Policy(approver=lambda request: False))
-        async with Client(mcp) as client:
-            await client.call_tool("lookup", {"order_id": "1"})
-            await client.call_tool("refund", {"order_id": "1", "api_key": "sk-live-x"})
+    with AuditLog(path=path) as file_log:
+        for audit in (memory, file_log):
+            mcp, _ = build(audit, Policy(approver=lambda request: False))
+            async with Client(mcp) as client:
+                await client.call_tool("lookup", {"order_id": "1"})
+                await client.call_tool("refund", {"order_id": "1", "api_key": "sk-live-x"})
     from_file = [json.loads(line) for line in path.read_text().split("\n") if line]
-    strip = lambda events: [{k: v for k, v in e.items() if k not in ("ts", "duration_ms")} for e in events]  # noqa: E731
+
+    def strip(events: list[dict]) -> list[dict]:
+        return [{k: v for k, v in e.items() if k not in ("ts", "duration_ms")} for e in events]
+
     assert strip(memory.events) == strip(from_file)
     assert all("ts" in e for e in memory.events)
     assert memory.outcomes() == [("ok", None), ("denied", "approver refused")]

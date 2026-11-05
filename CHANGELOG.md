@@ -41,6 +41,13 @@ All notable changes to `mcp-gatehouse`. The public API (`Gatehouse`,
   `mcp_gatehouse` logger and the call's result stands.
 - Assigning `gatehouse.policy` (or `.audit`) after registering tools did
   nothing. Both are now read on every call.
+- An approval nobody answered could be logged as `approver refused`, and
+  the model told the approver refused. An approver that gives up at
+  `request.deadline` (`terminal_approver` does) races the gate's own
+  timer, and whichever finished first decided the record. A "no" at the
+  deadline is now always `approval timed out`, as documented.
+- `terminal_approver` refused a typed `yes`; it now takes `y` or `yes`, in
+  any case. Enter and anything else still refuse.
 - `mcp-gatehouse --version` and `--help` called themselves
   `mcp-gatehouse-demo`.
 
@@ -64,6 +71,8 @@ All notable changes to `mcp-gatehouse`. The public API (`Gatehouse`,
   read-only. A future release will require the tier.
 - The demo and `examples/orders_server.py` use the tier decorators.
 - The sdist no longer ships `docs/` or `.github/`.
+- The Dockerfile's notes say the demo has four tools, and that a client
+  that can show the approval form can approve in the container.
 
 ## 0.5.0 — 2026-11-02
 

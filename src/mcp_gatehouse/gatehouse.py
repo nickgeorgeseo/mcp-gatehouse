@@ -20,6 +20,7 @@ import functools
 import inspect
 import logging
 import os
+import secrets
 import time
 import typing
 import warnings
@@ -39,6 +40,10 @@ from .policy import AccessTier, ApprovalRequest, Policy, _as_tier, redact_argume
 
 F = TypeVar("F", bound=Callable[..., Any])
 _T = TypeVar("_T")
+
+#: A per-tool approval rule: gets the redacted arguments, returns whether
+#: this call needs the approver. See :meth:`Gatehouse.tool`.
+ApprovalRule = Callable[[dict[str, Any]], bool]
 
 _log = logging.getLogger("mcp_gatehouse")
 
@@ -127,6 +132,7 @@ class Gatehouse:
         title: str | None = None,
         description: str | None = None,
         annotations: ToolAnnotations | Mapping[str, Any] | None = None,
+        require_approval: bool | ApprovalRule | None = None,
         **tool_kwargs: Any,
     ) -> Callable[[F], F]:
         """Register a tool on the wrapped server, with enforcement.
@@ -142,6 +148,17 @@ class Gatehouse:
         tier sets ``readOnlyHint`` and ``destructiveHint``, and an
         ``annotations`` value contradicting them is refused, so the hints
         stay honest.
+
+        ``require_approval`` decides approval for this tool instead of the
+        policy's tiers: ``True`` always asks, ``False`` never does, and a
+        function decides per call, from the redacted arguments::
+
+            @gatehouse.destructive(require_approval=lambda args: args["amount"] > 50)
+            def refund(order_id: str, amount: int) -> str: ...
+
+        Only a ``False`` from the function skips approval. Anything else, or
+        an exception, asks: a rule that can't decide fails closed. The
+        policy's denylist and ``max_tier`` still apply first.
         """
         if callable(tier):
             raise TypeError(
@@ -153,6 +170,11 @@ class Gatehouse:
         # Checked now, not on the first call: a mistake here should stop the
         # server starting, not surface as a crash mid-conversation.
         tool_annotations = _annotations_for(resolved, title, annotations)
+        if not (require_approval is None or isinstance(require_approval, bool) or callable(require_approval)):
+            raise TypeError(
+                "require_approval takes True, False, or a function of the arguments, "
+                f"not {type(require_approval).__name__}"
+            )
 
         def decorator(fn: F) -> F:
             tool_name = name or fn.__name__
@@ -170,7 +192,7 @@ class Gatehouse:
                 description=description,
                 annotations=tool_annotations,
                 **tool_kwargs,
-            )(self._guard(fn, tool_name, resolved))
+            )(self._guard(fn, tool_name, resolved, require_approval))
             return fn
 
         return decorator
@@ -224,9 +246,15 @@ class Gatehouse:
             )
         return decorator(fn)
 
-    def _guard(self, fn: Callable[..., Any], tool_name: str, tier: AccessTier) -> Callable[..., Any]:
+    def _guard(
+        self,
+        fn: Callable[..., Any],
+        tool_name: str,
+        tier: AccessTier,
+        require_approval: bool | ApprovalRule | None = None,
+    ) -> Callable[..., Any]:
         """The function MCPServer registers in ``fn``'s place."""
-        return _ToolGate(self, fn, tool_name, tier).entry_point()
+        return _ToolGate(self, fn, tool_name, tier, require_approval).entry_point()
 
 
 def _annotations_for(
@@ -278,11 +306,19 @@ class _ToolGate:
     which hands each call to :meth:`__call__`.
     """
 
-    def __init__(self, gatehouse: Gatehouse, fn: Callable[..., Any], name: str, tier: AccessTier) -> None:
+    def __init__(
+        self,
+        gatehouse: Gatehouse,
+        fn: Callable[..., Any],
+        name: str,
+        tier: AccessTier,
+        require_approval: bool | ApprovalRule | None = None,
+    ) -> None:
         self.gatehouse = gatehouse
         self.fn = fn
         self.name = name
         self.tier = tier
+        self.require_approval = require_approval
         self.signature = inspect.signature(fn)
         # MCPServer injects its Context as an ordinary parameter. The model
         # didn't send it, so it stays out of the log and away from approvers.
@@ -322,12 +358,13 @@ class _ToolGate:
         # applies from the next call, and one call never sees two.
         policy, audit = self.gatehouse.policy, self.gatehouse.audit
         call = _Call(
+            call_id=self._resumed_call_id(policy, context) or secrets.token_hex(8),
             tool=self.name,
             tier=self.tier,
             # Only this redacted copy reaches the log or an approver.
             arguments=redact_arguments(arguments, policy.redact),
             audit=audit,
-            timeout=policy.approval_timeout,
+            policy=policy,
         )
         question = await self._check(call, policy, context)
         if question is not None:
@@ -351,6 +388,15 @@ class _ToolGate:
             context = arguments.pop(self.context_param, None)
         return context, arguments
 
+    def _resumed_call_id(self, policy: Policy, context: Context | None) -> str | None:
+        """The ``call_id`` of the first round, when this call is the second
+        round of an approval asked in the client: so the verdict's line and
+        the ``pending`` line can be matched up."""
+        approver = policy.approver
+        if isinstance(approver, ElicitationApprover) and self.can_round_trip and context is not None:
+            return approver.resumed_call_id(context)
+        return None
+
     async def _check(self, call: _Call, policy: Policy, context: Context | None) -> InputRequiredResult | None:
         """Raise :class:`GateDenied` unless the policy lets this call run.
 
@@ -359,7 +405,9 @@ class _ToolGate:
         """
         if self.name in policy.deny:
             raise call.deny(Reason.DENYLIST)
-        if not policy.needs_approval(self.tier):
+        if not policy.allows(self.tier):
+            raise call.deny(Reason.ABOVE_MAX_TIER)
+        if not self._needs_approval(policy, call):
             return None
         approver = policy.approver
         if approver is None:
@@ -373,11 +421,29 @@ class _ToolGate:
             # the log records.
             arguments=copy.deepcopy(call.arguments),
             deadline=None if call.timeout is None else time.monotonic() + call.timeout,
+            call_id=call.call_id,
         )
         if isinstance(approver, ElicitationApprover):
             return await self._ask_in_client(call, approver, request, context)
+        call.approver = _approver_name(approver)
         await self._wait_for_approval(call, request, functools.partial(approver, request))
         return None
+
+    def _needs_approval(self, policy: Policy, call: _Call) -> bool:
+        """The tool's own rule if it has one; otherwise the policy's tiers."""
+        rule = self.require_approval
+        if rule is None:
+            return policy.needs_approval(self.tier)
+        if isinstance(rule, bool):
+            return rule
+        try:
+            # A copy, as an approver gets: the rule can't change the log.
+            return rule(copy.deepcopy(call.arguments)) is not False
+        except Exception:
+            _log.warning(
+                "mcp-gatehouse: the require_approval rule of %r raised; asking for approval", self.name, exc_info=True
+            )
+            return True
 
     async def _ask_in_client(
         self, call: _Call, approver: ElicitationApprover, request: ApprovalRequest, context: Context | None
@@ -390,6 +456,8 @@ class _ToolGate:
         answer. A client that can't be asked leaves it to the fallback.
         """
         transport = call.approver_step(approver.transport, context, round_trip=self.can_round_trip)
+        if transport is not None:
+            call.approver = _CLIENT
         if transport == "round-trip":
             answer = call.approver_step(approver.answer, request, context)
             if answer is None:
@@ -406,6 +474,7 @@ class _ToolGate:
         if transport == "back-channel":
             ask = functools.partial(approver.ask, request, context)
         elif approver.fallback is not None:
+            call.approver = _approver_name(approver.fallback)
             ask = functools.partial(approver.fallback, request)
         else:
             raise call.deny(Reason.CLIENT_CANNOT_BE_ASKED)
@@ -473,19 +542,32 @@ class _ToolGate:
 class _Call:
     """One call to a gated tool, as its audit lines describe it."""
 
+    call_id: str
+    """Shared by every line about this call, across rounds in the client."""
     tool: str
     tier: AccessTier
     arguments: dict[str, Any]
     """The redacted arguments."""
     audit: AuditSink
-    timeout: float | None
-    """The policy's ``approval_timeout`` when the call started."""
+    policy: Policy
+    """The policy as it was when the call started."""
+    approver: str | None = None
+    """Who is asked to approve, once someone is: ``client``, or a name."""
+
+    @property
+    def timeout(self) -> float | None:
+        return self.policy.approval_timeout
 
     def record(self, outcome: Outcome, reason: str | None = None, **extra: Any) -> None:
-        """Write one audit line: tool, tier, outcome, reason, arguments, then ``extra``."""
-        event: dict[str, Any] = {"tool": self.tool, "tier": self.tier.value, "outcome": outcome.value}
+        """Write one audit line: call_id, tool, tier, outcome, reason,
+        approver, arguments, then ``extra``. Unset fields are left out."""
+        event: dict[str, Any] = {
+            "call_id": self.call_id, "tool": self.tool, "tier": self.tier.value, "outcome": outcome.value,
+        }
         if reason is not None:
             event["reason"] = reason
+        if self.approver is not None:
+            event["approver"] = self.approver
         event["arguments"] = self.arguments
         event.update(extra)
         _record(self.audit, event)
@@ -509,6 +591,9 @@ def _denial_message(call: _Call, reason: str) -> str:
     tool = f"'{call.tool}'"
     if reason == Reason.DENYLIST:
         return f"{tool} is blocked by policy."
+    if reason == Reason.ABOVE_MAX_TIER:
+        limit = call.policy.max_tier.value if isinstance(call.policy.max_tier, AccessTier) else call.policy.max_tier
+        return f"{tool} ({call.tier.value}) is not allowed: this server is limited to {limit} tools right now."
     if reason == Reason.NO_APPROVER:
         return f"{tool} ({call.tier.value}) requires approval and no approver is configured. The gate fails closed."
     if reason == Reason.CLIENT_CANNOT_BE_ASKED:
@@ -524,6 +609,22 @@ def _denial_message(call: _Call, reason: str) -> str:
     if reason.startswith(Reason.APPROVER_ERROR):
         return f"{tool} could not be approved: the approver failed. The gate fails closed."
     return f"{tool} was refused by the approver."
+
+
+# The approver field when the person at the client is the one asked.
+_CLIENT = "client"
+
+
+def _approver_name(approver: object) -> str:
+    """How the audit log names an approver: its function's name
+    (``terminal_approver``, ``Approvals.ask``), else its class's."""
+    while isinstance(approver, functools.partial):
+        approver = approver.func
+    name = getattr(approver, "__qualname__", None)
+    if not isinstance(name, str):
+        return type(approver).__name__
+    # A function defined inside another is `outer.<locals>.inner`: keep `inner`.
+    return name.rsplit(".<locals>.", 1)[-1]
 
 
 def _record(audit: AuditSink, event: dict[str, Any]) -> None:

@@ -50,6 +50,7 @@ class Reason:
     """
 
     DENYLIST = "denylist"
+    ABOVE_MAX_TIER = "tier above max_tier"
     NO_APPROVER = "approval required, no approver configured"
     CLIENT_CANNOT_BE_ASKED = "approval required, client cannot be asked"
     REFUSED = "approver refused"
@@ -70,9 +71,10 @@ class Reason:
 class AuditSink(Protocol):
     """Anything the gate can hand its audit events to.
 
-    One method: ``record(**event)``, called once per outcome with ``tool``,
-    ``tier``, ``outcome`` (see :class:`Outcome`) and the redacted
-    ``arguments``, plus ``reason`` (see :class:`Reason`) and
+    One method: ``record(**event)``, called once per outcome with
+    ``call_id`` (shared by every line about one call), ``tool``, ``tier``,
+    ``outcome`` (see :class:`Outcome`) and the redacted ``arguments``, plus
+    ``reason`` (see :class:`Reason`), ``approver`` (who was asked) and
     ``duration_ms`` where they apply. Send them to a database, a SIEM or
     your logging stack by writing a class with that method.
 

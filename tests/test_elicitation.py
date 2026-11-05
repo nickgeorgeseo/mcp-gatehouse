@@ -512,3 +512,50 @@ async def test_a_message_function_that_raises_is_an_audited_denial(connect):
     assert result.is_error and "the approver failed" in result.content[0].text
     assert ran == []
     assert outcomes(stream) == [("denied", "approver error: KeyError")]
+
+
+# --- one call_id across the round trip; who was asked ---------------------------
+
+
+@pytest.mark.parametrize("answer", [APPROVE, ("decline", None)], ids=["approved", "declined"])
+async def test_the_pending_line_and_its_verdict_share_a_call_id(answer):
+    """Two tools/call requests, one call: the line written when the
+    question goes out, and the one written when the answer comes back,
+    can be matched exactly, not by guessing from arguments and time."""
+    stream, ran = io.StringIO(), []
+    mcp = build(Policy(approver=ElicitationApprover()), stream, ran)
+    async with Client(mcp, elicitation_callback=answering(*answer)) as client:
+        await client.call_tool("cancel_order", ARGUMENTS)
+        await client.call_tool("cancel_order", ARGUMENTS)  # a second call: its own id
+    first, verdict, again, again_verdict = events(stream)
+    assert first["outcome"] == "pending" and verdict["outcome"] in ("ok", "denied")
+    assert first["call_id"] == verdict["call_id"]
+    assert again["call_id"] == again_verdict["call_id"] != first["call_id"]
+    assert {e["approver"] for e in events(stream)} == {"client"}
+
+
+async def test_the_back_channel_names_the_client_and_a_fallback_its_own_name():
+    stream, ran = io.StringIO(), []
+
+    def front_desk(request):
+        return True
+
+    mcp = build(Policy(approver=ElicitationApprover(fallback=front_desk)), stream, ran)
+    async with Client(mcp, elicitation_callback=answering(*APPROVE), mode="legacy") as client:
+        await client.call_tool("cancel_order", ARGUMENTS)
+    async with Client(mcp) as client:  # no elicitation: the fallback decides
+        await client.call_tool("cancel_order", ARGUMENTS)
+    assert [(e["outcome"], e["approver"]) for e in events(stream)] == [("ok", "client"), ("ok", "front_desk")]
+
+
+@pytest.mark.parametrize(
+    "request_state",
+    [None, "not json", json.dumps({"cid": "../../etc"}), json.dumps({"cid": 7}), json.dumps({"other": 1}),
+     json.dumps({"cid": "0123456789abcdef"})],
+    ids=["none", "garbage", "path-like", "not-a-string", "no-cid", "valid"],
+)
+def test_only_a_well_formed_call_id_is_resumed(request_state):
+    from types import SimpleNamespace
+
+    resumed = ElicitationApprover().resumed_call_id(SimpleNamespace(request_state=request_state))
+    assert resumed == ("0123456789abcdef" if request_state and "0123456789abcdef" in request_state else None)

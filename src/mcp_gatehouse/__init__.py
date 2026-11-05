@@ -9,7 +9,7 @@ from importlib.metadata import PackageNotFoundError, version
 
 from .approvers import ElicitationApprover, terminal_approver
 from .audit import AuditLog, AuditSink, MemoryAuditLog, NullAuditLog, Outcome, Reason
-from .gatehouse import GateDenied, Gatehouse
+from .gatehouse import ApprovalRule, GateDenied, Gatehouse
 from .policy import (
     DEFAULT_REDACT,
     AccessTier,
@@ -23,6 +23,7 @@ __all__ = [
     "DEFAULT_REDACT",
     "AccessTier",
     "ApprovalRequest",
+    "ApprovalRule",
     "Approver",
     "AuditLog",
     "AuditSink",

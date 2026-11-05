@@ -11,7 +11,7 @@ import time
 
 import anyio
 import pytest
-from audit_helpers import events
+from audit_helpers import events, without_call_id
 from mcp import Client, MCPError
 from mcp.server.mcpserver import MCPServer
 
@@ -95,9 +95,9 @@ async def test_cancelled_while_awaiting_approval(interrupt):
     assert ran == []
     (event,) = events(log)
     del event["ts"]
-    assert event == {
+    assert without_call_id(event) == {
         "tool": "refund", "tier": "destructive", "outcome": "cancelled",
-        "reason": "awaiting approval", "arguments": LOGGED_ARGUMENTS,
+        "reason": "awaiting approval", "approver": "slow_human", "arguments": LOGGED_ARGUMENTS,
     }
 
 
@@ -132,9 +132,9 @@ async def test_cancelled_while_a_sync_approver_waits(interrupt):
     assert ran == []
     (event,) = events(log)
     del event["ts"]
-    assert event == {
+    assert without_call_id(event) == {
         "tool": "refund", "tier": "destructive", "outcome": "cancelled",
-        "reason": "awaiting approval", "arguments": LOGGED_ARGUMENTS,
+        "reason": "awaiting approval", "approver": "slow_human", "arguments": LOGGED_ARGUMENTS,
     }
 
 
@@ -157,9 +157,9 @@ async def test_cancelled_inside_an_async_tool(interrupt):
     (event,) = events(log)
     del event["ts"]
     assert event.pop("duration_ms") >= 0
-    assert event == {
+    assert without_call_id(event) == {
         "tool": "refund", "tier": "destructive", "outcome": "cancelled",
-        "reason": "tool running", "arguments": LOGGED_ARGUMENTS,
+        "reason": "tool running", "approver": "<lambda>", "arguments": LOGGED_ARGUMENTS,
     }
 
 

@@ -30,6 +30,11 @@ class AccessTier(enum.Enum):
     DESTRUCTIVE = "destructive"
     """Deletes, sends, or pays. Hard or impossible to take back."""
 
+    @property
+    def rank(self) -> int:
+        """0, 1, 2 for READ, WRITE, DESTRUCTIVE: how much it can do."""
+        return list(AccessTier).index(self)
+
 
 def _as_tier(value: object) -> AccessTier:
     """An :class:`AccessTier` from the enum itself or its value (``"write"``).
@@ -87,6 +92,10 @@ class ApprovalRequest:
     """``time.monotonic()`` value at which the gate stops waiting and denies
     the call, or ``None`` for no limit. An approver that blocks — a prompt,
     a poll — should give up by then: past it, its answer is ignored."""
+
+    call_id: str | None = None
+    """The ``call_id`` every audit line about this call carries. Put it in a
+    Slack message or a ticket, and the two can be matched up later."""
 
 
 Approver = Callable[[ApprovalRequest], bool | Awaitable[bool]]
@@ -217,6 +226,13 @@ class Policy:
     waits as long as the approver takes. Running out of time is a denial,
     so the gate still fails closed."""
 
+    max_tier: AccessTier | str | None = None
+    """The highest tier allowed to run at all; tools above it are denied
+    whatever else the policy says. ``"read"`` makes the server read-only.
+    The policy is read on every call, so assigning
+    ``gatehouse.policy = Policy(max_tier="read")`` switches a running
+    server to read-only from its next call. ``None``: no limit."""
+
     def __post_init__(self) -> None:
         # Normalised here, once, so every check downstream compares like with
         # like: "destructive" and AccessTier.DESTRUCTIVE are the same tier.
@@ -228,6 +244,8 @@ class Policy:
             if wrong:
                 raise TypeError(f"Policy({name}=...) takes strings; got {', '.join(wrong)}")
             object.__setattr__(self, name, names)
+        if self.max_tier is not None:
+            object.__setattr__(self, "max_tier", _as_tier(self.max_tier))
         if self.approver is not None and not callable(self.approver):
             raise TypeError(
                 f"Policy(approver=...) takes a callable (sync or async), not {type(self.approver).__name__}"
@@ -242,7 +260,12 @@ class Policy:
             )
 
     def needs_approval(self, tier: AccessTier | str) -> bool:
+        """Does this tier need the approver's sign-off, under this policy?"""
         return _as_tier(tier) in self.require_approval
+
+    def allows(self, tier: AccessTier | str) -> bool:
+        """Is this tier at or below ``max_tier``?"""
+        return self.max_tier is None or _as_tier(tier).rank <= _as_tier(self.max_tier).rank
 
 
 REDACTED = "«redacted»"

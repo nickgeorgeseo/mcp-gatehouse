@@ -522,3 +522,119 @@ async def test_only_true_approves(answer, reason, is_async):
     assert ran == (["1"] if answer is True else [])
     assert result.is_error is (answer is not True)
     assert outcomes(log) == [("ok", None) if answer is True else ("denied", reason)]
+
+
+# --- require_approval: per-tool rules ------------------------------------------
+
+
+def refund_server(rule, approver=None, log: io.StringIO | None = None, ran: list | None = None) -> MCPServer:
+    mcp = MCPServer("rules")
+    gk = Gatehouse(mcp, policy=Policy(approver=approver), audit=AuditLog(stream=log or io.StringIO()))
+
+    @gk.destructive(require_approval=rule)
+    def refund(order_id: str, amount: int, api_key: str = "") -> str:
+        if ran is not None:
+            ran.append(amount)
+        return f"refunded {amount}"
+
+    return mcp
+
+
+@pytest.mark.anyio
+async def test_a_rule_asks_only_when_it_says_so():
+    """Small refunds run on their own; big ones need the approver."""
+    asked, ran, log = [], [], io.StringIO()
+
+    def approver(request):
+        asked.append(request.arguments["amount"])
+        return False
+
+    mcp = refund_server(lambda args: args["amount"] > 50, approver, log, ran)
+    async with Client(mcp) as client:
+        small = await client.call_tool("refund", {"order_id": "1", "amount": 20})
+        big = await client.call_tool("refund", {"order_id": "2", "amount": 500})
+    assert not small.is_error and big.is_error
+    assert ran == [20] and asked == [500]
+    assert outcomes(log) == [("ok", None), ("denied", "approver refused")]
+
+
+@pytest.mark.anyio
+async def test_the_rule_sees_the_redacted_arguments_and_cannot_change_the_log():
+    seen, log = [], io.StringIO()
+
+    def rule(args):
+        seen.append(dict(args))
+        args["order_id"] = "rewritten"
+        return False
+
+    mcp = refund_server(rule, log=log)
+    async with Client(mcp) as client:
+        await client.call_tool("refund", {"order_id": "1", "amount": 5, "api_key": "sk-live-x"})
+    assert seen == [{"order_id": "1", "amount": 5, "api_key": "«redacted»"}]
+    assert events(log)[-1]["arguments"]["order_id"] == "1"
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    "rule",
+    [lambda args: None, lambda args: 0, lambda args: "", lambda args: 1 / 0],
+    ids=["None", "zero", "empty-string", "raises"],
+)
+async def test_only_false_skips_approval(rule, caplog):
+    """A rule that returns anything but False, or raises, asks: with no
+    approver configured, the call is denied. A rule that can't decide
+    must not wave a destructive call through."""
+    log, ran = io.StringIO(), []
+    with caplog.at_level(logging.WARNING, logger="mcp_gatehouse"):
+        async with Client(refund_server(rule, log=log, ran=ran)) as client:
+            result = await client.call_tool("refund", {"order_id": "1", "amount": 5})
+    assert result.is_error and ran == []
+    assert outcomes(log) == [("denied", "approval required, no approver configured")]
+
+
+@pytest.mark.anyio
+async def test_true_asks_for_any_tier_and_false_for_none():
+    asked, log = [], io.StringIO()
+    mcp = MCPServer("t")
+    gk = Gatehouse(mcp, policy=Policy(approver=lambda r: asked.append(r.tool) or True), audit=AuditLog(stream=log))
+
+    @gk.read(require_approval=True)
+    def export_customers() -> str:
+        return "exported"
+
+    @gk.destructive(require_approval=False)
+    def delete_draft() -> str:
+        return "deleted"
+
+    async with Client(mcp) as client:
+        hints = {t.name: t.annotations.destructive_hint for t in (await client.list_tools()).tools}
+        assert not (await client.call_tool("export_customers", {})).is_error
+        assert not (await client.call_tool("delete_draft", {})).is_error
+    assert asked == ["export_customers"]
+    assert hints == {"export_customers": False, "delete_draft": True}  # the hints follow the tier
+
+
+@pytest.mark.anyio
+async def test_the_policy_still_comes_first():
+    log = io.StringIO()
+    mcp = MCPServer("t")
+    gk = Gatehouse(mcp, policy=Policy(deny={"wipe"}, max_tier="write"), audit=AuditLog(stream=log))
+
+    @gk.destructive(require_approval=False)
+    def wipe() -> str:
+        return "wiped"
+
+    @gk.destructive(require_approval=False)
+    def purge() -> str:
+        return "purged"
+
+    async with Client(mcp) as client:
+        await client.call_tool("wipe", {})
+        await client.call_tool("purge", {})
+    assert outcomes(log) == [("denied", "denylist"), ("denied", "tier above max_tier")]
+
+
+def test_a_rule_of_the_wrong_kind_is_refused():
+    gk = Gatehouse(MCPServer("t"))
+    with pytest.raises(TypeError, match="require_approval"):
+        gk.destructive(require_approval="sometimes")  # type: ignore[arg-type]

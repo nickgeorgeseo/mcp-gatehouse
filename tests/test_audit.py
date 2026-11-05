@@ -7,17 +7,20 @@ had done its work had failed, inviting it to run it again."""
 
 from __future__ import annotations
 
+import functools
 import io
 import json
 import logging
 
 import pytest
+from audit_helpers import CALL_ID
 from mcp import Client
 from mcp.server.mcpserver import MCPServer
 from mcp.types import ElicitResult
 
 from mcp_gatehouse import (
     AccessTier,
+    ApprovalRequest,
     AuditLog,
     AuditSink,
     ElicitationApprover,
@@ -75,7 +78,8 @@ async def test_memory_log_holds_what_the_file_would(tmp_path):
     from_file = [json.loads(line) for line in path.read_text().split("\n") if line]
 
     def strip(events: list[dict]) -> list[dict]:
-        return [{k: v for k, v in e.items() if k not in ("ts", "duration_ms")} for e in events]
+        # ts, duration and call_id differ between the two runs by nature.
+        return [{k: v for k, v in e.items() if k not in ("ts", "duration_ms", "call_id")} for e in events]
 
     assert strip(memory.events) == strip(from_file)
     assert all("ts" in e for e in memory.events)
@@ -249,3 +253,94 @@ def test_each_record_is_on_disk_before_the_next_call(tmp_path):
             assert json.loads(reader.read())["tool"] == "refund"
     finally:
         log.close()
+
+
+# --- call_id and approver: tying lines together --------------------------------
+
+
+async def test_every_line_has_a_call_id_and_each_call_its_own():
+    audit = MemoryAuditLog()
+    mcp, _ = build(audit, Policy(approver=lambda request: True))
+    async with Client(mcp) as client:
+        for order_id in ("1", "2", "3"):
+            await client.call_tool("lookup", {"order_id": order_id})
+    ids = [e["call_id"] for e in audit.events]
+    assert len(set(ids)) == 3 and all(CALL_ID.fullmatch(i) for i in ids)
+    assert list(audit.events[0])[:3] == ["ts", "call_id", "tool"]  # read first when scanning a line
+
+
+async def test_the_approver_gets_the_call_id_its_line_will_carry():
+    """So a Slack message or a ticket can name the call, and be matched to
+    the audit line later."""
+    seen, audit = [], MemoryAuditLog()
+
+    def approver(request):
+        seen.append(request.call_id)
+        return True
+
+    mcp, _ = build(audit, Policy(approver=approver))
+    async with Client(mcp) as client:
+        await client.call_tool("refund", {"order_id": "9"})
+    assert seen == [audit.events[-1]["call_id"]]
+
+
+class SlackApprovals:
+    def ask(self, request: ApprovalRequest) -> bool:
+        return True
+
+    def __call__(self, request: ApprovalRequest) -> bool:
+        return True
+
+
+def approve_with_reason(request: ApprovalRequest, reason: str) -> bool:
+    return True
+
+
+def outer():
+    def nested_approver(request: ApprovalRequest) -> bool:
+        return True
+
+    return nested_approver
+
+
+@pytest.mark.parametrize(
+    ("approver", "name"),
+    [
+        (functools.partial(approve_with_reason, reason="x"), "approve_with_reason"),
+        (SlackApprovals().ask, "SlackApprovals.ask"),
+        (SlackApprovals(), "SlackApprovals"),
+        (outer(), "nested_approver"),
+        (lambda request: True, "<lambda>"),
+    ],
+    ids=["partial", "method", "callable-object", "nested-function", "lambda"],
+)
+async def test_lines_name_the_approver_that_was_asked(approver, name):
+    audit = MemoryAuditLog()
+    mcp, _ = build(audit, Policy(approver=approver))
+    async with Client(mcp) as client:
+        await client.call_tool("refund", {"order_id": "9"})
+    (line,) = audit.events
+    assert (line["outcome"], line["approver"]) == ("ok", name)
+
+
+async def test_a_refusal_names_the_approver_too():
+    audit = MemoryAuditLog()
+
+    def finance_team(request: ApprovalRequest) -> bool:
+        return False
+
+    mcp, _ = build(audit, Policy(approver=finance_team))
+    async with Client(mcp) as client:
+        await client.call_tool("refund", {"order_id": "9"})
+    assert [(e["outcome"], e["approver"]) for e in audit.events] == [("denied", "finance_team")]
+
+
+async def test_no_approver_field_when_nobody_was_asked():
+    audit = MemoryAuditLog()
+    mcp, _ = build(audit, Policy(deny={"broken"}))  # no approver configured
+    async with Client(mcp) as client:
+        await client.call_tool("lookup", {"order_id": "1"})  # needs no approval
+        await client.call_tool("refund", {"order_id": "1"})  # nobody to ask
+        await client.call_tool("broken", {})  # denylisted
+    assert [e["outcome"] for e in audit.events] == ["ok", "denied", "denied"]
+    assert all("approver" not in e for e in audit.events)

@@ -10,6 +10,7 @@ import hashlib
 import io
 import json
 import os
+import re
 import secrets
 import select
 import sys
@@ -137,6 +138,9 @@ _ROUND_TRIP_VERSION = "2026-07-28"
 
 # The key the gate's question is filed under in `input_requests`.
 _INPUT_KEY = "mcp-gatehouse/approval"
+
+# What a call_id looks like (see the gate). Anything else in a state is ignored.
+_CALL_ID = re.compile(r"[0-9a-f]{16}")
 
 # How long an asked-for approval stays answerable when the policy sets no
 # timeout. The SDK's own request-state lifetime (ten minutes unless
@@ -266,6 +270,9 @@ class ElicitationApprover:
             "q": _digest(message),
             "nonce": secrets.token_urlsafe(16),
             "exp": time.time() + age,
+            # So the verdict's audit line, a round later, carries the same
+            # call_id as the pending line written now.
+            "cid": request.call_id,
         }
         form = ElicitRequest(
             params=ElicitRequestFormParams(
@@ -276,6 +283,19 @@ class ElicitationApprover:
         return InputRequiredResult(
             input_requests={_INPUT_KEY: form}, request_state=json.dumps(state)
         )
+
+    def resumed_call_id(self, context: Any) -> str | None:
+        """Round trip, later round: the ``call_id`` of the call that asked.
+
+        ``None`` on a first round, or when the state is not the gate's. The
+        SDK seals the state and binds it to the tool and its arguments, so a
+        ``call_id`` found here is that call's own.
+        """
+        try:
+            cid = json.loads(context.request_state or "").get("cid")
+        except Exception:
+            return None
+        return cid if isinstance(cid, str) and _CALL_ID.fullmatch(cid) else None
 
     def answer(self, request: ApprovalRequest, context: Any) -> tuple[bool, str] | None:
         """Round trip, later round: read the client's answer.

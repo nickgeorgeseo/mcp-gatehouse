@@ -45,9 +45,10 @@ refused and one approved, and the audit log they left. No sound.
 |---|---|
 | **Permission tiers** | Every tool is declared `READ`, `WRITE`, or `DESTRUCTIVE` — and the tier also emits honest spec `ToolAnnotations` (`readOnlyHint` / `destructiveHint`), which the wrapper won't let you override to lie. |
 | **Approval gates** | Tiers you choose require a sign-off before the tool runs, asked right in the MCP client (Claude Code, Cursor, VS Code) or by any callable you write: a terminal prompt, a Slack ping, a ticket. **Fails closed:** a gated tool with no approver configured is denied, not waved through. |
-| **Audit log** | Append-only JSONL, one line per call — allowed, denied, failed, or cancelled — with UTC timestamps and durations. Or send the events anywhere: a sink is one method. The answer to "what did the AI actually do?" six months later. |
+| **Approval rules** | Decide per tool, or per call from its arguments: `require_approval=lambda args: args["amount"] > 50` asks only for the big refunds. |
+| **Audit log** | Append-only JSONL, one line per call — allowed, denied, failed, or cancelled — with UTC timestamps, durations, a `call_id` that ties a call's lines together, and who was asked to approve. Or send the events anywhere: a sink is one method. The answer to "what did the AI actually do?" six months later. |
 | **Redaction** | Argument keys you name (`api_key`, `password`, `token`, `client_secret`, … by default) are masked before they reach the log *or* the approver — however they're spelled, and whatever comes before them: `token` covers `github_token` and `authToken`, not `token_count`. |
-| **Denylist** | Block a tool outright, whatever its tier. |
+| **Denylist and read-only switch** | Block a tool outright, whatever its tier, or cap what can run at all: `Policy(max_tier="read")` makes a server read-only, even mid-incident. |
 
 ## Quickstart
 
@@ -92,6 +93,21 @@ test, skips the gate. Hints the tier doesn't decide, `idempotentHint` and
 `openWorldHint`, go in `annotations=` as usual; one that contradicts the
 tier is refused.
 
+Approval follows the policy's tiers unless a tool says otherwise.
+`require_approval=True` asks for every call to that tool, `False` for
+none, and a function decides per call, from the (redacted) arguments:
+
+```python
+@gatehouse.destructive(require_approval=lambda args: args["amount"] > 50)
+def refund(order_id: str, amount: int) -> str:
+    """Refunds up to 50 run on their own; bigger ones need a sign-off."""
+    ...
+```
+
+Only a `False` from the function skips approval. Anything else, or an
+exception, asks: a rule that can't decide fails closed. The denylist and
+`max_tier` (below) still come first.
+
 A tier the gate can't read stops the server starting, rather than letting
 a call through: `tier="destroy"` is an error, and so is `deny="drop_db"`
 where a collection belongs. A tool registered with no tier at all is
@@ -133,11 +149,15 @@ must come from outside the client, use an out-of-band approver instead.
 `terminal_approver` asks on the controlling terminal (`/dev/tty`), never
 stdin — over stdio, stdin *is* the protocol pipe, so a plain `input()`
 approver would corrupt it. An approver is any callable, sync or async,
-that takes an `ApprovalRequest` and returns `True` to allow; sync ones run
-in a worker thread from a pool of their own, so a human taking their time
-doesn't stall other calls, and a pile of pending approvals can't take the
-threads your sync tools need. If the approver raises (Slack down, ticket
-API timing out), the call is denied and the failure is logged.
+that takes an `ApprovalRequest` and returns `True` to allow. Only `True`:
+`False` refuses, and anything else (a forgotten `return`, an API response
+returned by mistake) is denied as an approver error, so a bug can't
+approve. Sync approvers run in a worker thread from a pool of their own,
+so a human taking their time doesn't stall other calls, and a pile of
+pending approvals can't take the threads your sync tools need. If the
+approver raises (Slack down, ticket API timing out), the call is denied
+and the failure is logged. `request.call_id` is the id the call's audit
+lines carry: put it in your Slack message or ticket to match them up.
 
 Give approvals a deadline so a sign-off nobody gives doesn't hang the call:
 
@@ -161,6 +181,16 @@ Policy(require_approval={"write", "destructive"}, ...)
 Tiers can be `AccessTier` members or their names, in any collection.
 The gate reads `gatehouse.policy` on every call, so replacing it (to deny
 a tool mid-incident, say) applies from the next call.
+
+`max_tier` caps what can run at all: `Policy(max_tier="read")` makes a
+server read-only, and writes and deletes are denied whatever the approver
+would say. On a running server, keep the rest of the policy and switch:
+
+```python
+from dataclasses import replace
+
+gatehouse.policy = replace(gatehouse.policy, max_tier="read")  # stop all changes
+```
 
 Add your own secret-bearing keys without losing the defaults:
 
@@ -202,11 +232,18 @@ worse.
 What the audit trail looks like:
 
 ```json
-{"ts": "2026-07-16T14:02:11+00:00", "tool": "lookup_order", "tier": "read", "outcome": "ok", "arguments": {"order_id": "4417"}, "duration_ms": 0.42}
-{"ts": "2026-07-16T14:02:38+00:00", "tool": "add_note", "tier": "write", "outcome": "ok", "arguments": {"order_id": "4417", "note": "call back", "api_key": "«redacted»"}, "duration_ms": 1.08}
-{"ts": "2026-07-16T14:03:05+00:00", "tool": "cancel_order", "tier": "destructive", "outcome": "denied", "reason": "approver refused", "arguments": {"order_id": "4417"}}
-{"ts": "2026-07-16T14:05:40+00:00", "tool": "cancel_order", "tier": "destructive", "outcome": "cancelled", "reason": "awaiting approval", "arguments": {"order_id": "4418"}}
+{"ts": "2026-07-16T14:02:11+00:00", "call_id": "3f9c2a7e5b1d4c08", "tool": "lookup_order", "tier": "read", "outcome": "ok", "arguments": {"order_id": "4417"}, "duration_ms": 0.42}
+{"ts": "2026-07-16T14:02:38+00:00", "call_id": "a1e0b44f9d2c7731", "tool": "add_note", "tier": "write", "outcome": "ok", "arguments": {"order_id": "4417", "note": "call back", "api_key": "«redacted»"}, "duration_ms": 1.08}
+{"ts": "2026-07-16T14:03:05+00:00", "call_id": "5d27c8e1f0a3b964", "tool": "cancel_order", "tier": "destructive", "outcome": "pending", "reason": "approval asked in client", "approver": "client", "arguments": {"order_id": "4417"}}
+{"ts": "2026-07-16T14:03:19+00:00", "call_id": "5d27c8e1f0a3b964", "tool": "cancel_order", "tier": "destructive", "outcome": "denied", "reason": "approver refused", "approver": "client", "arguments": {"order_id": "4417"}}
+{"ts": "2026-07-16T14:05:40+00:00", "call_id": "0be6d91a2f84c7e5", "tool": "cancel_order", "tier": "destructive", "outcome": "cancelled", "reason": "awaiting approval", "approver": "terminal_approver", "arguments": {"order_id": "4418"}}
 ```
+
+`call_id` is the same on every line about one call: above, the `pending`
+line and its verdict 14 seconds later. `approver` names who was asked:
+`client` for the form in the client, otherwise the approver's function
+name. For code that reads the log, the `outcome` and `reason` values are
+importable as `Outcome` and `Reason`.
 
 `outcome` is `ok`, `denied` (`reason` says why), `error` (the tool
 raised; `reason` is the exception type), `pending`, or `cancelled`.

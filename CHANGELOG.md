@@ -50,6 +50,21 @@ All notable changes to `mcp-gatehouse`. The public API (`Gatehouse`,
   any case. Enter and anything else still refuse.
 - `mcp-gatehouse --version` and `--help` called themselves
   `mcp-gatehouse-demo`.
+- **An approver that returned anything truthy approved the call**: an API
+  response returned by mistake, a `1`, even the string `"no"`. Only `True`
+  approves now; `False` refuses, and anything else is denied as
+  `approver error: returned <type>, not True or False`.
+- **The approval form showed argument values raw**, so bidi overrides and
+  zero-width characters in a model-supplied value could make it display
+  as something other than what was being approved. They're shown as
+  escapes now; readable text is unchanged.
+- A step of `ElicitationApprover`'s own that raised (a custom `message=`
+  over the 2026-07-28 round trip, say) crashed the call with no audit
+  line. It's an audited approver-error denial now.
+- A dataclass argument holding a value that can't be deep-copied made
+  redaction raise, so the call failed before it was logged.
+- `approval_timeout=float("inf")` passed validation, then broke the
+  terminal prompt. It's refused; `None` means no limit.
 
 ### Added
 
@@ -62,7 +77,22 @@ All notable changes to `mcp-gatehouse`. The public API (`Gatehouse`,
 - `Gatehouse(audit=...)` takes a path, or any object with a
   `record(**event)` method (the new `AuditSink` protocol).
 - `MemoryAuditLog`, which keeps records in `.events`, for tests.
-- CI type-checks the package with mypy against Python 3.10.
+- `require_approval=` on any tool: `True` always asks, `False` never
+  does, and a function of the redacted arguments decides per call
+  (`lambda args: args["amount"] > 50`). Only `False` from the function
+  skips approval; anything else, or an exception, asks.
+- `Policy(max_tier=...)`: tools above it are denied whatever the approver
+  would say. `"read"` makes a server read-only, and since the policy is
+  read per call, a running server can be switched.
+- Every audit line has a `call_id`, the same on every line about one
+  call, including an approval's `pending` line and its verdict a round
+  later. Approvers get it as `ApprovalRequest.call_id`.
+- Lines about a call an approver was asked about name it: `approver`,
+  `client` for the form in the client, else the approver's function name.
+- `Outcome` and `Reason`: the audit log's `outcome` and `reason` values,
+  for code that reads the log. `ApprovalRule`: the type of a rule.
+- CI type-checks the package with mypy against Python 3.10, and lints it
+  with ruff.
 
 ### Changed
 
@@ -70,6 +100,14 @@ All notable changes to `mcp-gatehouse`. The public API (`Gatehouse`,
   now warns (`FutureWarning`): that's ungated and tells clients the tool is
   read-only. A future release will require the tier.
 - The demo and `examples/orders_server.py` use the tier decorators.
+- Audit lines gain `call_id` (every line) and `approver` (where one was
+  asked). Code that parses the JSON is unaffected; code that compares
+  whole lines needs to allow for them.
+- An approval answered too late over the 2026-07-28 round trip says "was
+  not approved within Ns", like every other timeout.
+- Internals restructured for readers (no API change): the call path in
+  `gatehouse.py` reads top to bottom, and the tests are organised by
+  subject, sharing one helper.
 - The sdist no longer ships `docs/` or `.github/`.
 - The Dockerfile's notes say the demo has four tools, and that a client
   that can show the approval form can approve in the container.

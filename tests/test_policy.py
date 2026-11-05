@@ -119,3 +119,17 @@ def test_max_tier_is_read_like_any_tier():
     assert Policy().allows("destructive")
     with pytest.raises(ValueError, match="unknown access tier"):
         Policy(max_tier="readonly")
+
+
+def test_replace_switches_max_tier_and_keeps_the_rest():
+    """The README's mid-incident switch: dataclasses.replace on a Policy."""
+    from dataclasses import replace
+
+    def approver(request):
+        return True
+
+    policy = Policy(approver=approver, deny={"drop_db"}, require_approval={"write"}, approval_timeout=5)
+    switched = replace(policy, max_tier="read")
+    assert switched.max_tier is AccessTier.READ
+    assert switched.approver is approver and switched.deny == {"drop_db"}
+    assert switched.require_approval == {AccessTier.WRITE} and switched.approval_timeout == 5

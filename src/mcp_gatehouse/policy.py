@@ -142,14 +142,40 @@ def _secret_matcher(keys: frozenset[str]) -> Callable[[str], bool]:
     """
     whole = {_normalize_key(k) for k in keys}
     tails = {w for w in map(_words, keys) if w}
+    # Payloads repeat a few names many times (a list of rows), so each
+    # name's answer is kept. Only short names, and only so many, so hostile
+    # input can't grow it.
+    seen: dict[str, bool] = {}
+    # Only a name's last words can match a tail, and every tail fits well
+    # inside this many characters, so splitting a long name into words
+    # need only look at its end. A word cut at the window's edge can only
+    # make the name mask more, never less.
+    window = max(_SCAN_LIMIT, 2 * max((len(k) for k in keys), default=0) + 8)
 
-    def is_secret(name: str) -> bool:
+    def match(name: str) -> bool:
+        # Always the whole name, however long: separators vanish when it is
+        # normalised, so `api____…____key` is still `api_key`.
         if _normalize_key(name) in whole:
             return True
-        words = _words(name)
+        words = _words(name[-window:])
         return any(words[-len(tail):] == tail for tail in tails if len(tail) <= len(words))
 
+    def is_secret(name: str) -> bool:
+        known = seen.get(name)
+        if known is None:
+            known = match(name)
+            if len(name) <= _SCAN_LIMIT and len(seen) < _SEEN_LIMIT:
+                seen[name] = known
+        return known
+
     return is_secret
+
+
+# How much of the end of a long argument name is split into words (at
+# least; more if a key is long), and the longest name whose verdict is kept.
+_SCAN_LIMIT = 256
+# Distinct names whose verdict a matcher remembers.
+_SEEN_LIMIT = 4096
 
 
 @dataclass(frozen=True)

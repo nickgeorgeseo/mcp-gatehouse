@@ -102,3 +102,42 @@ def test_unusual_names_do_not_break_matching(name):
 def test_any_collection_of_keys_works():
     for keys in (["pin"], ("pin",), {"pin"}, frozenset({"pin"}), Policy(redact={"pin"}).redact):
         assert redact_arguments({"card_pin": "1"}, keys) == {"card_pin": REDACTED}
+
+
+# --- long names and the per-name cache -----------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("name", "secret"),
+    [
+        ("x" * 1_000_000 + "_github_token", True),  # the tail is all that's split
+        ("api" + "_" * 5_000 + "key", True),  # separators vanish: still api_key, whole
+        ("Api" + "-" * 5_000 + "Key", True),
+        ("x" * 10_000 + "token", False),  # one long word, not the word "token"
+        ("token_" + "x" * 10_000, False),
+    ],
+    ids=["long-prefix", "long-separators", "long-separators-mixed", "one-long-word", "long-suffix"],
+)
+def test_long_names_match_as_short_ones_do(name, secret):
+    assert masked(name) is secret
+
+
+def test_the_verdict_cache_is_bounded_and_never_changes_an_answer():
+    from mcp_gatehouse.policy import _SEEN_LIMIT, _secret_matcher
+
+    keys = frozenset({"card_pin"})
+    is_secret = _secret_matcher(keys)
+    for i in range(_SEEN_LIMIT * 2):
+        assert is_secret(f"field_{i}") is False
+        assert is_secret(f"field_{i}_card_pin") is True
+    assert is_secret("card_pin") and is_secret("cardPin") and not is_secret("spin")
+    (seen,) = [c.cell_contents for c in is_secret.__closure__ if isinstance(c.cell_contents, dict)]
+    assert len(seen) <= _SEEN_LIMIT
+    is_secret("y" * 100_000 + "_card_pin")
+    assert all(len(name) <= 256 for name in seen)  # long names are never kept
+
+
+def test_a_long_custom_key_still_matches_as_a_tail():
+    key = "_".join(["segment"] * 60)  # a 479-character key, longer than the scan window's floor
+    assert masked("prefix_" + key, frozenset({key}))
+    assert not masked("prefix_" + key[:-1], frozenset({key}))

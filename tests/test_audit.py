@@ -1,4 +1,5 @@
-"""Where audit events go, and what happens when they can't get there.
+"""The audit log: the JSONL file, other sinks, and what happens when a
+sink can't record.
 
 A sink that fails must not change a call's outcome: most records are
 written after the tool ran, and an error then told the model a call that
@@ -204,3 +205,47 @@ def test_policy_applies_to_both_tiers_and_is_typed():
     gatehouse = Gatehouse(MCPServer("t"))
     assert isinstance(gatehouse.policy, Policy)
     assert gatehouse.policy.needs_approval(AccessTier.DESTRUCTIVE)
+
+
+# --- the JSONL file -----------------------------------------------------------
+
+
+def test_audit_log_exposes_its_absolute_path(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    with AuditLog(path="sub/audit.jsonl") as log:
+        assert log.path == tmp_path / "sub" / "audit.jsonl"
+    assert AuditLog(stream=io.StringIO()).path is None
+
+
+def test_audit_log_writes_jsonl_with_timestamp(tmp_path):
+    path = tmp_path / "logs" / "audit.jsonl"
+    with AuditLog(path=path) as log:
+        log.record(tool="x", outcome="ok")
+        log.record(tool="y", outcome="denied")
+    lines = path.read_text().splitlines()
+    assert len(lines) == 2
+    first = json.loads(lines[0])
+    assert first["tool"] == "x"
+    assert first["ts"].endswith("+00:00")
+
+
+def test_audit_log_requires_exactly_one_sink():
+    import pytest
+
+    with pytest.raises(ValueError):
+        AuditLog()
+    with pytest.raises(ValueError):
+        AuditLog(path="x.jsonl", stream=io.StringIO())
+
+
+def test_each_record_is_on_disk_before_the_next_call(tmp_path):
+    """Flushed per record, while the log stays open: a crash after a call
+    must not take that call's line with it."""
+    path = tmp_path / "audit.jsonl"
+    log = AuditLog(path=path)
+    try:
+        log.record(tool="refund", outcome="ok")
+        with open(path, encoding="utf-8") as reader:  # a second handle, as a tail -f would
+            assert json.loads(reader.read())["tool"] == "refund"
+    finally:
+        log.close()

@@ -55,6 +55,7 @@ dev = [
     "twine>=7",
     # The package ships py.typed; CI holds its annotations to that.
     "mypy>=2,<3",
+    "ruff>=0.17,<0.18",
 ]
 
 [tool.hatch.build.targets.wheel]
@@ -67,6 +68,14 @@ exclude = ["/docs", "/.github"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+
+[tool.ruff.lint]
+# pyflakes, pycodestyle, bugbear, import order, and modern syntax for 3.10+.
+select = ["E", "F", "W", "B", "I", "UP"]
 
 [tool.mypy]
 # The floor of requires-python, so 3.11+-only typing fails here first.

@@ -18,13 +18,13 @@ import time
 from collections.abc import Awaitable, Callable
 from typing import Any, Literal, TextIO
 
+from mcp.server.elicitation import render_elicitation_schema
 from mcp.types import (
     ElicitRequest,
     ElicitRequestFormParams,
     ElicitResult,
     InputRequiredResult,
 )
-from mcp.server.elicitation import render_elicitation_schema
 from mcp_types.version import is_version_at_least
 from pydantic import BaseModel, Field, ValidationError
 

@@ -7,6 +7,7 @@ now also masks names that end in its words."""
 from __future__ import annotations
 
 import pytest
+from pydantic import BaseModel
 
 from mcp_gatehouse import DEFAULT_REDACT, Policy, redact_arguments
 from mcp_gatehouse.policy import REDACTED, _normalize_key
@@ -141,3 +142,55 @@ def test_a_long_custom_key_still_matches_as_a_tail():
     key = "_".join(["segment"] * 60)  # a 479-character key, longer than the scan window's floor
     assert masked("prefix_" + key, frozenset({key}))
     assert not masked("prefix_" + key[:-1], frozenset({key}))
+
+
+# --- spelling, nesting, and values the scrubber can't take apart ---------------
+
+
+@pytest.mark.parametrize(
+    "key", ["api_key", "apiKey", "API-Key", "x-api-key", "accessToken", "client_secret", "Set-Cookie", "PRIVATE_KEY"]
+)
+def test_default_redaction_ignores_case_and_separators(key):
+    assert redact_arguments({key: "hunter2"}, DEFAULT_REDACT) == {key: "«redacted»"}
+
+
+def test_custom_keys_normalize_too_and_defaults_extend():
+    keys = DEFAULT_REDACT | {"card_pin"}
+    out = redact_arguments({"cardPin": "1234", "password": "x", "note": "fine"}, keys)
+    assert out == {"cardPin": "«redacted»", "password": "«redacted»", "note": "fine"}
+
+
+def test_redaction_is_still_whole_key_not_substring():
+    assert redact_arguments({"token_count": 12, "secretary": "Ann"}, DEFAULT_REDACT) == {
+        "token_count": 12,
+        "secretary": "Ann",
+    }
+
+
+def test_redaction_is_case_insensitive_and_recursive():
+    args = {
+        "order_id": "4417",
+        "API_KEY": "sk-live",
+        "customer": {"name": "Pat", "Password": "pw"},
+        "batch": [{"token": "t1"}, {"note": "fine"}],
+    }
+    safe = redact_arguments(args, DEFAULT_REDACT)
+    assert safe["order_id"] == "4417"
+    assert safe["API_KEY"] == REDACTED
+    assert safe["customer"]["Password"] == REDACTED
+    assert safe["customer"]["name"] == "Pat"
+    assert safe["batch"][0]["token"] == REDACTED
+    assert safe["batch"][1]["note"] == "fine"
+    # the original is untouched
+    assert args["API_KEY"] == "sk-live"
+
+
+def test_a_model_whose_dump_fails_is_opaque():
+    class Fragile(BaseModel):
+        secret: str
+
+        def model_dump(self, *args: object, **kwargs: object) -> dict:  # type: ignore[override]
+            raise RuntimeError(f"cannot dump {self.secret}")
+
+    safe = redact_arguments({"thing": Fragile(secret="sk-live")}, DEFAULT_REDACT)
+    assert safe == {"thing": "«opaque:Fragile»"}

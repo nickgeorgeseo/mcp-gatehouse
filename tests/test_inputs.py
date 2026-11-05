@@ -8,19 +8,21 @@ a collection belongs iterated into its characters."""
 from __future__ import annotations
 
 import io
-import json
 import warnings
 
 import pytest
+from audit_helpers import events
 from mcp import Client
 from mcp.server.mcpserver import MCPServer
 from mcp.types import ToolAnnotations
 
-from mcp_gatehouse import AccessTier, AuditLog, Gatehouse, Policy, redact_arguments
-
-
-def events(stream: io.StringIO) -> list[dict]:
-    return [json.loads(line) for line in stream.getvalue().split("\n") if line]
+from mcp_gatehouse import (
+    AccessTier,
+    AuditLog,
+    Gatehouse,
+    Policy,
+    redact_arguments,
+)
 
 
 def server(policy: Policy, log: io.StringIO, ran: list[str], tier: object = AccessTier.DESTRUCTIVE) -> MCPServer:
@@ -309,3 +311,9 @@ async def test_title_comes_from_the_annotations_unless_given():
     tools = await listed(mcp)
     assert tools["a"].annotations.title == "From annotations"
     assert tools["b"].annotations.title == "From title"
+
+
+def test_annotations_of_the_wrong_type_are_refused():
+    gatehouse = Gatehouse(MCPServer("t"))
+    with pytest.raises(TypeError, match="ToolAnnotations or a mapping"):
+        gatehouse.read(annotations=["readOnlyHint"])  # type: ignore[arg-type]

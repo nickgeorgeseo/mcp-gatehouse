@@ -563,9 +563,10 @@ async def _call(
 
 
 def _is_async_callable(fn: Any) -> bool:
+    """An ``async def``, a partial of one, or an object whose ``__call__`` is one."""
     while isinstance(fn, functools.partial):
         fn = fn.func
-    return inspect.iscoroutinefunction(fn) or inspect.iscoroutinefunction(getattr(fn, "__call__", None))
+    return inspect.iscoroutinefunction(fn) or (callable(fn) and inspect.iscoroutinefunction(fn.__call__))
 
 
 def _runs_own_rounds(fn: Callable[..., Any]) -> bool:

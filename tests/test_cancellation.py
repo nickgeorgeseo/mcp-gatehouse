@@ -6,12 +6,12 @@ from __future__ import annotations
 
 import contextlib
 import io
-import json
 import threading
 import time
 
 import anyio
 import pytest
+from audit_helpers import events
 from mcp import Client, MCPError
 from mcp.server.mcpserver import MCPServer
 
@@ -19,10 +19,6 @@ from mcp_gatehouse import AccessTier, AuditLog, Gatehouse, Policy
 
 ARGUMENTS = {"order_id": "4417", "api_key": "sk-live-not-for-the-log"}
 LOGGED_ARGUMENTS = {"order_id": "4417", "api_key": "«redacted»"}
-
-
-def events(stream: io.StringIO) -> list[dict]:
-    return [json.loads(line) for line in stream.getvalue().split("\n") if line]
 
 
 async def until(started: threading.Event) -> None:

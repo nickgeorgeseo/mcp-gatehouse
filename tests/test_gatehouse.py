@@ -4,9 +4,9 @@ through a real MCP client session over the SDK's in-memory transport."""
 from __future__ import annotations
 
 import io
-import json
 
 import pytest
+from audit_helpers import events
 from mcp import Client
 from mcp.server.mcpserver import MCPServer
 
@@ -38,12 +38,6 @@ def build_server(policy: Policy, log_stream: io.StringIO) -> MCPServer:
         raise RuntimeError("downstream exploded")
 
     return mcp
-
-
-def events(stream: io.StringIO) -> list[dict]:
-    # split("\n"), not splitlines(): the log guarantees one \n per record,
-    # and splitlines() would treat U+2028-style separators as record breaks.
-    return [json.loads(line) for line in stream.getvalue().split("\n") if line]
 
 
 @pytest.mark.anyio

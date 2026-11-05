@@ -130,7 +130,7 @@ class AuditLog:
         if self._owns_stream:
             self._stream.close()
 
-    def __enter__(self) -> "AuditLog":
+    def __enter__(self) -> AuditLog:
         return self
 
     def __exit__(self, *exc: object) -> None:

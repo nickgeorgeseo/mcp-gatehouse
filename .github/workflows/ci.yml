@@ -31,9 +31,10 @@ jobs:
       - run: pip show mcp | grep -i version
       - run: pytest -q
 
-  typecheck:
-    # The package ships py.typed, so its annotations are part of the API.
-    # Checked against the oldest supported Python (see [tool.mypy]).
+  lint:
+    # ruff for correctness and consistency; mypy because the package ships
+    # py.typed, so its annotations are part of the API (checked against the
+    # oldest supported Python, see [tool.mypy]).
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
@@ -41,4 +42,5 @@ jobs:
         with:
           python-version: "3.12"
       - run: pip install -e ".[dev]"
+      - run: ruff check
       - run: mypy

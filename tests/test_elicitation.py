@@ -10,28 +10,31 @@ from __future__ import annotations
 
 import io
 import json
+import time
+from types import SimpleNamespace
 from typing import Any
 
 import anyio
 import pytest
+from audit_helpers import events, outcomes
 from mcp import Client, MCPError
 from mcp.server.mcpserver import Context, MCPServer
 from mcp.types import ElicitResult, InputRequiredResult
 
-from mcp_gatehouse import AccessTier, AuditLog, ElicitationApprover, Gatehouse, Policy
+from mcp_gatehouse import (
+    AccessTier,
+    ApprovalRequest,
+    AuditLog,
+    ElicitationApprover,
+    Gatehouse,
+    Policy,
+)
+from mcp_gatehouse.approvers import _INPUT_KEY, _default_message, _digest
 
 ARGUMENTS = {"order_id": "4417", "api_key": "sk-live-not-for-the-form"}
 LOGGED = {"order_id": "4417", "api_key": "«redacted»"}
 
 pytestmark = pytest.mark.anyio
-
-
-def events(stream: io.StringIO) -> list[dict]:
-    return [json.loads(line) for line in stream.getvalue().split("\n") if line]
-
-
-def outcomes(stream: io.StringIO) -> list[tuple[str, str | None]]:
-    return [(e["outcome"], e.get("reason")) for e in events(stream)]
 
 
 def build(policy: Policy, stream: io.StringIO, ran: list[str]) -> MCPServer:
@@ -90,7 +93,9 @@ async def test_approved_in_client_runs_once(connect):
 
 
 @pytest.mark.parametrize("connect", [ROUND_TRIP, BACK_CHANNEL], ids=["round-trip", "back-channel"])
-@pytest.mark.parametrize("answer", [("decline", None), ("cancel", None), UNTICKED], ids=["decline", "cancel", "unticked"])
+@pytest.mark.parametrize(
+    "answer", [("decline", None), ("cancel", None), UNTICKED], ids=["decline", "cancel", "unticked"]
+)
 async def test_anything_but_a_ticked_box_refuses(connect, answer):
     stream, ran = io.StringIO(), []
     mcp = build(Policy(approver=ElicitationApprover()), stream, ran)
@@ -378,3 +383,79 @@ def test_called_directly_it_defers_to_the_fallback():
     request = ApprovalRequest(tool="t", tier=AccessTier.DESTRUCTIVE, arguments={})
     assert ElicitationApprover()(request) is False
     assert ElicitationApprover(fallback=lambda r: True)(request) is True
+
+
+# --- the round trip's answer checks, one at a time ---------------------------
+
+REQUEST = ApprovalRequest(tool="cancel", tier=AccessTier.DESTRUCTIVE, arguments={"order_id": "1"})
+
+
+def answer_context(state: dict | str | None, reply: object = None) -> SimpleNamespace:
+    raw = state if isinstance(state, str) or state is None else json.dumps(state)
+    return SimpleNamespace(request_state=raw, input_responses=None if reply is None else {_INPUT_KEY: reply})
+
+
+def sealed_state(**overrides: object) -> dict:
+    base = {"v": 1, "q": _digest(_default_message(REQUEST)), "nonce": "n-1", "exp": time.time() + 60}
+    return {**base, **overrides}
+
+
+APPROVED = ElicitResult(action="accept", content={"approve": True})
+
+
+@pytest.mark.parametrize(
+    "ctx",
+    [
+        answer_context(None, APPROVED),
+        answer_context("not json", APPROVED),
+        answer_context(sealed_state(v=2), APPROVED),
+        answer_context(sealed_state(nonce=5), APPROVED),
+        answer_context({"v": 1}, APPROVED),
+        answer_context(sealed_state(), None),
+        answer_context(sealed_state(q=_digest("some other question")), APPROVED),
+    ],
+    ids=["no-state", "garbage", "other-version", "bad-nonce", "missing-fields", "no-answer", "other-question"],
+)
+def test_anything_but_an_answer_to_this_question_is_asked_again(ctx):
+    """None means 'ask (again)'; nothing here may approve."""
+    assert ElicitationApprover().answer(REQUEST, ctx) is None
+
+
+def test_an_answer_that_is_not_an_elicitation_result_is_an_error():
+    assert ElicitationApprover().answer(REQUEST, answer_context(sealed_state(), {"action": "accept"})) == (
+        False,
+        "approver error: not an elicitation answer",
+    )
+
+
+def test_spent_approvals_are_forgotten_once_expired():
+    """Single use is tracked in memory; expired entries must not pile up
+    for the life of the process."""
+    approver = ElicitationApprover()
+    now = time.time()
+    assert approver._spend("old", now - 1)
+    assert approver._spend("live", now + 60)
+    assert not approver._spend("live", now + 60)
+    assert approver._spend("new", now + 60)
+    assert set(approver._used) == {"live", "new"}
+
+
+# --- no live request: nobody to ask -------------------------------------------
+
+
+@pytest.mark.parametrize("fallback", [None, True, False], ids=["no-fallback", "fallback-yes", "fallback-no"])
+async def test_direct_call_tool_has_no_client_to_ask(fallback):
+    """MCPServer.call_tool() from server code (a test, a job) has no
+    request behind it, so there's no client to ask: the fallback decides,
+    and with none the call is denied."""
+    stream, ran = io.StringIO(), []
+    approver = ElicitationApprover(fallback=None if fallback is None else (lambda r: fallback))
+    mcp = build(Policy(approver=approver), stream, ran)
+    if fallback:
+        await mcp.call_tool("cancel_order", ARGUMENTS)
+        assert ran == ["4417"]
+    else:
+        with pytest.raises(Exception, match="fails closed|refused"):
+            await mcp.call_tool("cancel_order", ARGUMENTS)
+        assert ran == []
+        assert events(stream)[-1]["outcome"] == "denied"

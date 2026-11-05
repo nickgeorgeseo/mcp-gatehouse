@@ -12,6 +12,7 @@ import json
 import logging
 
 import pytest
+from audit_helpers import events
 from mcp import Client
 from mcp.server.mcpserver import Context, MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
@@ -19,11 +20,6 @@ from pydantic import BaseModel
 
 from mcp_gatehouse import AccessTier, AuditLog, GateDenied, Gatehouse, Policy
 from mcp_gatehouse.policy import DEFAULT_REDACT, REDACTED, redact_arguments
-
-
-def events(stream: io.StringIO) -> list[dict]:
-    # split("\n"), not splitlines(): U+2028 etc. must not create records.
-    return [json.loads(line) for line in stream.getvalue().split("\n") if line]
 
 
 class Creds(BaseModel):

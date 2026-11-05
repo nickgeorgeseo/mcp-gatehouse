@@ -253,7 +253,7 @@ async def test_a_late_approval_is_denied():
         late = await client.session.call_tool(
             "cancel_order", ARGUMENTS, input_responses=approval(question), request_state=question.request_state
         )
-    assert late.is_error and "not approved in time" in late.content[0].text
+    assert late.is_error and "not approved within 0.2s" in late.content[0].text
     assert ran == []
     assert outcomes(stream)[-1] == ("denied", "approval timed out")
 

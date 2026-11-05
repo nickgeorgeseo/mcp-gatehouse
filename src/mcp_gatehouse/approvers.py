@@ -28,6 +28,7 @@ from mcp.server.elicitation import render_elicitation_schema
 from mcp_types.version import is_version_at_least
 from pydantic import BaseModel, Field, ValidationError
 
+from .audit import Reason
 from .policy import ApprovalRequest, Approver
 
 # Approvers run in worker threads, so two gated calls can ask at once.
@@ -54,9 +55,8 @@ def terminal_approver(request: ApprovalRequest) -> bool:
     if not _tty_lock.acquire(timeout=-1 if left is None else left):
         return False  # another prompt held the terminal past our deadline
     try:
-        # Unbuffered, as getpass does it. Text-mode "r+" wraps the file in
-        # BufferedRandom, which insists on a seekable file; a terminal isn't
-        # one, so that open always raised.
+        # Unbuffered binary, as getpass does it: a buffered "r+" open wants a
+        # seekable file, and a terminal isn't one.
         with io.TextIOWrapper(open("/dev/tty", "r+b", buffering=0)) as tty:
             if not _in_line_mode(tty):
                 _report_denial(request, "the terminal is in use by a full-screen program")
@@ -76,7 +76,7 @@ def terminal_approver(request: ApprovalRequest) -> bool:
                     tty.flush()
                     return False
             # "y" or "yes", any case. Anything else, Enter included, is a no:
-            # the prompt says [y/N]. A "yes" used to be refused.
+            # the prompt says [y/N].
             return tty.readline().strip().lower() in ("y", "yes")
     except OSError:
         _report_denial(request, _no_terminal_reason())
@@ -281,18 +281,18 @@ class ElicitationApprover:
         if reply is None or asked != _digest(self._message(request)):
             return None
         if not time.time() < expires:
-            return False, "approval timed out"
+            return False, Reason.TIMED_OUT
         if not self._spend(nonce, expires):
-            return False, "approval already used"
+            return False, Reason.ALREADY_USED
         if not isinstance(reply, ElicitResult):
-            return False, "approver error: not an elicitation answer"
+            return False, Reason.approver_error("not an elicitation answer")
         if reply.action != "accept":
-            return False, "approver refused"
+            return False, Reason.REFUSED
         try:
             form = _ApprovalForm.model_validate(reply.content or {})
         except ValidationError:
-            return False, "approver error: invalid approval form"
-        return (True, "") if form.approve else (False, "approver refused")
+            return False, Reason.approver_error("invalid approval form")
+        return (True, "") if form.approve else (False, Reason.REFUSED)
 
     def _spend(self, nonce: str, expires: float) -> bool:
         """Mark one approval used. ``False`` if it already was."""

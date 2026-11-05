@@ -141,8 +141,7 @@ def open_audit_log(path: str | None = None) -> AuditLog:
 
 
 def main(argv: list[str] | None = None) -> None:
-    # Both entry points run this; name whichever was used (`uvx mcp-gatehouse`
-    # said "mcp-gatehouse-demo" in --version and --help).
+    # Both entry points run this: name whichever one was used.
     invoked = Path(sys.argv[0]).name
     parser = argparse.ArgumentParser(
         prog=invoked if invoked.startswith("mcp-gatehouse") else "mcp-gatehouse-demo",

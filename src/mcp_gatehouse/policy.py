@@ -8,12 +8,13 @@ reach the audit log.
 
 from __future__ import annotations
 
+import dataclasses
 import enum
 import functools
 import re
-from collections.abc import Awaitable, Callable, Collection
+from collections.abc import Awaitable, Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass, field
-from typing import Any, Union
+from typing import Any
 
 
 class AccessTier(enum.Enum):
@@ -32,9 +33,8 @@ class AccessTier(enum.Enum):
 def _as_tier(value: object) -> AccessTier:
     """An :class:`AccessTier` from the enum itself or its value (``"write"``).
 
-    Anything else is an error, raised where the tier is written down. A
-    tier the gate can't read must never be treated as some other tier: a
-    string that matched no member used to slip past the approval check.
+    Anything else is an error, raised where the tier is written down: a
+    tier the gate can't read must never be treated as some other tier.
     """
     if isinstance(value, AccessTier):
         return value
@@ -88,7 +88,7 @@ class ApprovalRequest:
     a poll — should give up by then: past it, its answer is ignored."""
 
 
-Approver = Callable[[ApprovalRequest], Union[bool, Awaitable[bool]]]
+Approver = Callable[[ApprovalRequest], bool | Awaitable[bool]]
 
 #: Argument keys that are masked in audit logs and approval requests by
 #: default. A key covers every spelling of itself (``api_key`` covers
@@ -125,6 +125,13 @@ def _words(key: str) -> tuple[str, ...]:
     for part in _SEPARATORS.split(key):
         words.extend(w.lower() for w in _CAMEL_BREAK.sub(" ", part).split())
     return tuple(words)
+
+
+# How much of the end of a long argument name is split into words (at
+# least; more if a key is long), and the longest name whose verdict is kept.
+_SCAN_LIMIT = 256
+# Distinct names whose verdict a matcher remembers.
+_SEEN_LIMIT = 4096
 
 
 @functools.lru_cache(maxsize=64)
@@ -171,12 +178,6 @@ def _secret_matcher(keys: frozenset[str]) -> Callable[[str], bool]:
     return is_secret
 
 
-# How much of the end of a long argument name is split into words (at
-# least; more if a key is long), and the longest name whose verdict is kept.
-_SCAN_LIMIT = 256
-# Distinct names whose verdict a matcher remembers.
-_SEEN_LIMIT = 4096
-
 
 @dataclass(frozen=True)
 class Policy:
@@ -217,8 +218,7 @@ class Policy:
 
     def __post_init__(self) -> None:
         # Normalised here, once, so every check downstream compares like with
-        # like. A tier written as "destructive" against a set of enum members
-        # matched nothing, and the gate waved the call through.
+        # like: "destructive" and AccessTier.DESTRUCTIVE are the same tier.
         tiers = frozenset(_as_tier(t) for t in _as_collection("require_approval", self.require_approval))
         object.__setattr__(self, "require_approval", tiers)
         for name in ("deny", "redact"):
@@ -258,9 +258,6 @@ def redact_arguments(arguments: dict[str, Any], keys: Collection[str]) -> dict[s
     repr can carry a secret, so unknown objects never pass through
     verbatim. The gate fails closed here too.
     """
-    import dataclasses as _dc
-    from collections.abc import Mapping, Sequence
-
     is_secret = _secret_matcher(frozenset(keys))
 
     def scrub(value: Any) -> Any:
@@ -268,7 +265,7 @@ def redact_arguments(arguments: dict[str, Any], keys: Collection[str]) -> dict[s
             return value
         if isinstance(value, (bytes, bytearray, memoryview)):
             # Before the Sequence check: bytearray and memoryview are
-            # sequences, and were logged as their contents, byte by byte.
+            # sequences, and would be logged byte by byte.
             return f"«opaque:{type(value).__name__}»"
         if isinstance(value, Mapping):
             return {
@@ -277,8 +274,8 @@ def redact_arguments(arguments: dict[str, Any], keys: Collection[str]) -> dict[s
             }
         if isinstance(value, (list, tuple, set, frozenset, Sequence)):
             return [scrub(v) for v in value]
-        if _dc.is_dataclass(value) and not isinstance(value, type):
-            return scrub(_dc.asdict(value))
+        if dataclasses.is_dataclass(value) and not isinstance(value, type):
+            return scrub(dataclasses.asdict(value))
         model_dump = getattr(value, "model_dump", None)  # pydantic v2
         if callable(model_dump):
             try:

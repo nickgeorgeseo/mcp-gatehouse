@@ -8,6 +8,7 @@ months later when someone asks "what did the AI actually do?"
 from __future__ import annotations
 
 import datetime as _dt
+import enum
 import io
 import json
 import os
@@ -16,14 +17,64 @@ from pathlib import Path
 from typing import Any, Protocol, TextIO, runtime_checkable
 
 
+class Outcome(str, enum.Enum):
+    """The ``outcome`` field of an audit line: what happened to the call.
+
+    A ``str`` enum, so ``event["outcome"] == Outcome.DENIED`` works on a
+    line read back from the file.
+    """
+
+    OK = "ok"
+    """It ran and returned."""
+
+    DENIED = "denied"
+    """The gate refused it; ``reason`` says why."""
+
+    ERROR = "error"
+    """It ran and raised; ``reason`` is the exception's type."""
+
+    PENDING = "pending"
+    """Approval was asked in the client; the verdict follows on a line of
+    its own when the client calls again."""
+
+    CANCELLED = "cancelled"
+    """The client gave up, or the server stopped, before it finished;
+    ``reason`` says at which step."""
+
+
+class Reason:
+    """The fixed values of an audit line's ``reason`` field.
+
+    An ``error`` line's reason is the exception's type name instead, and an
+    approver error carries a detail after the colon.
+    """
+
+    DENYLIST = "denylist"
+    NO_APPROVER = "approval required, no approver configured"
+    CLIENT_CANNOT_BE_ASKED = "approval required, client cannot be asked"
+    REFUSED = "approver refused"
+    TIMED_OUT = "approval timed out"
+    ALREADY_USED = "approval already used"
+    APPROVER_ERROR = "approver error"
+    ASKED_IN_CLIENT = "approval asked in client"
+    AWAITING_APPROVAL = "awaiting approval"
+    TOOL_RUNNING = "tool running"
+
+    @staticmethod
+    def approver_error(detail: str) -> str:
+        """``approver error: <detail>``, such as the exception's type."""
+        return f"{Reason.APPROVER_ERROR}: {detail}"
+
+
 @runtime_checkable
 class AuditSink(Protocol):
     """Anything the gate can hand its audit events to.
 
     One method: ``record(**event)``, called once per outcome with ``tool``,
-    ``tier``, ``outcome`` and the redacted ``arguments``, plus ``reason``
-    and ``duration_ms`` where they apply. Send them to a database, a SIEM
-    or your logging stack by writing a class with that method.
+    ``tier``, ``outcome`` (see :class:`Outcome`) and the redacted
+    ``arguments``, plus ``reason`` (see :class:`Reason`) and
+    ``duration_ms`` where they apply. Send them to a database, a SIEM or
+    your logging stack by writing a class with that method.
 
     A sink that raises doesn't change the call: the failure is logged (at
     ERROR, on the ``mcp_gatehouse`` logger) and the call's result stands.

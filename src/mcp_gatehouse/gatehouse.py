@@ -1,10 +1,16 @@
-"""The Gatehouse: policy enforcement + audit logging around MCPServer tools.
+"""The Gatehouse: policy enforcement and audit logging around MCPServer tools.
 
-Wrap an ``MCPServer``, register tools through the gatekeeper instead of
-directly, and every call gets: denylist enforcement, approval gates on the
-tiers you choose, redacted audit logging, and spec ``ToolAnnotations``
-(``readOnlyHint`` / ``destructiveHint``) derived from the tier — so MCP
-clients see honest hints without you hand-writing them.
+Register tools through a :class:`Gatehouse` instead of the ``MCPServer``.
+Each tool keeps its own name, docs and input schema, and gains:
+
+- honest spec hints (``readOnlyHint`` / ``destructiveHint``) from its tier;
+- the policy, checked on every call: the denylist first, then, for the
+  tiers that need it, approval from the policy's approver;
+- one audit line per outcome, with the arguments redacted first.
+
+Where to read: :class:`Gatehouse` is registration. :class:`_ToolGate` is
+everything that happens when the model calls a tool, in order, starting
+at :meth:`_ToolGate.__call__`. :class:`_Call` writes the audit lines.
 """
 
 from __future__ import annotations
@@ -15,8 +21,10 @@ import inspect
 import logging
 import os
 import time
+import typing
 import warnings
 from collections.abc import Callable, Mapping
+from dataclasses import dataclass
 from typing import Any, TypeVar, overload
 
 import anyio
@@ -26,80 +34,44 @@ from mcp.server.mcpserver.exceptions import ToolError
 from mcp.types import InputRequiredResult, ToolAnnotations
 
 from .approvers import ElicitationApprover
-from .audit import AuditLog, AuditSink, NullAuditLog
+from .audit import AuditLog, AuditSink, NullAuditLog, Outcome, Reason
 from .policy import AccessTier, ApprovalRequest, Policy, _as_tier, redact_arguments
 
 F = TypeVar("F", bound=Callable[..., Any])
 
 _log = logging.getLogger("mcp_gatehouse")
 
-# Tells "no tier given" apart from any tier, so the gate can say so.
-_NO_TIER: Any = object()
-
-# Worker threads for sync approvers, kept apart from anyio's default pool.
-# Sync tools draw on that pool; approvers wait on people. If they shared it,
-# a stack of pending sign-offs would leave no thread for a plain read.
+# Worker threads for sync approvers, apart from anyio's default pool. Sync
+# tools run in that pool, and approvers wait on people: sharing it, a stack
+# of pending sign-offs would leave no thread for a plain read.
 _APPROVER_THREADS = 40
 
-# The parameter the guard adds, out of the tool's schema, so MCPServer hands
-# it the call's Context when the tool takes none itself. Asking the client
-# for approval needs one. No leading underscore: MCPServer rejects those.
+# The parameter the gate adds, kept out of the tool's schema, so MCPServer
+# hands it the call's Context when the tool takes none itself. Asking the
+# client for approval needs one. No leading underscore: MCPServer refuses those.
 _CONTEXT_PARAM = "gatehouse_context"
+
+# A sleep or select can wake a hair before the instant it was given, so a
+# "no" this close to the deadline counts as the deadline.
+_DEADLINE_SLACK = 0.05
+
+# Tells "no tier given" apart from every real tier, so the gate can warn.
+_NO_TIER: Any = object()
 
 
 class GateDenied(PermissionError, ToolError):
-    """Raised when the policy blocks a call, so the model sees *why* it was
-    refused.
+    """Raised when the policy blocks a call; its message tells the model why.
 
-    Subclassing the SDK's ``ToolError`` is what makes that true. v2 sorts
-    tool exceptions into two buckets: a ``ToolError`` is an *anticipated*
-    failure, so its message reaches the model and the server logs it at
-    INFO; anything else is a crash, and the model gets only "Error
-    executing tool <name>" while the server logs a traceback at ERROR.
-
-    A denial is the most anticipated failure a gate has. Without this, a
-    policy working exactly as designed would withhold its reason from the
-    model and log an ERROR traceback on every refusal — noise that would
-    bury the real failures. ``PermissionError`` stays first in the bases so
-    existing ``except PermissionError`` handlers keep working.
+    It's a ``ToolError`` because the SDK treats those as anticipated
+    failures: the message reaches the model, and the server logs it at
+    INFO. Anything else counts as a crash: the model gets only "Error
+    executing tool <name>", and the server logs a traceback at ERROR, which
+    on every refusal would bury the real failures. ``PermissionError``
+    comes first, so ``except PermissionError`` catches it too.
     """
 
 
-def _annotations_for(
-    tier: AccessTier, title: str | None, given: ToolAnnotations | Mapping[str, Any] | None = None
-) -> ToolAnnotations:
-    """The tool's spec hints: ``readOnlyHint`` / ``destructiveHint`` from the
-    tier, anything else (``idempotentHint``, ``openWorldHint``) from ``given``.
-
-    The tier's two hints aren't up for negotiation. ``given`` may repeat
-    them, but one that contradicts the tier is refused: a client trusts
-    those hints, so they must say what the gate enforces.
-    """
-    derived = {"read_only_hint": tier is AccessTier.READ, "destructive_hint": tier is AccessTier.DESTRUCTIVE}
-    if given is None:
-        base = ToolAnnotations()
-    elif isinstance(given, ToolAnnotations):
-        base = given
-    elif isinstance(given, Mapping):
-        fields = ToolAnnotations.model_fields
-        known = set(fields) | {f.alias for f in fields.values() if f.alias}
-        unknown = sorted(set(map(str, given)) - known)
-        if unknown:
-            # Pydantic would drop these without a word; a misspelled hint
-            # should not quietly vanish.
-            raise ValueError(f"unknown tool annotation(s) {unknown}; known: {sorted(known)}")
-        base = ToolAnnotations.model_validate(dict(given))
-    else:
-        raise TypeError(f"annotations must be a ToolAnnotations or a mapping, not {type(given).__name__}")
-    for hint, value in derived.items():
-        claimed = getattr(base, hint)
-        if claimed is not None and claimed != value:
-            alias = ToolAnnotations.model_fields[hint].alias or hint
-            raise ValueError(
-                f"annotations {alias}={claimed} contradicts tier {tier.value!r}, which sets it to {value}; "
-                "change the tier instead"
-            )
-    return base.model_copy(update={**derived, "title": title if title is not None else base.title})
+# --- registration -----------------------------------------------------------
 
 
 class Gatehouse:
@@ -108,7 +80,7 @@ class Gatehouse:
     Usage::
 
         mcp = MCPServer("orders")
-        gk = Gatehouse(mcp, policy=Policy(...), audit=AuditLog(path="audit.jsonl"))
+        gk = Gatehouse(mcp, policy=Policy(...), audit="audit.jsonl")
 
         @gk.read
         def lookup_order(order_id: str) -> str: ...
@@ -191,14 +163,13 @@ class Gatehouse:
                     FutureWarning,
                     stacklevel=2,
                 )
-            guarded = self._guard(fn, tool_name, resolved)
             self.server.tool(
                 name=tool_name,
                 title=title,
                 description=description,
                 annotations=tool_annotations,
                 **tool_kwargs,
-            )(guarded)
+            )(self._guard(fn, tool_name, resolved))
             return fn
 
         return decorator
@@ -253,237 +224,299 @@ class Gatehouse:
         return decorator(fn)
 
     def _guard(self, fn: Callable[..., Any], tool_name: str, tier: AccessTier) -> Callable[..., Any]:
-        approver_limiter = self._approver_limiter
-        signature = inspect.signature(fn)
-        # A tool that resolves or returns its own InputRequiredResult owns the
-        # call's one multi-round channel, so the gate can't ask over it.
-        round_trip = not _runs_own_rounds(fn)
-
-        async def enforce(
-            policy: Policy, audit: AuditSink, safe_args: dict[str, Any], context: Context | None
-        ) -> InputRequiredResult | None:
-            """Raise GateDenied unless the policy allows this call.
-
-            Returns an ``InputRequiredResult`` instead when the approval is
-            being asked in the client and the call must wait for its answer.
-
-            Gets the redacted arguments only: the raw ones never reach the
-            log or the approver.
-            """
-
-            def denied(reason: str, message: str) -> GateDenied:
-                """Record the denial; return the error that tells the model why."""
-                _record(
-                    audit, tool=tool_name, tier=tier.value, outcome="denied",
-                    reason=reason, arguments=safe_args,
-                )
-                return GateDenied(message)
-
-            if tool_name in policy.deny:
-                raise denied("denylist", f"'{tool_name}' is blocked by policy.")
-
-            if not policy.needs_approval(tier):
-                return None
-
-            if policy.approver is None:
-                if not policy.fail_closed:
-                    return None
-                raise denied(
-                    "approval required, no approver configured",
-                    f"'{tool_name}' ({tier.value}) requires approval and "
-                    "no approver is configured. The gate fails closed.",
-                )
-
-            timeout = policy.approval_timeout
-            request = ApprovalRequest(
-                tool=tool_name,
-                tier=tier,
-                # Its own copy: nothing the approver does to these can change
-                # what the audit log records.
-                arguments=copy.deepcopy(safe_args),
-                deadline=None if timeout is None else time.monotonic() + timeout,
-            )
-            ask: Callable[[], Any] = functools.partial(policy.approver, request)
-            if isinstance(policy.approver, ElicitationApprover):
-                elicitor = policy.approver
-                transport = elicitor.transport(context, round_trip=round_trip)
-                if transport == "round-trip":
-                    verdict = elicitor.answer(request, context)
-                    if verdict is None:
-                        # The call ends here for now, and the client calls
-                        # again with the answer. If it never does, this line
-                        # is the record that it was asked.
-                        _record(
-                            audit, tool=tool_name, tier=tier.value, outcome="pending",
-                            reason="approval asked in client", arguments=safe_args,
-                        )
-                        return elicitor.question(request, timeout)
-                    allowed, reason = verdict
-                    if not allowed:
-                        raise denied(reason, _refusal(tool_name, reason))
-                    return None
-                if transport == "back-channel":
-                    ask = functools.partial(elicitor.ask, request, context)
-                elif elicitor.fallback is not None:
-                    ask = functools.partial(elicitor.fallback, request)
-                else:
-                    raise denied(
-                        "approval required, client cannot be asked",
-                        f"'{tool_name}' ({tier.value}) requires approval, and this "
-                        "client can't be asked for it (no form elicitation). "
-                        "The gate fails closed.",
-                    )
-            try:
-                # move_on_after, not fail_after: an approver that raises
-                # TimeoutError itself (a Slack call timing out) is an approver
-                # error, not the gate's deadline.
-                with anyio.move_on_after(timeout) as waiting:
-                    approved = await _call(
-                        ask, limiter=approver_limiter, abandon_on_cancel=True
-                    )
-            except Exception as exc:
-                # An approver that can't answer (Slack down, ticket API timing
-                # out) is a refusal, not a crash — and it belongs in the trail.
-                # Type only, as with tool errors.
-                raise denied(
-                    f"approver error: {type(exc).__name__}",
-                    f"'{tool_name}' could not be approved: the approver "
-                    "failed. The gate fails closed.",
-                ) from exc
-            except anyio.get_cancelled_exc_class():
-                # The client gave up, or the server is shutting down.
-                # Cancellation is a BaseException, so the clause above never
-                # sees it, and the gate's own timeout never gets this far:
-                # move_on_after catches that one. Log it, then let it carry
-                # on as is: swallowing it would keep a cancelled task running.
-                _record(
-                    audit, tool=tool_name, tier=tier.value, outcome="cancelled",
-                    reason="awaiting approval", arguments=safe_args,
-                )
-                raise
-            # An approver that honours request.deadline gives up as the gate's
-            # own timer fires, so either can finish first. A "no" at the
-            # deadline is the deadline, not a person refusing: without this,
-            # an unanswered terminal prompt was logged, and reported to the
-            # model, as refused whenever the approver won the race.
-            if waiting.cancelled_caught or (not approved and _past(request.deadline)):
-                raise denied(
-                    "approval timed out",
-                    f"'{tool_name}' was not approved within {timeout:g}s. "
-                    "The gate fails closed.",
-                )
-            if not approved:
-                raise denied("approver refused", _refusal(tool_name, "approver refused"))
-            return None
-
-        async def run(
-            arguments: dict[str, Any], args: tuple[Any, ...], kwargs: dict[str, Any], context: Context | None
-        ) -> Any:
-            # Read once per call, not at registration: replacing
-            # gatehouse.policy or gatehouse.audit takes effect on the next
-            # call, and one call never sees two policies.
-            policy, audit = self.policy, self.audit
-            safe_args = redact_arguments(arguments, policy.redact)
-            question = await enforce(policy, audit, safe_args, context)
-            if question is not None:
-                return question
-            start = time.perf_counter()
-            try:
-                result = await _call(functools.partial(fn, *args, **kwargs))
-            except Exception as exc:
-                # Only the exception TYPE goes in the log. Exception messages
-                # routinely embed argument values ("invalid api key: sk-…"),
-                # which would defeat redaction. The client gets what the SDK
-                # gives it either way: a ToolError's message, or for anything
-                # else just "Error executing tool <name>".
-                _record(
-                    audit, tool=tool_name, tier=tier.value, outcome="error",
-                    reason=type(exc).__name__, arguments=safe_args,
-                    duration_ms=round((time.perf_counter() - start) * 1000, 2),
-                )
-                raise
-            except anyio.get_cancelled_exc_class():
-                # Cancelled mid-run, as in enforce. The tool may have done
-                # part of its work, which is exactly what the trail is for.
-                _record(
-                    audit, tool=tool_name, tier=tier.value, outcome="cancelled",
-                    reason="tool running", arguments=safe_args,
-                    duration_ms=round((time.perf_counter() - start) * 1000, 2),
-                )
-                raise
-            _record(
-                audit, tool=tool_name, tier=tier.value, outcome="ok", arguments=safe_args,
-                duration_ms=round((time.perf_counter() - start) * 1000, 2),
-            )
-            return result
-
-        # MCPServer injects its Context object as a regular parameter. It is
-        # not a model-supplied argument, so it stays out of the audit trail
-        # and out of what the approver sees.
-        ctx_param = _find_context_parameter(fn)
-
-        # functools.wraps preserves the signature (via __wrapped__), so
-        # MCPServer still generates the tool's input schema from the real
-        # function — the guard is invisible to schema generation. The
-        # signature is computed once, above, not on every call.
-        @functools.wraps(fn)
-        async def guarded(*args: Any, **kwargs: Any) -> Any:
-            context = kwargs.pop(_CONTEXT_PARAM, None) if ctx_param is None else None
-            bound = signature.bind(*args, **kwargs)
-            bound.apply_defaults()
-            arguments = dict(bound.arguments)
-            if ctx_param is not None:
-                context = arguments.pop(ctx_param, None)
-            return await run(arguments, args, kwargs, context)
-
-        if ctx_param is None:
-            # The tool takes no Context, so the guard asks for one under a
-            # name of its own. __signature__ wins over __wrapped__, and its
-            # Context annotation keeps the parameter out of the schema.
-            if _CONTEXT_PARAM in signature.parameters:
-                raise ValueError(
-                    f"'{_CONTEXT_PARAM}' is a parameter name mcp-gatehouse reserves; "
-                    "rename the tool's parameter"
-                )
-            # Evaluated here, where fn's own globals resolve string annotations:
-            # MCPServer takes a __signature__ as it is and evaluates nothing.
-            try:
-                exposed = inspect.signature(fn, eval_str=True)
-            except Exception:
-                exposed = signature
-            params = list(exposed.parameters.values())
-            hidden = inspect.Parameter(
-                _CONTEXT_PARAM, inspect.Parameter.KEYWORD_ONLY, default=None, annotation=Context
-            )
-            at = len(params) - (bool(params) and params[-1].kind is inspect.Parameter.VAR_KEYWORD)
-            guarded.__signature__ = exposed.replace(  # type: ignore[attr-defined]  # read by inspect.signature
-                parameters=[*params[:at], hidden, *params[at:]]
-            )
-            # A copy: wraps() shares fn's own dict, which must stay untouched.
-            guarded.__annotations__ = {**getattr(fn, "__annotations__", {}), _CONTEXT_PARAM: Context}
-
-        return guarded
+        """The function MCPServer registers in ``fn``'s place."""
+        return _ToolGate(self, fn, tool_name, tier).entry_point()
 
 
-# A sleep or select can wake a hair before the instant it was given, so a
-# "no" this close to the deadline counts as the deadline.
-_DEADLINE_SLACK = 0.05
+def _annotations_for(
+    tier: AccessTier, title: str | None, given: ToolAnnotations | Mapping[str, Any] | None = None
+) -> ToolAnnotations:
+    """The tool's spec hints: ``readOnlyHint`` / ``destructiveHint`` from the
+    tier, anything else (``idempotentHint``, ``openWorldHint``) from ``given``.
 
-
-def _past(deadline: float | None) -> bool:
-    return deadline is not None and time.monotonic() >= deadline - _DEADLINE_SLACK
-
-
-def _record(audit: AuditSink, **event: Any) -> None:
-    """Hand one event to the sink. If the sink fails, say so loudly and
-    carry on: the record is lost either way, and the call's outcome must
-    not change with it.
-
-    That matters most after the tool ran. A sink that raised there (a full
-    disk, a database down) turned a call that had done its work into an
-    error, so the model was told it failed, and might well run it again: a
-    second refund. And a denial lost its reason and logged a crash.
+    The tier's two hints aren't up for negotiation. ``given`` may repeat
+    them, but one that contradicts the tier is refused: a client trusts
+    those hints, so they must say what the gate enforces.
     """
+    derived = {"read_only_hint": tier is AccessTier.READ, "destructive_hint": tier is AccessTier.DESTRUCTIVE}
+    if given is None:
+        base = ToolAnnotations()
+    elif isinstance(given, ToolAnnotations):
+        base = given
+    elif isinstance(given, Mapping):
+        fields = ToolAnnotations.model_fields
+        known = set(fields) | {f.alias for f in fields.values() if f.alias}
+        unknown = sorted(set(map(str, given)) - known)
+        if unknown:
+            # Pydantic would drop these without a word; a misspelled hint
+            # should not quietly vanish.
+            raise ValueError(f"unknown tool annotation(s) {unknown}; known: {sorted(known)}")
+        base = ToolAnnotations.model_validate(dict(given))
+    else:
+        raise TypeError(f"annotations must be a ToolAnnotations or a mapping, not {type(given).__name__}")
+    for hint, value in derived.items():
+        claimed = getattr(base, hint)
+        if claimed is not None and claimed != value:
+            alias = ToolAnnotations.model_fields[hint].alias or hint
+            raise ValueError(
+                f"annotations {alias}={claimed} contradicts tier {tier.value!r}, which sets it to {value}; "
+                "change the tier instead"
+            )
+    return base.model_copy(update={**derived, "title": title if title is not None else base.title})
+
+
+# --- enforcement: what happens on each call ----------------------------------
+
+
+class _ToolGate:
+    """Everything that happens when the model calls one gated tool.
+
+    Built once, at registration. What can be worked out from the function
+    alone (its signature, where its Context goes) is worked out here, not
+    on every call. MCPServer calls the function :meth:`entry_point` returns,
+    which hands each call to :meth:`__call__`.
+    """
+
+    def __init__(self, gatehouse: Gatehouse, fn: Callable[..., Any], name: str, tier: AccessTier) -> None:
+        self.gatehouse = gatehouse
+        self.fn = fn
+        self.name = name
+        self.tier = tier
+        self.signature = inspect.signature(fn)
+        # MCPServer injects its Context as an ordinary parameter. The model
+        # didn't send it, so it stays out of the log and away from approvers.
+        self.context_param = _find_context_parameter(fn)
+        if self.context_param is None and _CONTEXT_PARAM in self.signature.parameters:
+            raise ValueError(
+                f"'{_CONTEXT_PARAM}' is a parameter name mcp-gatehouse reserves; rename the tool's parameter"
+            )
+        # A tool that resolves its own parameters, or returns its own
+        # InputRequiredResult, owns the call's one multi-round channel, so
+        # the gate can't ask the client over it.
+        self.can_round_trip = not _runs_own_rounds(fn)
+
+    def entry_point(self) -> Callable[..., Any]:
+        """``fn`` as MCPServer should see it: same name, docs and schema.
+
+        ``functools.wraps`` keeps ``fn``'s signature (through
+        ``__wrapped__``), so MCPServer builds the input schema from ``fn``
+        itself. When ``fn`` takes no Context, the signature gains a hidden
+        one (see :func:`_add_hidden_context`).
+        """
+        gate = self
+
+        @functools.wraps(self.fn)
+        async def gated(*args: Any, **kwargs: Any) -> Any:
+            return await gate(args, kwargs)
+
+        if self.context_param is None:
+            _add_hidden_context(gated, self.fn, self.signature)
+        return gated
+
+    async def __call__(self, args: tuple[Any, ...], kwargs: dict[str, Any]) -> Any:
+        """One call: redact, check the policy, run. Every way out of here
+        writes its own audit line."""
+        context, arguments = self._take_context(args, kwargs)
+        # Read once per call: a policy or sink assigned to the Gatehouse
+        # applies from the next call, and one call never sees two.
+        policy, audit = self.gatehouse.policy, self.gatehouse.audit
+        call = _Call(
+            tool=self.name,
+            tier=self.tier,
+            # Only this redacted copy reaches the log or an approver.
+            arguments=redact_arguments(arguments, policy.redact),
+            audit=audit,
+            timeout=policy.approval_timeout,
+        )
+        question = await self._check(call, policy, context)
+        if question is not None:
+            return question  # the client answers it, then calls again
+        return await self._run(call, args, kwargs)
+
+    def _take_context(self, args: tuple[Any, ...], kwargs: dict[str, Any]) -> tuple[Context | None, dict[str, Any]]:
+        """Split the call's Context off the arguments the model sent.
+
+        The hidden parameter comes out of ``kwargs`` itself, so ``fn``
+        never receives it. A Context parameter ``fn`` declares stays in
+        ``kwargs``, for ``fn``.
+        """
+        context: Context | None = None
+        if self.context_param is None:
+            context = kwargs.pop(_CONTEXT_PARAM, None)
+        bound = self.signature.bind(*args, **kwargs)
+        bound.apply_defaults()
+        arguments = dict(bound.arguments)
+        if self.context_param is not None:
+            context = arguments.pop(self.context_param, None)
+        return context, arguments
+
+    async def _check(self, call: _Call, policy: Policy, context: Context | None) -> InputRequiredResult | None:
+        """Raise :class:`GateDenied` unless the policy lets this call run.
+
+        Returns a question for the client instead when the approval is
+        being asked in the client and the call has to wait for the answer.
+        """
+        if self.name in policy.deny:
+            raise call.deny(Reason.DENYLIST)
+        if not policy.needs_approval(self.tier):
+            return None
+        approver = policy.approver
+        if approver is None:
+            if policy.fail_closed:
+                raise call.deny(Reason.NO_APPROVER)
+            return None
+        request = ApprovalRequest(
+            tool=self.name,
+            tier=self.tier,
+            # Its own copy: nothing an approver does to it can change what
+            # the log records.
+            arguments=copy.deepcopy(call.arguments),
+            deadline=None if call.timeout is None else time.monotonic() + call.timeout,
+        )
+        if isinstance(approver, ElicitationApprover):
+            return await self._ask_in_client(call, approver, request, context)
+        await self._wait_for_approval(call, request, functools.partial(approver, request))
+        return None
+
+    async def _ask_in_client(
+        self, call: _Call, approver: ElicitationApprover, request: ApprovalRequest, context: Context | None
+    ) -> InputRequiredResult | None:
+        """Approval from the person at the client: MCP elicitation.
+
+        Up to protocol 2025-11-25 the form goes to the client mid-call, and
+        the gate waits for it like any approver. From 2026-07-28 the call
+        ends with the question, and the client's next call brings the
+        answer. A client that can't be asked leaves it to the fallback.
+        """
+        transport = approver.transport(context, round_trip=self.can_round_trip)
+        if transport == "round-trip":
+            answer = approver.answer(request, context)
+            if answer is None:
+                # The first round. If the client never comes back, this line
+                # is the record that it was asked.
+                call.record(Outcome.PENDING, Reason.ASKED_IN_CLIENT)
+                return approver.question(request, call.timeout)
+            allowed, reason = answer
+            if not allowed:
+                raise call.deny(reason)
+            return None
+        ask: Callable[[], Any]
+        if transport == "back-channel":
+            ask = functools.partial(approver.ask, request, context)
+        elif approver.fallback is not None:
+            ask = functools.partial(approver.fallback, request)
+        else:
+            raise call.deny(Reason.CLIENT_CANNOT_BE_ASKED)
+        await self._wait_for_approval(call, request, ask)
+        return None
+
+    async def _wait_for_approval(self, call: _Call, request: ApprovalRequest, ask: Callable[[], Any]) -> None:
+        """Run the approver under the policy's deadline. Return if it said
+        yes; otherwise raise :class:`GateDenied`, saying why."""
+        try:
+            # move_on_after, not fail_after: an approver that raises
+            # TimeoutError itself (a Slack call timing out) has failed, which
+            # isn't the same as the gate's deadline passing.
+            with anyio.move_on_after(call.timeout) as waiting:
+                approved = await _call(ask, limiter=self.gatehouse._approver_limiter, abandon_on_cancel=True)
+        except Exception as exc:
+            # An approver that can't answer (Slack down, a bug) is a refusal,
+            # not a crash. Type only, as with tool errors.
+            raise call.deny(Reason.approver_error(type(exc).__name__)) from exc
+        except anyio.get_cancelled_exc_class():
+            # The client gave up, or the server is stopping. (The gate's own
+            # deadline never gets here: move_on_after catches that.) Record
+            # it and let it carry on: swallowing it would keep a cancelled
+            # task running.
+            call.record(Outcome.CANCELLED, Reason.AWAITING_APPROVAL)
+            raise
+        # An approver that honours request.deadline gives up just as the
+        # gate's own timer fires, and either can finish first. A "no" at
+        # the deadline is the deadline, not a person refusing.
+        if waiting.cancelled_caught or (not approved and _past(request.deadline)):
+            raise call.deny(Reason.TIMED_OUT)
+        if not approved:
+            raise call.deny(Reason.REFUSED)
+
+    async def _run(self, call: _Call, args: tuple[Any, ...], kwargs: dict[str, Any]) -> Any:
+        """Run the tool and record how it went."""
+        start = time.perf_counter()
+
+        def took() -> float:
+            return round((time.perf_counter() - start) * 1000, 2)
+
+        try:
+            result = await _call(functools.partial(self.fn, *args, **kwargs))
+        except Exception as exc:
+            # Only the exception's type goes in the log: messages routinely
+            # embed argument values ("invalid api key: sk-…"), which would
+            # defeat redaction. The client gets what the SDK gives it either
+            # way: a ToolError's message, or else "Error executing tool <name>".
+            call.record(Outcome.ERROR, type(exc).__name__, duration_ms=took())
+            raise
+        except anyio.get_cancelled_exc_class():
+            # Cancelled mid-run. The tool may have done part of its work,
+            # which is exactly what the trail is for.
+            call.record(Outcome.CANCELLED, Reason.TOOL_RUNNING, duration_ms=took())
+            raise
+        call.record(Outcome.OK, duration_ms=took())
+        return result
+
+
+@dataclass
+class _Call:
+    """One call to a gated tool, as its audit lines describe it."""
+
+    tool: str
+    tier: AccessTier
+    arguments: dict[str, Any]
+    """The redacted arguments."""
+    audit: AuditSink
+    timeout: float | None
+    """The policy's ``approval_timeout`` when the call started."""
+
+    def record(self, outcome: Outcome, reason: str | None = None, **extra: Any) -> None:
+        """Write one audit line: tool, tier, outcome, reason, arguments, then ``extra``."""
+        event: dict[str, Any] = {"tool": self.tool, "tier": self.tier.value, "outcome": outcome.value}
+        if reason is not None:
+            event["reason"] = reason
+        event["arguments"] = self.arguments
+        event.update(extra)
+        _record(self.audit, event)
+
+    def deny(self, reason: str) -> GateDenied:
+        """Record a denial; return the error that tells the model why."""
+        self.record(Outcome.DENIED, reason)
+        return GateDenied(_denial_message(self, reason))
+
+
+def _denial_message(call: _Call, reason: str) -> str:
+    """What the model is told when the gate refuses a call."""
+    tool = f"'{call.tool}'"
+    if reason == Reason.DENYLIST:
+        return f"{tool} is blocked by policy."
+    if reason == Reason.NO_APPROVER:
+        return f"{tool} ({call.tier.value}) requires approval and no approver is configured. The gate fails closed."
+    if reason == Reason.CLIENT_CANNOT_BE_ASKED:
+        return (
+            f"{tool} ({call.tier.value}) requires approval, and this client can't be asked for it "
+            "(no form elicitation). The gate fails closed."
+        )
+    if reason == Reason.TIMED_OUT:
+        within = "in time" if call.timeout is None else f"within {call.timeout:g}s"
+        return f"{tool} was not approved {within}. The gate fails closed."
+    if reason == Reason.ALREADY_USED:
+        return f"{tool}: that approval was already used. Each approval runs one call."
+    if reason.startswith(Reason.APPROVER_ERROR):
+        return f"{tool} could not be approved: the approver failed. The gate fails closed."
+    return f"{tool} was refused by the approver."
+
+
+def _record(audit: AuditSink, event: dict[str, Any]) -> None:
+    """Hand one event to the sink. A sink that fails is logged, loudly, and
+    the call goes on: most lines are written after the tool ran, and turning
+    its result into an error would tell the model that a call which did its
+    work had failed, so it might well run it again."""
     try:
         audit.record(**event)
     except Exception:
@@ -493,15 +526,46 @@ def _record(audit: AuditSink, **event: Any) -> None:
         )
 
 
-def _refusal(tool_name: str, reason: str) -> str:
-    """What the model is told when an approval comes back no."""
-    if reason == "approval timed out":
-        return f"'{tool_name}' was not approved in time. The gate fails closed."
-    if reason == "approval already used":
-        return f"'{tool_name}': that approval was already used. Each approval runs one call."
-    if reason.startswith("approver error"):
-        return f"'{tool_name}' could not be approved: the approver failed. The gate fails closed."
-    return f"'{tool_name}' was refused by the approver."
+def _past(deadline: float | None) -> bool:
+    return deadline is not None and time.monotonic() >= deadline - _DEADLINE_SLACK
+
+
+# --- helpers ------------------------------------------------------------------
+
+
+async def _call(
+    fn: Callable[[], Any],
+    *,
+    limiter: anyio.CapacityLimiter | None = None,
+    abandon_on_cancel: bool = False,
+) -> Any:
+    """Await an async callable; run a sync one in a worker thread.
+
+    MCPServer runs sync tools in a thread itself, but all it sees is the
+    gate's async wrapper, so the offload has to happen here. Otherwise a
+    blocking tool, or an approver waiting on a person, would stall every
+    other request on the server.
+
+    ``fn`` takes no arguments (bind them with ``functools.partial``), so
+    these options can't collide with a tool's own parameter names.
+    ``limiter`` picks the thread pool (anyio's default when ``None``).
+    ``abandon_on_cancel`` lets a timeout stop waiting on a thread that is
+    still blocked; Python can't stop the thread, so it finishes in the
+    background and its result is dropped. A sync callable that returns an
+    awaitable (``lambda r: check(r)`` with ``check`` async) is awaited.
+    """
+    if _is_async_callable(fn):
+        return await fn()
+    result = await anyio.to_thread.run_sync(fn, limiter=limiter, abandon_on_cancel=abandon_on_cancel)
+    if inspect.isawaitable(result):
+        result = await result
+    return result
+
+
+def _is_async_callable(fn: Any) -> bool:
+    while isinstance(fn, functools.partial):
+        fn = fn.func
+    return inspect.iscoroutinefunction(fn) or inspect.iscoroutinefunction(getattr(fn, "__call__", None))
 
 
 def _runs_own_rounds(fn: Callable[..., Any]) -> bool:
@@ -514,54 +578,14 @@ def _runs_own_rounds(fn: Callable[..., Any]) -> bool:
         return True  # can't tell, so stay off the channel: the fallback decides
 
 
-async def _call(
-    fn: Callable[[], Any],
-    *,
-    limiter: anyio.CapacityLimiter | None = None,
-    abandon_on_cancel: bool = False,
-) -> Any:
-    """Await an async callable; run a sync one in a worker thread.
-
-    MCPServer offloads sync tools to a thread itself, but all it sees is the
-    guard, which is async — so the offload has to happen here. Otherwise a
-    blocking tool, or an approver waiting on a human, stalls every other
-    request on the server until it returns.
-
-    ``fn`` takes no arguments (bind them with ``functools.partial``), so
-    these options can't collide with a tool's own parameter names.
-    ``limiter`` picks the thread pool (anyio's default when ``None``).
-    ``abandon_on_cancel`` lets a timeout stop waiting on a thread that is
-    still blocked; Python can't stop the thread, so it finishes in the
-    background and its result is dropped.
-    """
-    if _is_async_callable(fn):
-        return await fn()
-    result = await anyio.to_thread.run_sync(
-        fn, limiter=limiter, abandon_on_cancel=abandon_on_cancel
-    )
-    if inspect.isawaitable(result):
-        result = await result
-    return result
-
-
-def _is_async_callable(fn: Any) -> bool:
-    while isinstance(fn, functools.partial):
-        fn = fn.func
-    return inspect.iscoroutinefunction(fn) or inspect.iscoroutinefunction(
-        getattr(fn, "__call__", None)
-    )
-
-
 def _find_context_parameter(fn: Callable[..., Any]) -> str | None:
     """Name of the parameter MCPServer will inject its ``Context`` into.
 
-    Asks the SDK itself, so the two can't disagree. They used to: the gate
-    missed ``ctx: Context | None = None``, which the SDK injects into, so
-    the gate added its own hidden parameter. The SDK, seeing ``ctx``
-    first, then treated that one as an ordinary argument: it showed up in
-    the tool's schema for the model to fill, ``ctx`` went into the audit
-    log, and approval in the client was always denied, because the gate
-    never got the Context.
+    Asks the SDK, so the gate and the SDK can't disagree. If they did, a
+    tool taking ``ctx: Context | None = None`` would get the gate's hidden
+    parameter too, the SDK would treat that one as an ordinary argument
+    (in the schema, for the model to fill), and approval in the client
+    would never see the Context it needs.
     """
     try:
         from mcp.server.mcpserver.utilities.context_injection import find_context_parameter
@@ -577,8 +601,6 @@ def _sdk_find_context_parameter(fn: Callable[..., Any]) -> str | None:
     """The SDK's rule (mcp 2.0-2.3): the first parameter whose resolved
     hint is a ``Context`` subclass, directly or inside a union such as
     ``Optional[Context]``. ``Annotated`` is unwrapped by get_type_hints."""
-    import typing
-
     try:
         hints = typing.get_type_hints(fn)
     except Exception:
@@ -588,3 +610,28 @@ def _sdk_find_context_parameter(fn: Callable[..., Any]) -> str | None:
         if any(inspect.isclass(c) and issubclass(c, Context) for c in candidates):
             return param_name
     return None
+
+
+def _add_hidden_context(gated: Callable[..., Any], fn: Callable[..., Any], signature: inspect.Signature) -> None:
+    """Give ``gated`` a keyword-only ``gatehouse_context`` parameter, which
+    MCPServer fills with the call's Context, without it entering the schema.
+
+    ``__signature__`` wins over ``__wrapped__``, and the parameter's
+    Context annotation is what keeps MCPServer from treating it as an
+    argument. String annotations are resolved here, in ``fn``'s own
+    globals: MCPServer takes a ``__signature__`` as it is.
+    """
+    try:
+        exposed = inspect.signature(fn, eval_str=True)
+    except Exception:
+        exposed = signature
+    params = list(exposed.parameters.values())
+    hidden = inspect.Parameter(_CONTEXT_PARAM, inspect.Parameter.KEYWORD_ONLY, default=None, annotation=Context)
+    # Before a **kwargs, which has to stay last.
+    at = len(params) - (bool(params) and params[-1].kind is inspect.Parameter.VAR_KEYWORD)
+    gated.__signature__ = exposed.replace(  # type: ignore[attr-defined]  # read by inspect.signature
+        parameters=[*params[:at], hidden, *params[at:]]
+    )
+    # wraps() handed gated fn's own annotations dict, which must stay
+    # untouched: give gated a copy with the hidden parameter added.
+    gated.__annotations__ = {**getattr(fn, "__annotations__", {}), _CONTEXT_PARAM: Context}

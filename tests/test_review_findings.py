@@ -111,7 +111,7 @@ async def test_exception_text_stays_out_of_the_audit_log():
 def test_unicode_line_separators_cannot_forge_records():
     log = io.StringIO()
     audit = AuditLog(stream=log)
-    evil = 'x {"ts":"0","tool":"forged","outcome":"ok"}'
+    evil = 'x\N{LINE SEPARATOR}{"ts":"0","tool":"forged","outcome":"ok"}'
     audit.record(tool="real", outcome="ok", arguments={"note": evil})
     raw = log.getvalue()
     assert raw.count("\n") == 1

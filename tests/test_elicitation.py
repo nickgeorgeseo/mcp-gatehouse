@@ -472,26 +472,31 @@ async def test_the_form_shows_invisible_characters_as_escapes(connect):
     them. Readable text, accents and all, stays as it is."""
     stream, ran, asked = io.StringIO(), [], []
     mcp = build(Policy(approver=ElicitationApprover()), stream, ran)
-    tricky = {"order_id": "4417‮0001", "api_key": "", "note": "café​"}
+    tricky = {"order_id": "4417\N{RIGHT-TO-LEFT OVERRIDE}0001", "api_key": "", "note": "café\N{ZERO WIDTH SPACE}"}
     async with Client(mcp, elicitation_callback=answering(*APPROVE, asked=asked), **connect) as client:
         mcp_tool = (await client.list_tools()).tools[0].name
         await client.call_tool(mcp_tool, {"order_id": tricky["order_id"]})
     (form,) = asked
-    assert "‮" not in form.message and "\\u202e" in form.message
+    assert "\N{RIGHT-TO-LEFT OVERRIDE}" not in form.message and "\\u202e" in form.message
     assert "4417" in form.message
 
 
 def test_the_default_message_keeps_readable_text_and_escapes_the_rest():
     from mcp_gatehouse.approvers import _default_message
 
-    request = ApprovalRequest(
-        tool="t", tier=AccessTier.WRITE, arguments={"note": "café ünïcode 中文 ​⁦x⁩   tab\there"}
+    note = (
+        "café ünïcode 中文 "
+        "\N{ZERO WIDTH SPACE}\N{LEFT-TO-RIGHT ISOLATE}x\N{POP DIRECTIONAL ISOLATE} \N{LINE SEPARATOR} tab\there"
     )
-    message = _default_message(request)
+    message = _default_message(ApprovalRequest(tool="t", tier=AccessTier.WRITE, arguments={"note": note}))
     assert "café ünïcode 中文" in message
-    for hidden in ("​", "⁦", "⁩", " ", "\t"):
+    hidden_characters = (
+        "\N{ZERO WIDTH SPACE}", "\N{LEFT-TO-RIGHT ISOLATE}", "\N{POP DIRECTIONAL ISOLATE}", "\N{LINE SEPARATOR}", "\t",
+    )
+    for hidden in hidden_characters:
         assert hidden not in message
-    assert "\\u200b" in message and "\\u2066" in message and "\\t" in message
+    for shown in ("\\u200b", "\\u2066", "\\u2069", "\\u2028", "\\t"):
+        assert shown in message
 
 
 # --- the approver's own machinery failing ---------------------------------------

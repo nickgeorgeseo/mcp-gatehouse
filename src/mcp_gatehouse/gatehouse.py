@@ -28,12 +28,11 @@ import dataclasses
 import functools
 import hashlib
 import inspect
-import sys
 import time
 import typing
 from collections.abc import Generator, Mapping
 from types import MappingProxyType
-from typing import Annotated, Any, Callable, TypeVar, get_args, get_origin
+from typing import Annotated, Any, Callable, Literal, TypeVar, get_args, get_origin
 
 import anyio
 import anyio.to_thread
@@ -82,6 +81,10 @@ _CONTEXT_PARAM = "gatehouse_context"
 # refuses everyone else.
 _REGISTERING: contextvars.ContextVar[Any] = contextvars.ContextVar("mcp_gatehouse_registering")
 
+# Set by the call_tool guard for the call it admitted, so the tool's guard
+# reads the same caller without resolving it a second time.
+_ADMITTED: contextvars.ContextVar[tuple[str, _Who | None]] = contextvars.ContextVar("mcp_gatehouse_admitted")
+
 _UNSET = object()
 
 
@@ -106,8 +109,8 @@ class GateDenied(PermissionError, ToolError):
 def _annotations_for(tier: AccessTier, title: str | None) -> ToolAnnotations:
     return ToolAnnotations(
         title=title,
-        readOnlyHint=tier is AccessTier.READ,
-        destructiveHint=tier is AccessTier.DESTRUCTIVE,
+        read_only_hint=tier is AccessTier.READ,
+        destructive_hint=tier is AccessTier.DESTRUCTIVE,
     )
 
 
@@ -179,7 +182,7 @@ class _Who:
 class _CallState:
     """What one call has got to, for the audit lines it writes."""
 
-    stage: str = "authorizing"
+    stage: Literal["authorizing", "tool running", "filtering", "committing"] = "authorizing"
     authz: str | None = None
     start: float | None = None
     duration_ms: float | None = None
@@ -300,7 +303,7 @@ class Gatehouse:
                 + ", ".join(existing)
                 + ". Create the Gatehouse first and register every tool through it."
             )
-        self._manager = manager
+        self._manager: Any = manager
         server._mcp_gatehouse = self  # type: ignore[attr-defined]
         gate = self
 
@@ -325,8 +328,12 @@ class Gatehouse:
 
         @functools.wraps(server_call)
         async def call_tool(name: str, arguments: dict[str, Any], context: Any = None, *args: Any, **kwargs: Any) -> Any:
-            gate._admit(name, arguments, context)
-            return await server_call(name, arguments, context, *args, **kwargs)
+            who = gate._admit(name, arguments, context)
+            admitted = _ADMITTED.set((name, who))
+            try:
+                return await server_call(name, arguments, context, *args, **kwargs)
+            finally:
+                _ADMITTED.reset(admitted)
 
         @functools.wraps(manager_call)
         async def manager_call_tool(name: str, arguments: dict[str, Any], *args: Any, **kwargs: Any) -> Any:
@@ -347,7 +354,8 @@ class Gatehouse:
         ``None`` if there's no such tool; ``False`` otherwise, including when
         the gate can't tell."""
         try:
-            if getattr(self.server, "_tool_manager", None) is not self._manager:
+            registry: Any = getattr(self.server, "_tool_manager", None)
+            if registry is not self._manager:
                 return False  # the registry was swapped out from under the gate
             tool = self._manager.get_tool(name)
             if tool is None:
@@ -357,15 +365,16 @@ class Gatehouse:
         except Exception:
             return False
 
-    def _admit(self, name: str, arguments: Any, context: Any, *, check_caller: bool = True) -> None:
+    def _admit(self, name: str, arguments: Any, context: Any, *, check_caller: bool = True) -> _Who | None:
         """Refuse a call before the SDK touches it: a tool the gate didn't
         register, or (when ``check_caller``) a request with no verified caller.
 
-        The guard checks the caller again; this is the earlier of the two.
+        Returns the caller it resolved, so the guard needn't resolve it again;
+        the guard still denies a call that reaches it with none.
         """
         gated = self._gated(name)
         if gated is None:
-            return  # no such tool: the SDK says so
+            return None  # no such tool: the SDK says so
 
         def safe() -> dict[str, Any]:
             return redact_arguments(arguments if isinstance(arguments, Mapping) else {}, self.policy.redact)
@@ -373,12 +382,16 @@ class Gatehouse:
         if gated is False:
             self.audit.record(tool=name, tier=None, outcome="denied", reason="ungated tool", arguments=safe())
             raise GateDenied(f"'{name}' was not registered through the gate, so it can't run.")
-        if check_caller and self._resolve(context) is None:
+        if not check_caller:
+            return None
+        who = self._resolve(context)
+        if who is None:
             self.audit.record(
                 tool=name, tier=self._registry[name].tier.value, outcome="denied",
                 reason="no verified caller", arguments=safe(),
             )
             raise GateDenied(_no_caller(name))
+        return who
 
     # --- identity ------------------------------------------------------------
 
@@ -464,11 +477,12 @@ class Gatehouse:
             # The scope the tool is defined in, so a string annotation naming
             # a local (a Load(...) bound to a database handle, a model class
             # defined in a function) still evaluates.
-            frame = sys._getframe(1)
+            frame = inspect.currentframe()
+            scope = frame.f_back if frame is not None else None
             try:
-                defined_in = dict(frame.f_locals)
+                defined_in = dict(scope.f_locals) if scope is not None else {}
             finally:
-                del frame
+                del frame, scope
             spec = _build_spec(
                 fn, tool_name, tier, authorize, authorize_items,
                 consistency if consistency is not None else self.consistency,
@@ -545,8 +559,11 @@ class Gatehouse:
 
         async def run(arguments: dict[str, Any], args: tuple, kwargs: dict[str, Any], context: Any) -> Any:
             safe_args = redact_arguments(arguments, policy.redact)
-            # Read once, so every line this call writes names the same caller.
-            who = gate._resolve(context)
+            # Read once, so every line this call writes names the same caller:
+            # what the call_tool guard resolved when it admitted this call,
+            # else (a call that came in another way) resolved here.
+            admitted = _ADMITTED.get(None)
+            who = admitted[1] if admitted is not None and admitted[0] == spec.name else gate._resolve(context)
             state = _CallState()
             fixed: dict[str, Any] = {}
             if spec.loads:
@@ -902,7 +919,7 @@ class Gatehouse:
             return approver.question(request, timeout)
         if need.via == "back-channel":
             assert isinstance(approver, ElicitationApprover)
-            ask = functools.partial(approver.ask, request, call.context)
+            ask: Callable[[], Any] = functools.partial(approver.ask, request, call.context)
         elif need.via == "fallback":
             assert isinstance(approver, ElicitationApprover) and approver.fallback is not None
             ask = functools.partial(approver.fallback, request)

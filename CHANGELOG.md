@@ -1,7 +1,9 @@
 # Changelog
 
 All notable changes to `mcp-gatehouse`. The public API (`Gatehouse`,
-`Policy`, `AuditLog`, `AccessTier`) stays compatible within a minor line.
+`Policy`, `AuditLog`, `AccessTier`) stays compatible within a minor line,
+with one deliberate exception: the authorization invariant below is
+breaking, and its release notes say how to migrate.
 
 ## Unreleased
 

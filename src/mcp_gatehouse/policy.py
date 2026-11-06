@@ -9,7 +9,7 @@ reach the audit log.
 from __future__ import annotations
 
 import enum
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
 from typing import Any, Union
 
@@ -29,11 +29,14 @@ class AccessTier(enum.Enum):
 
 @dataclass(frozen=True)
 class Caller:
-    """Who a call was made for: the identity in the request's access token.
+    """Who a call was made for.
 
-    Taken from the token the MCP SDK verified for this request, so it is
-    only present on transports with authentication (streamable HTTP or SSE
-    with a ``token_verifier``). Over stdio there is no token and no caller.
+    Over streamable HTTP or SSE with a ``token_verifier``, it is the identity
+    in the access token the MCP SDK verified for this request. Over stdio
+    nobody signs in, so it is the ``local_caller`` the server declared to
+    its :class:`~mcp_gatehouse.Gatehouse`; a server that declares none
+    denies every call. An HTTP request without a verified token is nobody,
+    never the local caller.
 
     It is only as specific as your token verifier makes it. ``subject`` is
     the user the token speaks for; a verifier that doesn't fill in
@@ -156,7 +159,7 @@ class Policy:
 REDACTED = "«redacted»"
 
 
-def redact_arguments(arguments: dict[str, Any], keys: frozenset[str]) -> dict[str, Any]:
+def redact_arguments(arguments: Mapping[str, Any], keys: frozenset[str]) -> dict[str, Any]:
     """Return a deep copy of ``arguments`` with sensitive values masked.
 
     Matching is by whole key name at any nesting depth, ignoring case,
@@ -170,7 +173,7 @@ def redact_arguments(arguments: dict[str, Any], keys: frozenset[str]) -> dict[st
     """
     import dataclasses as _dc
     import datetime as _dt
-    from collections.abc import Mapping, Sequence
+    from collections.abc import Sequence
     from decimal import Decimal
 
     lowered = {_normalize_key(k) for k in keys}

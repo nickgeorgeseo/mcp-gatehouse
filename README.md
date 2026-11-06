@@ -61,10 +61,18 @@ refused and one approved, and the audit log they left. No sound.
 from typing import Annotated
 
 from mcp.server.mcpserver import MCPServer
+from pydantic import BaseModel
+
 from mcp_gatehouse import (
-    AccessTier, Allow, AuditLog, Caller, ConditionalWrite, Deny, ElicitationApprover,
-    Gatehouse, Load, Policy, any_caller, terminal_approver,
+    AccessTier, Allow, AuditLog, AuthorizationRequest, Caller, ConditionalWrite, Deny,
+    ElicitationApprover, Gatehouse, Load, Policy, any_caller, terminal_approver,
 )
+
+class Order(BaseModel):
+    """Your record. Any Pydantic model, dataclass or mapping will do."""
+    id: str
+    owner: str
+    status: str
 
 mcp = MCPServer("order-desk")
 gatehouse = Gatehouse(
@@ -80,7 +88,7 @@ def load_order(order_id: str) -> Order | None:
     """Your system of record. None means there's no such order."""
     ...
 
-def owner_only(request) -> Allow | Deny:
+def owner_only(request: AuthorizationRequest) -> Allow | Deny:
     order = request.resources["order"]
     return Allow() if order.owner == request.caller.subject else Deny("not the owner")
 

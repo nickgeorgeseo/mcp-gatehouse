@@ -49,6 +49,9 @@ Repository = "https://github.com/nickgeorgeseo/mcp-gatehouse"
 dev = [
     "pytest>=8",
     "anyio>=4",
+    # Imported by the tests' HTTP fixtures (tests/_support.py).
+    "uvicorn",
+    "httpx2",
     "build",
     # <7 monkeypatches packaging to cap Metadata-Version at 2.4, which
     # rejects the 2.5 metadata hatchling emits.

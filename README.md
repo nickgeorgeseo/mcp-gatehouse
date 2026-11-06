@@ -319,7 +319,26 @@ box, a malformed answer) is a refusal. When the client can't be asked, the
 `fallback` decides; with no fallback, the call is denied. A tool that runs
 its own multi-round input flow, through `Resolve(...)` parameters or by
 returning `InputRequiredResult`, gets the fallback too, since one call has
-one such channel. Single-use is tracked per process.
+one such channel.
+
+Used approvals are remembered in an `ApprovalStore`, so each runs its call
+once. The default, `MemoryApprovalStore`, remembers per process. That is
+enough while the SDK's request-state key is per process too, which it is
+by default: an approval minted before a restart, or by another replica,
+fails the SDK's seal check before the gate sees it. Share that key
+(`MCPServer(..., request_state_security=RequestStateSecurity(keys=[...]))`)
+so approvals survive a restart or work across replicas, and the store
+must be shared too, or one approval runs its call once per replica and
+once more after each restart within `approval_timeout`. A store is
+anything with `spend(nonce, expires) -> bool`:
+[`examples/approval_store_sqlite.py`](examples/approval_store_sqlite.py)
+is one on SQLite, standard library only, with the single-use guarantee
+tested across two processes. A store that raises denies the call, logged
+as `approval store error`.
+
+```python
+ElicitationApprover(store=SqliteApprovalStore("/var/lib/order-desk/approvals.db"))
+```
 
 Elicitation trusts the client to show the form to a person. A client or
 hook set to accept forms on its own can approve too. When the approval

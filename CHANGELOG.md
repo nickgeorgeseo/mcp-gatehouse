@@ -61,6 +61,14 @@ migrate a server:
   in `docs/audit-line.schema.json`, a JSON Schema the test suite checks
   every audit line against. `examples/audit_otel.py` forwards records to
   OpenTelemetry logs.
+- `ApprovalStore`: where the round-trip approver remembers used
+  approvals, as `spend(nonce, expires) -> bool`. `MemoryApprovalStore` is
+  the default and remembers per process; `ElicitationApprover(store=...)`
+  takes another. `examples/approval_store_sqlite.py` is one on SQLite,
+  standard library only, for servers that share the SDK's request-state
+  key across replicas or restarts; its single-use guarantee is tested
+  across two processes. A store that raises denies the call, logged as
+  `approval store error: <ExceptionType>`.
 - Who each call was for. On servers that sign callers in with the MCP
   SDK's auth (a `token_verifier`, over streamable HTTP or SSE), every
   audit line has a `caller` field: the verified token's `client_id`,

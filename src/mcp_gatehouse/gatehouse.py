@@ -1404,6 +1404,8 @@ def _refusal(tool_name: str, reason: str) -> str:
         return f"'{tool_name}' was not approved in time. The gate fails closed."
     if reason == "approval already used":
         return f"'{tool_name}': that approval was already used. Each approval runs one call."
+    if reason.startswith("approval store error"):
+        return f"'{tool_name}' could not be approved: the approval store failed. The gate fails closed."
     if reason.startswith("approver error"):
         return f"'{tool_name}' could not be approved: the approver failed. The gate fails closed."
     return f"'{tool_name}' was refused by the approver."

@@ -16,7 +16,7 @@ import sys
 import threading
 import time
 from collections.abc import Awaitable, Callable
-from typing import Any, Literal, TextIO
+from typing import Any, Literal, Protocol, TextIO, runtime_checkable
 
 from mcp.types import (
     ElicitRequest,
@@ -188,6 +188,49 @@ _MAX_APPROVAL_AGE = 3600.0
 Transport = Literal["back-channel", "round-trip"]
 
 
+@runtime_checkable
+class ApprovalStore(Protocol):
+    """Where used approvals are remembered, so each one runs its call once.
+
+    ``spend(nonce, expires)`` marks the approval ``nonce`` used and returns
+    ``True``, or returns ``False`` if it already was. ``expires`` is the
+    ``time.time()`` after which the nonce can be forgotten: past it, the
+    gate refuses the approval before asking the store. A store that raises
+    denies the call, logged as ``approval store error: <ExceptionType>``.
+
+    :class:`MemoryApprovalStore` is the default and remembers per process.
+    That is enough while the server's request-state key is per process
+    too, which is the MCP SDK's default: an approval minted before a
+    restart or by another replica fails the SDK's own check first. A
+    server that shares that key (``MCPServer(request_state_security=
+    RequestStateSecurity(keys=[...]))``) so approvals survive a restart
+    or work across replicas needs a store they all share, such as the
+    SQLite one in ``examples/approval_store_sqlite.py``.
+    """
+
+    def spend(self, nonce: str, expires: float) -> bool: ...
+
+
+class MemoryApprovalStore:
+    """Used approvals, remembered in this process. The default."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._used: dict[str, float] = {}  # nonce → when its approval expires
+
+    def spend(self, nonce: str, expires: float) -> bool:
+        now = time.time()
+        with self._lock:
+            # Past its expiry a nonce is refused before it gets here, so the
+            # record of it can go.
+            for old in [n for n, exp in self._used.items() if exp <= now]:
+                del self._used[old]
+            if nonce in self._used:
+                return False
+            self._used[nonce] = expires
+            return True
+
+
 class _ApprovalForm(BaseModel):
     """The form the client shows. One required box, nothing pre-ticked, so
     a client that accepts forms unseen still can't approve by accident."""
@@ -231,8 +274,9 @@ class ElicitationApprover:
     round is checked before anything runs: the SDK seals the gate's state
     and binds it to the tool and its exact arguments, the answer must be
     to the question asked, within ``approval_timeout`` (an hour when none
-    is set), and each approval runs its call once. Single use is tracked
-    per process.
+    is set), and each approval runs its call once. Used approvals are
+    remembered in ``store``, per process by default; see
+    :class:`ApprovalStore` for when replicas need to share one.
 
     When the client can't be asked (it declares no form elicitation, or
     the tool runs its own multi-round flow), ``fallback`` decides. With no
@@ -249,12 +293,15 @@ class ElicitationApprover:
         fallback: Approver | None = None,
         *,
         message: Callable[[ApprovalRequest], str] | None = None,
+        store: ApprovalStore | None = None,
     ) -> None:
         self.fallback = fallback
         """Decides when the client can't be asked; ``None`` denies."""
         self._message = message or _default_message
-        self._used_lock = threading.Lock()
-        self._used: dict[str, float] = {}  # nonce → when its approval expires
+        if store is not None and not callable(getattr(store, "spend", None)):
+            raise TypeError("store must have a spend(nonce, expires) method")
+        self.store: ApprovalStore = store if store is not None else MemoryApprovalStore()
+        """Where used approvals are remembered."""
 
     def __call__(self, request: ApprovalRequest) -> bool | Awaitable[bool]:
         """Decide with no client to ask: the fallback's answer, or a refusal.
@@ -331,7 +378,14 @@ class ElicitationApprover:
             return None
         if not time.time() < expires:
             return False, "approval timed out"
-        if not self._spend(nonce, expires):
+        try:
+            spent = self.store.spend(nonce, expires)
+        except Exception as exc:
+            # The store is the single-use guarantee. Without its answer the
+            # gate can't tell a first use from a replay, so it refuses. Type
+            # only, as with every other error in the trail.
+            return False, f"approval store error: {type(exc).__name__}"
+        if spent is not True:
             return False, "approval already used"
         if not isinstance(reply, ElicitResult):
             return False, "approver error: not an elicitation answer"
@@ -342,19 +396,6 @@ class ElicitationApprover:
         except ValidationError:
             return False, "approver error: invalid approval form"
         return (True, "") if form.approve else (False, "approver refused")
-
-    def _spend(self, nonce: str, expires: float) -> bool:
-        """Mark one approval used. ``False`` if it already was."""
-        now = time.time()
-        with self._used_lock:
-            # Past its expiry a nonce is refused before it gets here, so the
-            # record of it can go.
-            for old in [n for n, exp in self._used.items() if exp <= now]:
-                del self._used[old]
-            if nonce in self._used:
-                return False
-            self._used[nonce] = expires
-            return True
 
 
 def _digest(message: str, binding: str | None) -> str:

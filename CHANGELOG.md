@@ -69,6 +69,13 @@ migrate a server:
   key across replicas or restarts; its single-use guarantee is tested
   across two processes. A store that raises denies the call, logged as
   `approval store error: <ExceptionType>`.
+- External policy engines as the policy behind the gate:
+  `examples/policy_opa.py` and `examples/policy_cerbos.py`. Each sends
+  the caller, the tool, the action and the loaded record's attributes to
+  the engine over HTTP, standard library only, and maps the answer to
+  `Allow`, `Deny` or `Ask`. An engine that can't be reached is
+  `Deny("policy engine unavailable")`. Each file carries the engine-side
+  policy for the order-desk demo. The library imports neither.
 - Who each call was for. On servers that sign callers in with the MCP
   SDK's auth (a `token_verifier`, over streamable HTTP or SSE), every
   audit line has a `caller` field: the verified token's `client_id`,

@@ -1,7 +1,7 @@
 """The caller: who a call is for, from the request's verified access token.
 
 Most tests sign in by setting the SDK's auth context directly, as its auth
-middleware does for each HTTP request. The last one runs a real
+middleware does for each HTTP request. The last ones run a real
 streamable-HTTP server with a token verifier, so the whole path is covered:
 bearer header, verification, the tool call, the audit line.
 """
@@ -9,15 +9,18 @@ bearer header, verification, the tool call, the audit line.
 from __future__ import annotations
 
 import contextlib
+import functools
 import io
 import json
 import socket
+from collections.abc import AsyncIterator, Callable
+from typing import Any
 
 import anyio
 import httpx2
 import pytest
 import uvicorn
-from mcp import Client
+from mcp import Client, MCPError
 from mcp.client.session import ClientSession
 from mcp.client.streamable_http import streamable_http_client
 from mcp.server.auth.middleware.auth_context import auth_context_var
@@ -25,8 +28,11 @@ from mcp.server.auth.middleware.bearer_auth import AuthenticatedUser
 from mcp.server.auth.provider import AccessToken
 from mcp.server.auth.settings import AuthSettings
 from mcp.server.mcpserver import MCPServer
+from mcp.types import ElicitResult, InputRequiredResult
 
-from mcp_gatehouse import AccessTier, ApprovalRequest, AuditLog, Caller, Gatehouse, Policy
+from mcp_gatehouse import (
+    AccessTier, ApprovalRequest, AuditLog, Caller, ElicitationApprover, Gatehouse, Policy,
+)
 from mcp_gatehouse.approvers import _for_whom
 
 ISSUER = "https://idp.example"
@@ -89,6 +95,13 @@ def alice_only(seen: list[Caller | None]):
     return approver
 
 
+async def approve_in_client(context: Any, params: Any) -> ElicitResult:
+    return ElicitResult(action="accept", content={"approve": True})
+
+
+ALICE = {"client_id": "support-agent", "subject": "alice", "issuer": ISSUER, "scopes": ["orders:read"]}
+
+
 @pytest.mark.anyio
 async def test_no_caller_without_authentication():
     log, seen = io.StringIO(), []
@@ -115,10 +128,7 @@ async def test_caller_is_on_every_line_and_in_the_approval_request():
     assert seen == [alice]
     lines = events(log)
     assert [e["outcome"] for e in lines] == ["ok", "ok", "error"]
-    for line in lines:
-        assert line["caller"] == {
-            "client_id": "support-agent", "subject": "alice", "issuer": ISSUER, "scopes": ["orders:read"],
-        }
+    assert all(line["caller"] == ALICE for line in lines)
     # Who, never the credential.
     assert "secret-token" not in log.getvalue()
 
@@ -140,6 +150,56 @@ async def test_denials_name_the_caller_too():
 
 
 @pytest.mark.anyio
+async def test_an_approval_asked_in_the_client_names_the_caller_both_times():
+    """The 2026-07-28 round trip writes two lines: `pending`, then the verdict."""
+    log = io.StringIO()
+    server = build(Policy(approver=ElicitationApprover()), log)
+    with signed_in(token("alice")):
+        async with Client(server, elicitation_callback=approve_in_client) as session:
+            result = await session.call_tool("cancel", {"order_id": "4417"})
+    assert not result.is_error
+    lines = events(log)
+    assert [line["outcome"] for line in lines] == ["pending", "ok"]
+    assert all(line["caller"] == ALICE for line in lines)
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("phase", ["awaiting approval", "tool running"])
+async def test_cancelled_calls_name_the_caller(phase):
+    started = anyio.Event()
+
+    async def slow_human(request: ApprovalRequest) -> bool:
+        started.set()
+        await anyio.sleep_forever()
+
+    async def instant_yes(request: ApprovalRequest) -> bool:
+        return True
+
+    log = io.StringIO()
+    mcp = MCPServer("cancel-test")
+    approver = slow_human if phase == "awaiting approval" else instant_yes
+    gk = Gatehouse(mcp, policy=Policy(approver=approver), audit=AuditLog(stream=log))
+
+    @gk.tool(tier=AccessTier.DESTRUCTIVE)
+    async def cancel(order_id: str) -> str:
+        """Cancel an order, slowly."""
+        started.set()
+        await anyio.sleep_forever()
+
+    with signed_in(token("alice")):
+        async with Client(mcp) as client:
+            async with anyio.create_task_group() as tg:
+                tg.start_soon(client.call_tool, "cancel", {"order_id": "4417"})
+                with anyio.fail_after(5):
+                    await started.wait()
+                tg.cancel_scope.cancel()
+
+    (line,) = events(log)
+    assert (line["outcome"], line["reason"]) == ("cancelled", phase)
+    assert line["caller"] == ALICE
+
+
+@pytest.mark.anyio
 async def test_a_token_without_a_subject_names_only_the_client():
     log = io.StringIO()
     server = build(Policy(), log)
@@ -157,26 +217,82 @@ def test_approval_requests_built_without_a_caller_still_work():
     assert request.caller is None
 
 
+# --- the line terminal_approver adds to its prompt -----------------------------
+
+
 def test_terminal_prompt_says_who_the_call_is_for():
     assert _for_whom(None) == ""
     alice = Caller(client_id="support-agent", subject="alice")
-    assert _for_whom(alice) == "\n  for 'alice' via client 'support-agent'"
+    assert _for_whom(alice) == '\n  for "alice" via client "support-agent"'
     nameless = Caller(client_id="support-agent")
     assert "a user the token doesn't name" in _for_whom(nameless)
 
 
 def test_terminal_prompt_escapes_control_characters_in_names():
     # A subject that tries to clear the line and redraw the prompt.
-    sneaky = Caller(client_id="app\x1b[2K", subject="mallory\r\x1b[1A‮")
+    sneaky = Caller(client_id="app\x1b[2K\x7f", subject="mallory\r\x1b[1A‮\x9b")
     line = _for_whom(sneaky)
-    assert "\x1b" not in line and "\r" not in line and "‮" not in line
-    assert "\\x1b" in line
+    for raw in ("\x1b", "\r", "‮", "\x9b", "\x7f"):
+        assert raw not in line
+    assert "\\u001b" in line and "\\u007f" in line
 
 
-def _free_port() -> int:
-    with socket.socket() as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
+def test_a_quote_in_a_name_cant_fake_the_rest_of_the_line():
+    forged = Caller(client_id="evil", subject='alice" via client "support-agent')
+    line = _for_whom(forged)
+    # The whole name stays inside one pair of quotes, and the real client follows.
+    assert line == '\n  for "alice\\" via client \\"support-agent" via client "evil"'
+
+
+def test_look_alike_and_blank_characters_show_as_escapes():
+    # Cyrillic "а" for Latin "a", and a Hangul filler that renders blank.
+    line = _for_whom(Caller(client_id="support-agent", subject="аliceㅤ"))
+    assert line.startswith('\n  for "\\u0430lice\\u3164"')
+
+
+def test_long_names_are_cut():
+    line = _for_whom(Caller(client_id="support-agent", subject="a" * 500))
+    assert len(line) < 150 and '"…' in line
+
+
+# --- over real HTTP ------------------------------------------------------------
+
+
+@contextlib.asynccontextmanager
+async def http_server(make_app: Callable[[str], Any]) -> AsyncIterator[str]:
+    """Serve `make_app(url)` on a port the OS picks. The socket is bound
+    before the server starts and handed to it, so nothing can take the port
+    in between."""
+    sock = socket.socket()
+    sock.bind(("127.0.0.1", 0))
+    url = f"http://127.0.0.1:{sock.getsockname()[1]}/mcp"
+    server = uvicorn.Server(uvicorn.Config(make_app(url), log_level="warning"))
+    try:
+        with anyio.fail_after(30):
+            async with anyio.create_task_group() as tg:
+                tg.start_soon(functools.partial(server.serve, sockets=[sock]))
+                while not server.started:
+                    await anyio.sleep(0.02)
+                try:
+                    yield url
+                finally:
+                    server.should_exit = True
+    finally:
+        sock.close()
+
+
+def signed_in_server(url: str, tokens: dict[str, AccessToken], name: str) -> MCPServer:
+    class Verifier:
+        async def verify_token(self, presented: str) -> AccessToken | None:
+            return tokens.get(presented)
+
+    return MCPServer(
+        name, token_verifier=Verifier(), auth=AuthSettings(issuer_url=ISSUER, resource_server_url=url)
+    )
+
+
+def bearer(presented: str) -> httpx2.AsyncClient:
+    return httpx2.AsyncClient(headers={"Authorization": f"Bearer {presented}"})
 
 
 @pytest.mark.anyio
@@ -184,41 +300,30 @@ def _free_port() -> int:
 @pytest.mark.filterwarnings("ignore:.*validate_token_resource")
 async def test_each_http_request_is_logged_for_its_own_caller():
     """Real bearer auth over streamable HTTP: two users, one token refresh."""
-    port = _free_port()
-    url = f"http://127.0.0.1:{port}/mcp"
-    tokens = {
-        "alice-1": token("alice", resource=url),
-        "alice-2": token("alice", ("orders:read", "orders:write"), resource=url),
-        "bob-1": token("bob", resource=url),
-    }
-
-    class Verifier:
-        async def verify_token(self, presented: str) -> AccessToken | None:
-            return tokens.get(presented)
-
     log, seen = io.StringIO(), []
-    mcp = MCPServer(
-        "caller-http",
-        token_verifier=Verifier(),
-        auth=AuthSettings(issuer_url=ISSUER, resource_server_url=url),
-    )
-    gk = Gatehouse(mcp, policy=Policy(approver=alice_only(seen)), audit=AuditLog(stream=log))
 
-    @gk.tool(tier=AccessTier.READ)
-    def lookup(order_id: str) -> str:
-        """Look up an order."""
-        return f"order {order_id}"
+    def app(url: str):
+        tokens = {
+            "alice-1": token("alice", resource=url),
+            "alice-2": token("alice", ("orders:read", "orders:write"), resource=url),
+            "bob-1": token("bob", resource=url),
+        }
+        mcp = signed_in_server(url, tokens, "caller-http")
+        gk = Gatehouse(mcp, policy=Policy(approver=alice_only(seen)), audit=AuditLog(stream=log))
 
-    @gk.tool(tier=AccessTier.DESTRUCTIVE)
-    async def cancel(order_id: str) -> str:
-        """Cancel an order."""
-        return f"order {order_id} cancelled"
+        @gk.tool(tier=AccessTier.READ)
+        def lookup(order_id: str) -> str:
+            """Look up an order."""
+            return f"order {order_id}"
 
-    server = uvicorn.Server(
-        uvicorn.Config(mcp.streamable_http_app(), host="127.0.0.1", port=port, log_level="warning")
-    )
+        @gk.tool(tier=AccessTier.DESTRUCTIVE)
+        async def cancel(order_id: str) -> str:
+            """Cancel an order."""
+            return f"order {order_id} cancelled"
 
-    async def call(http: httpx2.AsyncClient, *calls: tuple[str, str]) -> None:
+        return mcp.streamable_http_app()
+
+    async def call(url: str, http: httpx2.AsyncClient, *calls: tuple[str, str]) -> None:
         async with streamable_http_client(url, http_client=http) as (read, write, *_):
             async with ClientSession(read, write) as session:
                 await session.initialize()
@@ -228,18 +333,11 @@ async def test_each_http_request_is_logged_for_its_own_caller():
                         # The client refreshes its token mid-session.
                         http.headers["Authorization"] = "Bearer alice-2"
 
-    with anyio.fail_after(30):
-        async with anyio.create_task_group() as tg:
-            tg.start_soon(server.serve)
-            while not server.started:
-                await anyio.sleep(0.02)
-            try:
-                async with httpx2.AsyncClient(headers={"Authorization": "Bearer alice-1"}) as alice:
-                    await call(alice, ("lookup", "1"), ("cancel", "1"))
-                async with httpx2.AsyncClient(headers={"Authorization": "Bearer bob-1"}) as bob:
-                    await call(bob, ("cancel", "2"))
-            finally:
-                server.should_exit = True
+    async with http_server(app) as url:
+        async with bearer("alice-1") as alice:
+            await call(url, alice, ("lookup", "1"), ("cancel", "1"))
+        async with bearer("bob-1") as bob:
+            await call(url, bob, ("cancel", "2"))
 
     lines = events(log)
     assert [(e["tool"], e["outcome"], e["caller"]["subject"], e["caller"]["scopes"]) for e in lines] == [
@@ -249,3 +347,56 @@ async def test_each_http_request_is_logged_for_its_own_caller():
     ]
     assert [c.subject for c in seen] == ["alice", "bob"]
     assert "secret-token" not in log.getvalue()
+
+
+@pytest.mark.anyio
+@pytest.mark.filterwarnings("ignore:.*validate_token_resource")
+async def test_an_approval_asked_over_http_stays_with_its_caller():
+    """The round trip over HTTP: the question goes out in one request and the
+    answer comes back in another. Both lines name alice, and bob can't spend
+    her approval by replaying it."""
+    log, ran = io.StringIO(), []
+
+    def app(url: str):
+        tokens = {"alice-1": token("alice", resource=url), "bob-1": token("bob", resource=url)}
+        mcp = signed_in_server(url, tokens, "caller-round-trip")
+        gk = Gatehouse(mcp, policy=Policy(approver=ElicitationApprover()), audit=AuditLog(stream=log))
+
+        @gk.tool(tier=AccessTier.DESTRUCTIVE)
+        async def cancel(order_id: str) -> str:
+            """Cancel an order."""
+            ran.append(order_id)
+            return f"order {order_id} cancelled"
+
+        return mcp.streamable_http_app()
+
+    arguments = {"order_id": "4417"}
+    async with http_server(app) as url:
+        async with bearer("alice-1") as alice_http, bearer("bob-1") as bob_http:
+            # The callback declares that these clients can show a form; this
+            # test answers the question itself, so it is never called.
+            async with Client(
+                streamable_http_client(url, http_client=alice_http), elicitation_callback=approve_in_client
+            ) as alice, Client(
+                streamable_http_client(url, http_client=bob_http), elicitation_callback=approve_in_client
+            ) as bob:
+                question = await alice.session.call_tool("cancel", arguments, allow_input_required=True)
+                assert isinstance(question, InputRequiredResult)
+                (key,) = question.input_requests
+                answer = {key: ElicitResult(action="accept", content={"approve": True})}
+
+                with pytest.raises(MCPError):
+                    await bob.session.call_tool(
+                        "cancel", arguments, input_responses=answer,
+                        request_state=question.request_state, allow_input_required=True,
+                    )
+                assert ran == []
+
+                result = await alice.session.call_tool(
+                    "cancel", arguments, input_responses=answer, request_state=question.request_state,
+                )
+    assert not result.is_error and ran == ["4417"]
+    lines = events(log)
+    assert [(line["outcome"], line["caller"]["subject"]) for line in lines] == [
+        ("pending", "alice"), ("ok", "alice"),
+    ]

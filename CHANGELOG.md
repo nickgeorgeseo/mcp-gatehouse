@@ -13,9 +13,18 @@ All notable changes to `mcp-gatehouse`. The public API (`Gatehouse`,
   `subject`, `issuer` and `scopes`, never the token itself. It is read
   per request, so a token refreshed mid-session is logged as the new
   one. Approvers get the same as `ApprovalRequest.caller`, a new
-  `Caller` type, and `terminal_approver` shows it in the prompt. Over
-  stdio nobody signs in: there is no `caller`, and audit lines are
-  unchanged.
+  `Caller` type, and `terminal_approver` names the user and client in
+  its prompt. Names there are JSON-quoted with everything outside
+  printable ASCII escaped and cut at 80 characters, so a crafted
+  subject can't redraw the prompt or pass for someone else. Over stdio
+  nobody signs in: there is no `caller`, and audit lines are unchanged.
+
+### Changed
+
+- On servers that sign callers in, the audit object's `record()` gets a
+  `caller` keyword. `AuditLog` takes any keywords; a custom audit class
+  whose `record` lists fixed keywords needs `**kwargs`, or calls fail
+  with a `TypeError`.
 
 ## 0.5.0 — 2026-11-02
 

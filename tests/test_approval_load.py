@@ -18,7 +18,7 @@ import pytest
 from mcp import Client
 from mcp.server.mcpserver import MCPServer
 
-from mcp_gatehouse import AccessTier, ApprovalRequest, AuditLog, Gatehouse, Policy, terminal_approver
+from mcp_gatehouse import AccessTier, ApprovalRequest, AuditLog, Caller, Gatehouse, Policy, terminal_approver
 from mcp_gatehouse import approvers
 from mcp_gatehouse import gatehouse as gatehouse_module
 
@@ -360,6 +360,28 @@ def test_terminal_prompt_takes_an_answer(operator, timeout):
     os.write(operator, b"y\n")
     deadline = None if timeout is None else time.monotonic() + timeout
     assert terminal_approver(request(deadline)) is True
+
+
+@needs_pty
+def test_terminal_prompt_names_the_caller(operator):
+    """On a server that signs callers in, the prompt says whose request it is,
+    between the call and the question."""
+    os.write(operator, b"y\n")
+    signed_in = ApprovalRequest(
+        tool="cancel", tier=AccessTier.DESTRUCTIVE, arguments={"order_id": "4417"},
+        deadline=time.monotonic() + 5, caller=Caller(client_id="support-agent", subject="alice"),
+    )
+    assert terminal_approver(signed_in) is True
+    shown = screen(operator)
+    assert 'for "alice" via client "support-agent"' in shown
+    assert shown.index("approval needed") < shown.index('for "alice"') < shown.index("allow?")
+
+
+@needs_pty
+def test_terminal_prompt_without_a_caller_is_unchanged(operator):
+    os.write(operator, b"y\n")
+    assert terminal_approver(request(time.monotonic() + 5)) is True
+    assert " for " not in screen(operator)
 
 
 @needs_pty

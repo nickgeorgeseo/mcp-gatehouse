@@ -187,22 +187,36 @@ request:
 
 It is read per request, so a token the client refreshes mid-session is
 logged as the new one. Approvers get the same thing as `request.caller`
-(a `Caller`), and `terminal_approver` shows it in the prompt, so whoever
-signs off knows whose request it is. An approver can act on it too:
+(a `Caller`), and `terminal_approver` names the user and the client in
+its prompt, so whoever signs off knows whose request it is:
+
+```
+⚠ approval needed → cancel_order (destructive) {'order_id': '4417'}
+  for "alice" via client "support-agent"
+allow? [y/N]
+```
+
+An approver can act on it too:
 
 ```python
 async def approver(request: ApprovalRequest) -> bool:
-    if request.caller is None:
-        return False  # nobody signed in
-    # ask_in_slack and manager_of are yours to write.
-    return await ask_in_slack(request, notify=manager_of(request.caller.subject))
+    caller = request.caller
+    if caller is None or caller.subject is None:
+        return False  # no signed-in user to ask on behalf of
+    # ask_in_slack and manager_of are yours to write. A subject is unique
+    # only per issuer, so look people up by both.
+    return await ask_in_slack(request, notify=manager_of(caller.issuer, caller.subject))
 ```
 
 `subject` is only as good as your token verifier. Fill in
 `AccessToken.subject` (and `claims` with `iss`), or the log can name only
-the client application, not the person. The token itself is never
-logged. Over stdio nobody signs in, so there is no `caller` and the lines
-are as before.
+the client application, not the person. Gatehouse never logs the token
+itself, but it does log `client_id` and `subject` as your verifier sets
+them, so keep the token out of both (some API-key setups use the key as
+the client ID). A subject can be an email address or other personal
+data, and `redact` doesn't cover it, since redaction applies to tool
+arguments: keep the log's retention in line with that. Over stdio nobody
+signs in, so there is no `caller` and the lines are as before.
 
 Naming the caller isn't deciding what they may touch. Whether alice may
 cancel order 4417 still has to be checked by your tool or your API.

@@ -87,10 +87,25 @@ def _for_whom(caller: Caller | None) -> str:
     """The prompt's "for whom" line, or nothing when no one signed in (stdio)."""
     if caller is None:
         return ""
-    # repr, as the arguments get: these strings come from a token, and a
-    # control character in one must not get to redraw the prompt.
-    user = "a user the token doesn't name" if caller.subject is None else repr(caller.subject)
-    return f"\n  for {user} via client {caller.client_id!r}"
+    user = "a user the token doesn't name" if caller.subject is None else _shown(caller.subject)
+    return f"\n  for {user} via client {_shown(caller.client_id)}"
+
+
+# Long enough for an email address or a URL-shaped client ID; a name past
+# it is cut rather than allowed to push the rest of the prompt off screen.
+_NAME_LIMIT = 80
+
+
+def _shown(name: str) -> str:
+    """A name from a token, quoted so it can only ever read as itself.
+
+    JSON-quoted with everything outside printable ASCII escaped: no control
+    sequence can redraw the prompt, a quote in the name can't close the
+    quoting early and fake the rest of the line, and a look-alike or blank
+    Unicode character shows up as an escape instead of passing for a letter.
+    """
+    quoted = json.dumps(name[:_NAME_LIMIT], ensure_ascii=True).replace("\x7f", "\\u007f")
+    return quoted + "…" if len(name) > _NAME_LIMIT else quoted
 
 
 def _seconds_left(request: ApprovalRequest) -> float | None:

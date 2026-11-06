@@ -71,8 +71,21 @@ class ApprovalRequest:
     a poll — should give up by then: past it, its answer is ignored."""
 
     caller: Caller | None = None
-    """Who the call is for, from the request's verified access token, or
-    ``None`` when the transport has no authentication (stdio)."""
+    """Who the call is for: the request's verified access token, or the
+    server's declared ``local_caller`` on stdio."""
+
+    reason: str | None = None
+    """Why the policy asked, when it answered ``Ask(reason)``; ``None`` when
+    the approval is required by the tool's tier alone."""
+
+    resources: tuple[str, ...] = ()
+    """One line per record the call acts on, from ``Load(describe=...)``, so
+    the approver sees what will change, not only the model's arguments."""
+
+    binding: str | None = None
+    """A fingerprint of the caller, the records' state and the reason. Not
+    for showing: an approval given for one binding never runs a call with
+    another, so a record that changed while a person decided is refused."""
 
 
 Approver = Callable[[ApprovalRequest], Union[bool, Awaitable[bool]]]
@@ -168,7 +181,12 @@ def redact_arguments(arguments: dict[str, Any], keys: frozenset[str]) -> dict[st
                 str(k): (REDACTED if _normalize_key(str(k)) in lowered else scrub(v))
                 for k, v in value.items()
             }
-        if isinstance(value, (list, tuple, set, frozenset)) or (
+        if isinstance(value, (set, frozenset)):
+            # Sorted: a set's order depends on PYTHONHASHSEED, and approvals
+            # bind to a fingerprint of the redacted record, which must read
+            # the same in every worker process.
+            return sorted((scrub(v) for v in value), key=_canonical)
+        if isinstance(value, (list, tuple)) or (
             isinstance(value, Sequence) and not isinstance(value, bytes)
         ):
             return [scrub(v) for v in value]
@@ -183,3 +201,10 @@ def redact_arguments(arguments: dict[str, Any], keys: frozenset[str]) -> dict[st
         return f"«opaque:{type(value).__name__}»"
 
     return scrub(dict(arguments))
+
+
+def _canonical(value: Any) -> str:
+    """One stable text for a JSON-shaped value, for sorting and fingerprints."""
+    import json
+
+    return json.dumps(value, sort_keys=True, ensure_ascii=True, default=str)

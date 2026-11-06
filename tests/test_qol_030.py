@@ -18,7 +18,9 @@ from mcp import Client
 from mcp.server.mcpserver import MCPServer
 
 import mcp_gatehouse
-from mcp_gatehouse import DEFAULT_REDACT, AccessTier, AuditLog, Gatehouse, Policy, redact_arguments
+from mcp_gatehouse import DEFAULT_REDACT, AccessTier, AuditLog, Policy, redact_arguments
+
+from _support import OpenGatehouse as Gatehouse
 from mcp_gatehouse import demo
 
 REPO = Path(__file__).resolve().parent.parent
@@ -262,8 +264,9 @@ async def test_demo_tools_are_documented_and_work_end_to_end():
             for name, prop in tool.input_schema.get("properties", {}).items():
                 assert prop.get("description"), f"{tool.name}.{name} has no description"
 
-        listing = (await client.call_tool("list_orders", {})).content[0].text
+        listing = " ".join(c.text for c in (await client.call_tool("list_orders", {})).content)
         assert "4417" in listing and "4418" in listing
+        assert "4420" not in listing  # someone else's: the gate withholds it
         await client.call_tool("add_note", {"order_id": "4418", "note": "rush", "api_key": "sk-live-1"})
         assert "rush" in (await client.call_tool("lookup_order", {"order_id": "4418"})).content[0].text
 

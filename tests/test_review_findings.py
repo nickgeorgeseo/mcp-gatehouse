@@ -17,7 +17,9 @@ from mcp.server.mcpserver import Context, MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 from pydantic import BaseModel
 
-from mcp_gatehouse import AccessTier, AuditLog, GateDenied, Gatehouse, Policy
+from mcp_gatehouse import AccessTier, AuditLog, GateDenied, Policy
+
+from _support import OpenGatehouse as Gatehouse
 from mcp_gatehouse.policy import DEFAULT_REDACT, REDACTED, redact_arguments
 
 

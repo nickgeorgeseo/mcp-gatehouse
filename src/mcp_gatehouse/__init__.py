@@ -1,14 +1,34 @@
-"""mcp-gatehouse — permission tiers, approval gates, and audit logging
-for MCP servers built with the official Python SDK.
+"""mcp-gatehouse — authorization as a runtime invariant for MCP servers
+built with the official Python SDK.
 
-The server is the gatekeeper: you decide what an AI can read, what it can
-write, and what's off-limits — and every action gets logged.
+Every tool call needs a verified caller, an explicit policy, and a decision
+on the record it acts on, made server-side before the tool runs. Anything
+missing, and the call fails closed. Around that: permission tiers, approval
+gates, and an audit log of every call.
 """
 
 from importlib.metadata import PackageNotFoundError, version
 
 from .approvers import ElicitationApprover, terminal_approver
 from .audit import AuditLog, NullAuditLog
+from .authz import (
+    AcceptRace,
+    Allow,
+    Ask,
+    AuthorizationRequest,
+    Authorizer,
+    ConditionalWrite,
+    Conflict,
+    Consistency,
+    Decision,
+    Deny,
+    Load,
+    Scope,
+    Transaction,
+    any_caller,
+    any_item,
+    current_transaction,
+)
 from .gatehouse import GateDenied, Gatehouse
 from .policy import (
     DEFAULT_REDACT,
@@ -22,16 +42,32 @@ from .policy import (
 
 __all__ = [
     "DEFAULT_REDACT",
+    "AcceptRace",
     "AccessTier",
+    "Allow",
     "ApprovalRequest",
     "Approver",
+    "Ask",
     "AuditLog",
+    "AuthorizationRequest",
+    "Authorizer",
     "Caller",
+    "ConditionalWrite",
+    "Conflict",
+    "Consistency",
+    "Decision",
+    "Deny",
     "ElicitationApprover",
     "GateDenied",
     "Gatehouse",
+    "Load",
     "NullAuditLog",
     "Policy",
+    "Scope",
+    "Transaction",
+    "any_caller",
+    "any_item",
+    "current_transaction",
     "redact_arguments",
     "terminal_approver",
 ]

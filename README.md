@@ -12,9 +12,11 @@
 
 [![Gatehouse MCP server](https://mcprush.com/badge/gatehouse-mcp/card.svg)](https://mcprush.com/to/gatehouse-mcp?ref=badge)
 
-**Permission tiers, approval gates, and audit logging for MCP servers.**
-The server is the gatekeeper: you decide what an AI can read, what it can
-write, and what's off-limits — and every action gets logged.
+**Authorization as a runtime invariant for MCP servers.** Every tool call
+needs a verified caller, an explicit policy, and a decision on the record it
+acts on, made by the server before the tool runs. If any of those is
+missing, the call doesn't run. Around that: permission tiers, approval
+gates, and an audit log of every call.
 
 Most MCP servers hand the model every tool at full strength and keep no
 record of what it did. That's fine for a demo. It's not fine the day an
@@ -43,18 +45,25 @@ refused and one approved, and the audit log they left. No sound.
 
 | | |
 |---|---|
+| **Authorization on the record** | Every tool names a policy. The gate loads the record the call is about from the model's arguments, your policy decides on it, and the tool gets that same object. The model can't describe a record into existence or reach one that isn't the caller's. |
+| **No way around the gate** | A tool without a policy doesn't register, the server refuses tools registered around the gate, and a call with no verified caller is denied. Each opt-out is explicit and marked in the audit log. |
+| **Check and write together** | The policy's decision and the tool's write share one transaction you supply, or the write carries the checked state in its own condition. A record that changes after the check is never acted on. |
+| **Lists filtered per item** | A tool that returns records gets each one checked: what the caller may not see never reaches the model. |
 | **Permission tiers** | Every tool is declared `READ`, `WRITE`, or `DESTRUCTIVE` — and the tier also emits honest spec `ToolAnnotations` (`readOnlyHint` / `destructiveHint`), which the wrapper won't let you override to lie. |
 | **Approval gates** | Tiers you choose require a sign-off before the tool runs, asked right in the MCP client (Claude Code, Cursor, VS Code) or by any callable you write: a terminal prompt, a Slack ping, a ticket. **Fails closed:** a gated tool with no approver configured is denied, not waved through. |
-| **Audit log** | Append-only JSONL, one line per call — allowed, denied, failed, or cancelled — with UTC timestamps and durations, and, on servers that sign callers in, who each call was for. The answer to "what did the AI actually do, and for whom?" six months later. |
+| **Audit log** | Append-only JSONL, one line per call — allowed, denied, failed, or cancelled — with UTC timestamps and durations, who each call was for, and the policy's real reason for every refusal. The answer to "what did the AI actually do, and for whom?" six months later. |
 | **Redaction** | Argument keys you name (`api_key`, `password`, `token`, `client_secret`, … by default) are masked before they reach the log *or* the approver — however they're spelled: `apiKey`, `API-Key` and `api_key` are the same key. |
 | **Denylist** | Block a tool outright, whatever its tier. |
 
 ## Quickstart
 
 ```python
+from typing import Annotated
+
 from mcp.server.mcpserver import MCPServer
 from mcp_gatehouse import (
-    AccessTier, AuditLog, ElicitationApprover, Gatehouse, Policy, terminal_approver,
+    AccessTier, Allow, AuditLog, Caller, ConditionalWrite, Deny, ElicitationApprover,
+    Gatehouse, Load, Policy, any_caller, terminal_approver,
 )
 
 mcp = MCPServer("order-desk")
@@ -63,27 +72,220 @@ gatehouse = Gatehouse(
     # Ask in the client's own UI; prompt on the terminal if it can't show a form.
     policy=Policy(approver=ElicitationApprover(fallback=terminal_approver)),
     audit=AuditLog(path="~/order-desk/audit.jsonl"),
+    # Over stdio nobody signs in, so say who the calls are for.
+    local_caller=Caller(client_id="local", subject="alice"),
 )
 
-@gatehouse.tool(tier=AccessTier.READ)
-def lookup_order(order_id: str) -> str:
-    """Look up an order's status."""
+def load_order(order_id: str) -> Order | None:
+    """Your system of record. None means there's no such order."""
     ...
 
-@gatehouse.tool(tier=AccessTier.DESTRUCTIVE)
-def cancel_order(order_id: str) -> str:
-    """Cancel an order. Runs only if the approver says yes."""
+def owner_only(request) -> Allow | Deny:
+    order = request.resources["order"]
+    return Allow() if order.owner == request.caller.subject else Deny("not the owner")
+
+@gatehouse.tool(tier=AccessTier.READ, authorize=owner_only)
+def lookup_order(order_id: str, order: Annotated[Order, Load(load_order)]) -> str:
+    """Look up an order's status."""
+    return order.status
+
+@gatehouse.tool(
+    tier=AccessTier.DESTRUCTIVE,
+    authorize=owner_only,
+    consistency=ConditionalWrite(),  # the cancel's UPDATE checks the order's version
+)
+def cancel_order(order_id: str, order: Annotated[Order, Load(load_order)]) -> str:
+    """Cancel an order. Runs only if it's the caller's and the approver says yes."""
     ...
 
 mcp.run()
 ```
 
-That's the whole integration: build your `MCPServer` exactly as the
-SDK docs show, but register tools through the gatehouse. Schema generation
-(including `Annotated[..., Field(description=...)]` parameter docs),
-transports, and everything else work unchanged — the guard preserves the
-function's signature. Sync tools still run in a worker thread, exactly as
-they would on a bare `MCPServer`.
+That's the whole integration: build your `MCPServer` exactly as the SDK
+docs show, but create the gatehouse first and register every tool through
+it. The model sees `order_id` and nothing else; the gate loads the order,
+your policy decides on it, and the tool gets the order the policy saw.
+Schema generation (including `Annotated[..., Field(description=...)]`
+parameter docs), transports, and everything else work unchanged. Sync tools
+still run in a worker thread, exactly as they would on a bare `MCPServer`.
+
+## Authorization: a runtime invariant
+
+Most servers leave authorization to each tool, and nothing notices when one
+forgets. Here the server enforces it. Every call needs three things, checked
+in the server before the tool runs:
+
+1. **A verified caller.** That's the identity in the access token the SDK
+   verified for the request. Over stdio, where nobody signs in, it's the
+   `local_caller` you declare. An HTTP request with no verified token is
+   nobody, even on a server that declares a local caller.
+2. **An explicit policy.** `authorize=` is required on every tool.
+3. **A decision on the record itself.** The gate loads each `Load`
+   parameter from the model's arguments, gives the records to your policy,
+   and hands the tool those same objects.
+
+If any of the three is missing, the call is denied. Gatehouse doesn't know
+your business rules. What it guarantees is that they run at the right
+place, and that nothing gets around them:
+
+- A tool without `authorize=` raises at registration, so the server doesn't
+  start.
+- The server refuses tools added around the gate. That covers
+  `@mcp.tool()` and `add_tool` before or after the gate is created,
+  `MCPServer(tools=...)`, extension tools, and a tool slipped into the
+  registry. A refused tool is hidden from `tools/list` and denied when
+  called.
+- Nothing the gate fills can come from the model. A `Load` parameter never
+  appears in the input schema, and registration fails if the SDK would put
+  it there.
+
+Each requirement has a way out, but only one you write down, and the audit
+log shows it:
+
+| Requirement | Applies to | Declared with | Deliberate opt-out | Audit line shows |
+|---|---|---|---|---|
+| Verified caller | every call | the SDK's auth (`token_verifier`) | `local_caller=` (stdio only) | `caller` (local ones: `"source": "local"`) |
+| Policy | every tool | `authorize=` | `authorize=any_caller` | `authz: "open"` |
+| Item filtering | tools returning a list of records | `authorize_items=` | `authorize_items=any_item` | `items: "open"` |
+| Check and write in one unit | WRITE/DESTRUCTIVE tools that `Load` | `consistency=` (per tool, or on the `Gatehouse`) | `consistency=AcceptRace("why")` | `consistency: "accept-race"` and the reason |
+
+### Policies
+
+A policy is any callable, sync or async, that takes an
+`AuthorizationRequest` and returns one of three decisions:
+
+- `Allow()`.
+- `Deny(reason)`.
+- `Ask(reason)`: a person decides. The configured approver is asked, and
+  sees the reason. `Ask` with no approver is a denial, whatever
+  `fail_closed` says.
+
+Only a decision counts. A policy that returns `True`, `None` or anything
+else, or that raises, has denied the call.
+
+The request carries:
+
+- `caller`: who the call is for;
+- `resources`: the loaded records;
+- `arguments`: what the model sent, read-only;
+- `claims`: the verified token's claims, read-only. They go to the policy
+  only and are never logged.
+
+```python
+def can_cancel(request: AuthorizationRequest) -> Decision:
+    order = request.resources["order"]
+    if order.owner != request.caller.subject:
+        return Deny("not the owner")
+    if order.status == "shipped":
+        return Deny("already shipped", message=f"Order {order.id} has shipped.")
+    if order.total > 500:
+        return Ask("order over $500")
+    return Allow()
+```
+
+The model gets the same answer for every refusal on authorization: "'X' is
+not permitted for this caller." That covers a record that doesn't exist, one
+that isn't theirs, and a loader or policy that failed, so it can't probe
+which orders exist. The audit log records the real reason (`not found:
+order`, `policy: not the owner`). `Deny(..., message=...)` tells the model
+more, when that's safe to say.
+
+`Load(loader, describe=..., fingerprint=...)`:
+
+- The loader's parameters name the tool's arguments it loads from. A
+  loader that returns `None` means not found.
+- `describe` gives the approver one line about the record ("order 4417 ·
+  Blue Ridge Cabinets · $812.00"), so they see what the call will act on,
+  not only the arguments the model chose.
+- An approval binds to the record's state, by default a redacted snapshot
+  of it, or what `fingerprint` returns. If the record changes while a
+  person decides, the call is refused rather than run on something they
+  never saw. On a tier that requires approval, a record must be a Pydantic
+  model, a dataclass or a mapping, or have a `fingerprint`.
+
+### The check and the write
+
+Loading once and handing over means the tool acts on the object that was
+checked. It doesn't stop that record changing in the database between the
+check and the write. A WRITE or DESTRUCTIVE tool that loads a record must
+say how that window is closed:
+
+- **`Transaction(factory)`.** `factory(caller)` returns your context
+  manager, sync or async. The gate runs the load, the policy, the tool and
+  the commit inside it, and a refusal or an error rolls it back.
+  - Lock the row in the loader (`SELECT … FOR UPDATE`) and the decision
+    still holds when the tool writes.
+  - Loaders and the tool reach the transaction through
+    `current_transaction()`.
+  - A sync transaction runs entirely in one worker thread, so drivers tied
+    to their thread are safe. Everything inside it must then be sync. With
+    an async transaction, the loaders and the tool are async.
+  - The gate never holds a transaction open while a person decides. It
+    asks first, then opens the transaction, reloads and checks again.
+- **`ConditionalWrite()`.** The write carries the checked state in its own
+  condition: `UPDATE … WHERE id = ? AND version = ?`. When it matches
+  nothing, the tool raises `Conflict`. The log records
+  `outcome: "conflict"` and the model is told the record changed. The gate
+  can't see your query, so this one is your promise.
+- **`AcceptRace("why")`.** Accept the window on purpose. The reason goes on
+  every audit line.
+
+The gate guarantees that the check and the write share one unit, in that
+order. Isolation (row locks, `SERIALIZABLE`) is your database's job.
+[`examples/orders_postgres.py`](examples/orders_postgres.py) shows all of
+it on Postgres.
+
+### Lists
+
+"May alice update invoice 123?" is a check. "Show alice her invoices" is a
+filter, and filters belong in the data layer. The gate wires each layer to
+the verified caller and backstops it:
+
+1. **Row-level security.** The transaction factory gets the caller, so it
+   can `SET LOCAL app.subject` and let Postgres RLS limit every query the
+   tool runs.
+2. **`Scope(fn)`.** This fills a hidden parameter with a query filter
+   computed from the caller: an owner, a tenant, or the IDs a
+   relationship-based engine lists. Your query uses it.
+3. **`authorize_items=`**, the gate's backstop. A tool that returns a list
+   of records must declare it. The gate checks each item it returned
+   (`action="read"`, `resource=item`), and only `Allow` keeps one.
+   - With layers 1 and 2 working, it withholds nothing.
+   - The `ok` line counts `withheld`, and flags `scope_mismatch` when a
+     `Scope` was in force. A nonzero count is an alarm that the query and
+     the policy disagree.
+
+The gate can only filter records it can see as items. A tool that formats
+rows into a string gets the call-level check alone, so return records.
+Filtering after the fetch also shrinks pages, so correct paging needs layer
+1 or 2.
+
+### Allowed isn't the same as wanted
+
+Perfect enforcement still lets a prompt-injected agent do anything the user
+is allowed to do. Authorization answers "may this happen?", not "did the
+user ask for this?". The gate holds two levers:
+
+- **Task-scoped credentials** make "allowed" as small as the task.
+  - `scopes={"orders:cancel"}` on a tool denies a token without that
+    scope, before anything loads.
+  - A policy can read `request.claims`. It can require that the token's
+    `authorization_details` (RFC 9396) name this exact order, so a token
+    minted for "cancel 4417" can't cancel 4418. It can also check `act`
+    (RFC 8693) to tell an agent acting for alice from alice herself.
+  - Issue short-lived, down-scoped tokens per task. The gate enforces
+    them; it doesn't mint them.
+- **Confirmation for high-impact actions.** DESTRUCTIVE needs approval by
+  default, and `Ask` adds it on your conditions. The approver sees the
+  record (`describe`) and the reason, not only the model's arguments,
+  which gives a person the chance to spot an action nobody asked for.
+  Elicitation trusts the client to show the form to a person. For the
+  tools that matter most, approve out-of-band (Slack, a ticket), where
+  neither the model nor a compromised client can answer.
+
+What no gate can do is infer intent. It limits the blast radius, puts a
+person in front of what can't be undone, and keeps a trail that makes
+misuse visible afterwards.
 
 ### Approve in the client
 
@@ -155,20 +357,25 @@ Policy(redact=DEFAULT_REDACT | {"card_pin"}, ...)
 What the audit trail looks like:
 
 ```json
-{"ts": "2026-07-16T14:02:11+00:00", "tool": "lookup_order", "tier": "read", "outcome": "ok", "arguments": {"order_id": "4417"}, "duration_ms": 0.42}
-{"ts": "2026-07-16T14:02:38+00:00", "tool": "add_note", "tier": "write", "outcome": "ok", "arguments": {"order_id": "4417", "note": "call back", "api_key": "«redacted»"}, "duration_ms": 1.08}
-{"ts": "2026-07-16T14:03:05+00:00", "tool": "cancel_order", "tier": "destructive", "outcome": "denied", "reason": "approver refused", "arguments": {"order_id": "4417"}}
-{"ts": "2026-07-16T14:05:40+00:00", "tool": "cancel_order", "tier": "destructive", "outcome": "cancelled", "reason": "awaiting approval", "arguments": {"order_id": "4418"}}
+{"ts": "2026-11-06T14:02:11+00:00", "tool": "list_orders", "tier": "read", "outcome": "ok", "arguments": {}, "duration_ms": 0.31, "withheld": 1, "caller": {"client_id": "local", "subject": "alice", "issuer": null, "scopes": [], "source": "local"}, "authz": "open"}
+{"ts": "2026-11-06T14:02:38+00:00", "tool": "add_note", "tier": "write", "outcome": "ok", "arguments": {"order_id": "4417", "note": "call back", "api_key": "«redacted»"}, "duration_ms": 1.08, "caller": {…}, "authz": "allow", "resources": {"order": {"order_id": "4417"}}, "consistency": "conditional"}
+{"ts": "2026-11-06T14:03:05+00:00", "tool": "cancel_order", "tier": "destructive", "outcome": "denied", "reason": "policy: someone else's order", "arguments": {"order_id": "4420"}, "caller": {…}, "authz": "deny", "resources": {"order": {"order_id": "4420"}}, "consistency": "conditional"}
+{"ts": "2026-11-06T14:05:40+00:00", "tool": "cancel_order", "tier": "destructive", "outcome": "denied", "reason": "approver refused", "arguments": {"order_id": "4417"}, "caller": {…}, "authz": "ask", "resources": {"order": {"order_id": "4417"}}, "consistency": "conditional"}
 ```
 
 `outcome` is `ok`, `denied` (`reason` says why), `error` (the tool
-raised; `reason` is the exception type), `pending`, or `cancelled`.
+raised; `reason` is the exception type), `conflict` (a conditional write
+matched nothing because the record changed), `pending`, or `cancelled`.
+`authz` is the policy's decision: `allow`, `ask`, `deny`, or `open` for an
+`any_caller` tool. `resources` names the arguments each record was loaded
+from, never the record itself. `withheld` counts the items a list tool
+returned that the caller may not see.
 `pending` is a call whose approval was asked in the client over the
 2026-07-28 round trip: the verdict follows on a line of its own when the
 client comes back, so a `pending` line with nothing after it is a question
 nobody answered. `cancelled` means the client gave
 up, or the server shut down, before the call finished. `reason` says
-when. `awaiting approval` means the tool never ran. `tool running` comes
+when. `authorizing` and `awaiting approval` mean the tool never ran. `tool running` comes
 with `duration_ms`, and the tool may have done part of its work. A sync
 tool can't be stopped partway: its worker thread runs to the end, and the
 line says `ok` or `error` as usual. The gate only writes the line; the
@@ -192,6 +399,8 @@ its prompt, so whoever signs off knows whose request it is:
 
 ```
 ⚠ approval needed → cancel_order (destructive) {'order_id': '4417'}
+  on order 4417 · Blue Ridge Cabinets · packed · $812.00
+  asked because: order over $500
   for "alice" via client "support-agent"
 allow? [y/N]
 ```
@@ -216,16 +425,18 @@ them, so keep the token out of both (some API-key setups use the key as
 the client ID). A subject can be an email address or other personal
 data, and `redact` doesn't cover it, since redaction applies to tool
 arguments: keep the log's retention in line with that. Over stdio nobody
-signs in, so there is no `caller` and the lines are as before.
-
-Naming the caller isn't deciding what they may touch. Whether alice may
-cancel order 4417 still has to be checked by your tool or your API.
+signs in: the lines name the `local_caller` the server declared, marked
+`"source": "local"`, and without one every call is denied.
 
 ## Try the demo
 
 The package ships a runnable order-desk server with all three tiers wired
-up. Approvals are asked in the client when it can show a form, with a
-terminal prompt as the fallback. Add it to any MCP client that speaks
+up. Every order has an owner. Over stdio the server declares that calls are
+for you, the user running it, so you see and change only your orders: order
+4420 is someone else's. `cancel_order` refuses an order that has shipped,
+and needs your approval for the rest, asked in the client when it can show
+a form, with a terminal prompt as the fallback. Above $500 the approval
+says so. Add it to any MCP client that speaks
 stdio. For Claude Code:
 
 ```bash
@@ -246,8 +457,9 @@ For Claude Desktop, in `claude_desktop_config.json`:
 ```
 
 Or run `mcp-gatehouse-demo` yourself after `pip install mcp-gatehouse`.
-Ask the model to list the orders and cancel one, then watch the verdict
-land in the audit log either way. The audit log goes to `--audit-log`, else
+Ask the model to list the orders, look up 4420, and cancel one, then watch
+each verdict land in the audit log, with the policy's reason when it says
+no. The audit log goes to `--audit-log`, else
 `$MCP_GATEHOUSE_AUDIT_LOG`, else `./audit.jsonl` — falling back to
 `~/.mcp-gatehouse/audit.jsonl` when the working directory isn't writable
 (desktop clients often launch servers from `/`). The server prints the
@@ -300,16 +512,23 @@ template.
   or a full-screen program has it in raw mode. Asking in the client
   (elicitation) sidesteps the terminal entirely. When the approval must
   not come from the client, approve out-of-band: Slack, a ticket, a queue.
+- **Opt out on purpose, never by omission.** As with CSRF protection in a
+  web framework, the protection is on unless you switch it off for one
+  tool, in writing (`any_caller`, `any_item`, `AcceptRace("why")`), and
+  the audit log shows every place you did.
 - **What this is not:** authentication, transport encryption, a sandbox,
-  or a check on which records a caller may touch. It logs the caller the
-  SDK authenticated; your tools and APIs still decide what that caller is
-  allowed to do. It's a gate inside your server, not a perimeter around
-  it. See [SECURITY.md](SECURITY.md).
+  or a judge of intent. It enforces *your* policy on the record, for the
+  caller the SDK authenticated, but it can't tell an action the user
+  wanted from one a manipulated agent chose within their rights. Resources
+  and prompts aren't gated, only tools. It's a gate inside your server,
+  not a perimeter around it. See [SECURITY.md](SECURITY.md).
 
 ## Compatibility
 
 Targets the official [`mcp` Python SDK](https://github.com/modelcontextprotocol/python-sdk)
-v2.x (`mcp>=2,<3`) and Python 3.10–3.14. Ships type information
+v2.x (`mcp>=2.3,<3`) and Python 3.10–3.14. The gate guards the SDK's
+tool registry, which it reaches through 2.3's internals; on an SDK where
+they aren't there, creating a `Gatehouse` raises rather than run unguarded. Ships type information
 (`py.typed`). Release notes: [CHANGELOG.md](CHANGELOG.md).
 
 | `mcp-gatehouse` | SDK | Server class |
@@ -321,7 +540,10 @@ v2.x (`mcp>=2,<3`) and Python 3.10–3.14. Ships type information
 | `0.1.x` | `mcp>=1.27,<2` | `FastMCP` |
 
 The public API (`Gatehouse`, `Policy`, `AuditLog`, `AccessTier`) is
-unchanged across that line, as promised. Porting a v1 server is two
+unchanged across that line, as promised. The authorization invariant (not
+yet released) is the deliberate exception: every tool now needs
+`authorize=`, and a server needs a verified or declared caller. See
+[CHANGELOG.md](CHANGELOG.md) for the migration. Porting a v1 server is two
 import edits — `FastMCP` became `MCPServer` and moved to
 `mcp.server.mcpserver`; see the SDK's
 [migration guide](https://py.sdk.modelcontextprotocol.io/v2/migration/).

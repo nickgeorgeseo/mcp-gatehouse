@@ -8,62 +8,33 @@ bearer header, verification, the tool call, the audit line.
 
 from __future__ import annotations
 
-import contextlib
-import functools
 import io
 import json
-import socket
-from collections.abc import AsyncIterator, Callable
 from typing import Any
 
 import anyio
 import httpx2
 import pytest
-import uvicorn
 from mcp import Client, MCPError
 from mcp.client.session import ClientSession
 from mcp.client.streamable_http import streamable_http_client
-from mcp.server.auth.middleware.auth_context import auth_context_var
-from mcp.server.auth.middleware.bearer_auth import AuthenticatedUser
 from mcp.server.auth.provider import AccessToken
 from mcp.server.auth.settings import AuthSettings
 from mcp.server.mcpserver import MCPServer
 from mcp.types import ElicitResult, InputRequiredResult
 
 from mcp_gatehouse import (
-    AccessTier, ApprovalRequest, AuditLog, Caller, ElicitationApprover, Gatehouse, Policy,
+    AccessTier, ApprovalRequest, AuditLog, Caller, ElicitationApprover, Policy,
 )
 from mcp_gatehouse.approvers import _for_whom
 
-ISSUER = "https://idp.example"
+from _support import ISSUER, LOCAL, LOCAL_ENTRY, bearer, http_server, signed_in, token
+from _support import OpenGatehouse as Gatehouse
 
 
-def token(user: str, scopes: tuple[str, ...] = ("orders:read",), *, named: bool = True,
-          resource: str | None = None) -> AccessToken:
-    """A verified token for `user`; `named=False` is a verifier that sets no subject."""
-    return AccessToken(
-        token=f"secret-token-{user}",
-        client_id="support-agent",
-        scopes=list(scopes),
-        subject=user if named else None,
-        claims={"iss": ISSUER} if named else None,
-        resource=resource,
-    )
-
-
-@contextlib.contextmanager
-def signed_in(access_token: AccessToken):
-    """What the SDK's AuthContextMiddleware does around each HTTP request."""
-    reset = auth_context_var.set(AuthenticatedUser(access_token))
-    try:
-        yield
-    finally:
-        auth_context_var.reset(reset)
-
-
-def build(policy: Policy, log: io.StringIO, name: str = "caller-test") -> MCPServer:
+def build(policy: Policy, log: io.StringIO, name: str = "caller-test", **gate: Any) -> MCPServer:
     mcp = MCPServer(name)
-    gk = Gatehouse(mcp, policy=policy, audit=AuditLog(stream=log))
+    gk = Gatehouse(mcp, policy=policy, audit=AuditLog(stream=log), **gate)
 
     @gk.tool(tier=AccessTier.READ)
     def lookup(order_id: str) -> str:
@@ -103,15 +74,35 @@ ALICE = {"client_id": "support-agent", "subject": "alice", "issuer": ISSUER, "sc
 
 
 @pytest.mark.anyio
-async def test_no_caller_without_authentication():
+async def test_no_caller_is_denied_before_anything_runs():
+    """Nobody signed in and no local caller declared: every call fails closed,
+    and neither the approver nor the tool is reached."""
+    log, seen = io.StringIO(), []
+    server = build(Policy(approver=alice_only(seen)), log, local_caller=None)
+    async with Client(server) as session:
+        for name in ("lookup", "cancel"):
+            result = await session.call_tool(name, {"order_id": "4417"})
+            assert result.is_error
+            assert "needs a verified caller" in result.content[0].text
+    assert seen == []
+    assert [(e["tool"], e["outcome"], e["reason"]) for e in events(log)] == [
+        ("lookup", "denied", "no verified caller"),
+        ("cancel", "denied", "no verified caller"),
+    ]
+    assert all("caller" not in event for event in events(log))
+
+
+@pytest.mark.anyio
+async def test_the_declared_local_caller_is_named_on_every_line():
+    """Over stdio or in memory, the server's declared local caller is who
+    the call is for: the approver gets it, and the log marks it local."""
     log, seen = io.StringIO(), []
     server = build(Policy(approver=alice_only(seen)), log)
     async with Client(server) as session:
         await session.call_tool("lookup", {"order_id": "4417"})
         await session.call_tool("cancel", {"order_id": "4417"})
-    assert seen == [None]
-    # Lines stay exactly as they were before callers existed.
-    assert all("caller" not in event for event in events(log))
+    assert seen == [LOCAL]
+    assert [event["caller"] for event in events(log)] == [LOCAL_ENTRY, LOCAL_ENTRY]
 
 
 @pytest.mark.anyio
@@ -258,29 +249,6 @@ def test_long_names_are_cut():
 # --- over real HTTP ------------------------------------------------------------
 
 
-@contextlib.asynccontextmanager
-async def http_server(make_app: Callable[[str], Any]) -> AsyncIterator[str]:
-    """Serve `make_app(url)` on a port the OS picks. The socket is bound
-    before the server starts and handed to it, so nothing can take the port
-    in between."""
-    sock = socket.socket()
-    sock.bind(("127.0.0.1", 0))
-    url = f"http://127.0.0.1:{sock.getsockname()[1]}/mcp"
-    server = uvicorn.Server(uvicorn.Config(make_app(url), log_level="warning"))
-    try:
-        with anyio.fail_after(30):
-            async with anyio.create_task_group() as tg:
-                tg.start_soon(functools.partial(server.serve, sockets=[sock]))
-                while not server.started:
-                    await anyio.sleep(0.02)
-                try:
-                    yield url
-                finally:
-                    server.should_exit = True
-    finally:
-        sock.close()
-
-
 def signed_in_server(url: str, tokens: dict[str, AccessToken], name: str) -> MCPServer:
     class Verifier:
         async def verify_token(self, presented: str) -> AccessToken | None:
@@ -289,10 +257,6 @@ def signed_in_server(url: str, tokens: dict[str, AccessToken], name: str) -> MCP
     return MCPServer(
         name, token_verifier=Verifier(), auth=AuthSettings(issuer_url=ISSUER, resource_server_url=url)
     )
-
-
-def bearer(presented: str) -> httpx2.AsyncClient:
-    return httpx2.AsyncClient(headers={"Authorization": f"Bearer {presented}"})
 
 
 @pytest.mark.anyio

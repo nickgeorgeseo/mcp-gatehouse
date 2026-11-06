@@ -34,7 +34,7 @@ classifiers = [
     "Topic :: Software Development :: Libraries",
     "Topic :: Security",
 ]
-dependencies = ["mcp>=2,<3"]
+dependencies = ["mcp>=2.3,<3"]
 
 [project.scripts]
 mcp-gatehouse-demo = "mcp_gatehouse.demo:main"

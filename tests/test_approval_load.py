@@ -18,7 +18,10 @@ import pytest
 from mcp import Client
 from mcp.server.mcpserver import MCPServer
 
-from mcp_gatehouse import AccessTier, ApprovalRequest, AuditLog, Caller, Gatehouse, Policy, terminal_approver
+from mcp_gatehouse import AccessTier, ApprovalRequest, AuditLog, Caller, Policy, terminal_approver
+
+from _support import OpenGatehouse as Gatehouse
+from _support import signed_in, token
 from mcp_gatehouse import approvers
 from mcp_gatehouse import gatehouse as gatehouse_module
 
@@ -266,13 +269,14 @@ async def test_signature_is_not_recomputed_per_call(monkeypatch):
     def lookup(order_id: str, verbose: bool = False) -> str:
         return f"order {order_id}"
 
-    guarded = gk._guard(lookup, "lookup", AccessTier.READ)
+    guarded = gk.guard(lookup, "lookup", AccessTier.READ)
 
     def no_signature(*args, **kwargs):
         raise AssertionError("inspect.signature called on the call path")
 
     monkeypatch.setattr(gatehouse_module.inspect, "signature", no_signature)
-    assert await guarded(order_id="1") == "order 1"
+    with signed_in(token("alice")):
+        assert await guarded(order_id="1") == "order 1"
 
 
 @pytest.mark.anyio

@@ -5,6 +5,32 @@ All notable changes to `mcp-gatehouse`. The public API (`Gatehouse`,
 
 ## Unreleased
 
+### Breaking: authorization is a runtime invariant
+
+Every tool call now needs a verified caller, an explicit policy, and a
+decision on the record it acts on. Anything missing fails closed. To
+migrate a server:
+
+- Give every tool `authorize=`: your policy, or `any_caller` where any
+  verified caller may use it. A tool without one raises at registration.
+- Over stdio, declare who calls are for: `Gatehouse(..., local_caller=Caller(...))`.
+  Without a token or a local caller, calls are denied. `local_caller`
+  never applies to an HTTP request.
+- Create the `Gatehouse` before registering any tool, and register every
+  tool through it. A server that already has tools is refused, and
+  `@mcp.tool()`, `add_tool`, `MCPServer(tools=...)` and extension tools
+  are refused on a gated server.
+- A WRITE or DESTRUCTIVE tool that loads a record needs
+  `consistency=`: `Transaction(...)`, `ConditionalWrite()` or
+  `AcceptRace("why")`, per tool or as the `Gatehouse` default.
+- A tool that returns a list of records needs `authorize_items=` (or
+  `any_item`).
+- Tool annotations must evaluate at registration. The gate reads them
+  with the defining scope's locals, so local classes and loaders work.
+- SDK `Resolve(...)` parameters are refused on gated tools: the SDK runs
+  them before the gate.
+- Requires `mcp>=2.3`.
+
 ### Added
 
 - Who each call was for. On servers that sign callers in with the MCP
@@ -18,6 +44,37 @@ All notable changes to `mcp-gatehouse`. The public API (`Gatehouse`,
   printable ASCII escaped and cut at 80 characters, so a crafted
   subject can't redraw the prompt or pass for someone else. Over stdio
   nobody signs in: there is no `caller`, and audit lines are unchanged.
+- `Load(loader)`: a parameter the gate fills. It loads the record from the
+  model's arguments, your policy decides on it, and the tool gets that same
+  object. Hidden from the input schema, and registration fails if the SDK
+  would ever expose it.
+- Policies return `Allow()`, `Deny(reason)` or `Ask(reason)`. `Ask` puts
+  the call to the approver with the reason. Every refusal on authorization
+  reads the same to the model, and the audit log keeps the real reason.
+- Approvals are bound to the record's state. If it changes while a person
+  decides, the call is refused. The approval form and terminal prompt show
+  the record (`Load(describe=...)`) and the reason.
+- `consistency=`: `Transaction(factory)` runs load, policy, tool and
+  commit in your transaction, never held open during an approval.
+  `ConditionalWrite()` with `Conflict`, and `AcceptRace(reason)`.
+  `current_transaction()` reaches the handle.
+- `authorize_items=` filters list results item by item, and `Scope(fn)`
+  passes a caller-computed query filter to the tool. Audit lines count
+  `withheld` and flag `scope_mismatch`.
+- `scopes=` on a tool, and token claims for policies
+  (`AuthorizationRequest.claims`, never logged).
+- Audit fields `authz`, `resources`, `items`, `consistency`, `withheld`,
+  `filter_errors`, `scope_mismatch`, outcome `conflict`, cancellation
+  reason `authorizing`, and `"source": "local"` for the local caller.
+- `examples/orders_postgres.py`: a transaction with row-level security and
+  `FOR UPDATE`.
+
+### Fixed
+
+- A tool annotated `ctx: Context | None` no longer gets a second, hidden
+  `gatehouse_context` parameter in its input schema that the model could
+  fill.
+- Redacted sets come out sorted, so they read the same in every process.
 
 ### Changed
 

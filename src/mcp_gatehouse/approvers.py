@@ -63,7 +63,7 @@ def terminal_approver(request: ApprovalRequest) -> bool:
                 return False
             tty.write(
                 f"\n⚠ approval needed → {request.tool} ({request.tier.value}) "
-                f"{request.arguments}{_for_whom(request.caller)}\nallow? [y/N] "
+                f"{request.arguments}{_on_what(request)}{_for_whom(request.caller)}\nallow? [y/N] "
             )
             tty.flush()
             left = _seconds_left(request)
@@ -81,6 +81,25 @@ def terminal_approver(request: ApprovalRequest) -> bool:
         return False
     finally:
         _tty_lock.release()
+
+
+def _on_what(request: ApprovalRequest) -> str:
+    """The prompt's lines for the records the call acts on and why it was
+    asked, or nothing. Shown as single lines, so a record can't redraw the
+    prompt."""
+    lines = ""
+    if request.resources:
+        lines += "\n  on " + " | ".join(_one_line(line) for line in request.resources)
+    if request.reason:
+        lines += "\n  asked because: " + _one_line(request.reason)
+    return lines
+
+
+def _one_line(text: str, limit: int = 200) -> str:
+    """``text`` on one line: line breaks, control and format characters
+    (bidi overrides among them) escaped, cut at ``limit``."""
+    shown = "".join(ch if ch.isprintable() else ch.encode("unicode_escape").decode("ascii") for ch in str(text))
+    return shown[:limit] + "…" if len(shown) > limit else shown
 
 
 def _for_whom(caller: Caller | None) -> str:
@@ -180,11 +199,18 @@ class _ApprovalForm(BaseModel):
 
 
 def _default_message(request: ApprovalRequest) -> str:
-    # Two lines, arguments on the second. Clients show only the start of a
-    # long message (Claude Code folds it after three lines), and what is
-    # being approved must never be in the folded part.
+    # At most three lines: the tool (and why it was asked), its arguments,
+    # and the records it acts on. Clients show only the start of a long
+    # message (Claude Code folds it after three lines), and what is being
+    # approved must never be in the folded part.
     arguments = json.dumps(request.arguments, ensure_ascii=False, default=str)
-    return f"The AI wants to run {request.tool} ({request.tier.value}) with:\n{arguments}"
+    head = f"The AI wants to run {request.tool} ({request.tier.value}) with:"
+    if request.reason:
+        head = f"Approval needed ({_one_line(request.reason, 120)}). {head}"
+    message = f"{head}\n{arguments}"
+    if request.resources:
+        message += "\non " + " | ".join(_one_line(line) for line in request.resources)
+    return message
 
 
 class ElicitationApprover:
@@ -271,8 +297,8 @@ class ElicitationApprover:
         message = self._message(request)
         age = _MAX_APPROVAL_AGE if timeout is None else timeout
         state = {
-            "v": 1,
-            "q": _digest(message),
+            "v": 2,
+            "q": _digest(message, request.binding),
             "nonce": secrets.token_urlsafe(16),
             "exp": time.time() + age,
         }
@@ -296,12 +322,12 @@ class ElicitationApprover:
         try:
             state = json.loads(context.request_state or "")
             nonce, expires, asked = state["nonce"], float(state["exp"]), state["q"]
-            if state["v"] != 1 or not isinstance(nonce, str):
+            if state["v"] != 2 or not isinstance(nonce, str):
                 return None
         except (ValueError, TypeError, KeyError):
             return None
         reply = (context.input_responses or {}).get(_INPUT_KEY)
-        if reply is None or asked != _digest(self._message(request)):
+        if reply is None or asked != _digest(self._message(request), request.binding):
             return None
         if not time.time() < expires:
             return False, "approval timed out"
@@ -331,5 +357,12 @@ class ElicitationApprover:
             return True
 
 
-def _digest(message: str) -> str:
-    return hashlib.sha256(message.encode("utf-8", "surrogatepass")).hexdigest()
+def _digest(message: str, binding: str | None) -> str:
+    """The question asked, bound to the state it was asked about.
+
+    The binding (caller, reason, a fingerprint of each record) is part of
+    the digest whatever the message says, so a custom ``message=`` that
+    leaves the record out still can't carry an answer over to a record
+    that changed."""
+    text = message + "\0" + (binding or "")
+    return hashlib.sha256(text.encode("utf-8", "surrogatepass")).hexdigest()

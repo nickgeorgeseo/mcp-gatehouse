@@ -75,6 +75,11 @@ migrate a server:
   `gatehouse_context` parameter in its input schema that the model could
   fill.
 - Redacted sets come out sorted, so they read the same in every process.
+- `Decimal`, `date`, `datetime` and `time` values are logged and shown to
+  approvers as their values, not `«opaque:…»`. They can't carry text, and
+  an approval's fingerprint has to see an amount change: before, an
+  approval for an $812 order still applied after the order changed to
+  $99,999.
 
 ### Changed
 

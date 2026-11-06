@@ -664,6 +664,44 @@ async def test_a_record_that_changes_during_approval_is_refused():
 
 
 @pytest.mark.anyio
+async def test_an_amount_that_changes_during_approval_is_refused():
+    """Found running examples/orders_postgres.py: a Decimal total was opaque to
+    the fingerprint, so an approval for $812 carried over to $99,999. No
+    describe= line here, so only the fingerprint can catch it."""
+    from decimal import Decimal
+
+    class Invoice(BaseModel):
+        id: str
+        owner: str
+        total: Decimal
+
+    log, ran = io.StringIO(), []
+    store = {"1": Invoice(id="1", owner="tester", total=Decimal("812"))}
+
+    async def approver(request: ApprovalRequest) -> bool:
+        store["1"] = store["1"].model_copy(update={"total": Decimal("99999")})
+        return True
+
+    mcp, gk = gated(Policy(approver=approver), log=log)
+
+    def load(invoice_id: str) -> Invoice | None:
+        return store.get(invoice_id)
+
+    def owners(request: AuthorizationRequest):
+        return Allow() if request.resources["invoice"].owner == request.caller.subject else Deny("not the owner")
+
+    @gk.tool(tier=AccessTier.DESTRUCTIVE, authorize=owners, consistency=AcceptRace("test"))
+    def pay(invoice_id: str, invoice: Annotated[Invoice, Load(load)]) -> str:
+        ran.append(invoice.total)
+        return "paid"
+
+    async with Client(mcp) as client:
+        result = await client.call_tool("pay", {"invoice_id": "1"})
+    assert result.is_error and ran == []
+    assert reasons(log) == [("denied", "resource changed while awaiting approval")]
+
+
+@pytest.mark.anyio
 async def test_a_record_that_becomes_forbidden_during_approval_is_refused():
     log, store = io.StringIO(), {"1": Order(id="1", owner="tester")}
 

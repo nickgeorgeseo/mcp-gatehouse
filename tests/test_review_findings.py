@@ -67,6 +67,20 @@ def test_opaque_objects_never_pass_through():
     assert safe["blob"] == "«opaque:bytes»"
 
 
+def test_numbers_and_dates_are_shown_as_values():
+    """A Decimal or a date can't carry free text, so it isn't opaque: the log
+    shows the amount, and an approval's fingerprint sees it change."""
+    import datetime
+    from decimal import Decimal
+
+    safe = redact_arguments(
+        {"amount": Decimal("812.50"), "due": datetime.date(2026, 11, 6),
+         "at": datetime.datetime(2026, 11, 6, 9, 30, tzinfo=datetime.timezone.utc)},
+        DEFAULT_REDACT,
+    )
+    assert safe == {"amount": "812.50", "due": "2026-11-06", "at": "2026-11-06T09:30:00+00:00"}
+
+
 def test_tuples_and_sets_are_recursed():
     safe = redact_arguments({"batch": ({"api_key": "k"},)}, DEFAULT_REDACT)
     assert safe["batch"][0]["api_key"] == REDACTED

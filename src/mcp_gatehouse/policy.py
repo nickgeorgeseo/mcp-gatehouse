@@ -169,13 +169,21 @@ def redact_arguments(arguments: dict[str, Any], keys: frozenset[str]) -> dict[st
     closed here too.
     """
     import dataclasses as _dc
+    import datetime as _dt
     from collections.abc import Mapping, Sequence
+    from decimal import Decimal
 
     lowered = {_normalize_key(k) for k in keys}
 
     def scrub(value: Any) -> Any:
         if value is None or isinstance(value, (str, int, float, bool)):
             return value
+        if isinstance(value, Decimal):
+            # Numbers and dates are shown as what they are: they can't carry
+            # text, and an approval's fingerprint must see an amount change.
+            return str(value)
+        if isinstance(value, (_dt.date, _dt.time)):  # datetime is a date
+            return value.isoformat()
         if isinstance(value, Mapping):
             return {
                 str(k): (REDACTED if _normalize_key(str(k)) in lowered else scrub(v))

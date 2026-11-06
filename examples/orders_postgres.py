@@ -15,9 +15,15 @@ and a database set up like this:
     ALTER TABLE orders FORCE ROW LEVEL SECURITY;
     CREATE POLICY own_orders ON orders
         USING (owner = current_setting('app.subject', true));
+    CREATE ROLE order_desk LOGIN PASSWORD '…';
+    GRANT SELECT, UPDATE ON orders TO order_desk;
 
-Connect as a role that doesn't own the table and has no BYPASSRLS, or the
-database's own policy doesn't apply.
+and `ORDERS_DSN` pointing at it as that role. Superusers and roles with
+BYPASSRLS skip row-level security even with FORCE, so never connect as one.
+
+Verified against Postgres 16: the list shows only the caller's rows,
+someone else's order reads as not found, approvals show the record, and a
+row edited while a person decides is asked about again.
 
 The three layers, strongest first:
 

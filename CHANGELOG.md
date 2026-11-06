@@ -3,6 +3,20 @@
 All notable changes to `mcp-gatehouse`. The public API (`Gatehouse`,
 `Policy`, `AuditLog`, `AccessTier`) stays compatible within a minor line.
 
+## Unreleased
+
+### Added
+
+- Who each call was for. On servers that sign callers in with the MCP
+  SDK's auth (a `token_verifier`, over streamable HTTP or SSE), every
+  audit line has a `caller` field: the verified token's `client_id`,
+  `subject`, `issuer` and `scopes`, never the token itself. It is read
+  per request, so a token refreshed mid-session is logged as the new
+  one. Approvers get the same as `ApprovalRequest.caller`, a new
+  `Caller` type, and `terminal_approver` shows it in the prompt. Over
+  stdio nobody signs in: there is no `caller`, and audit lines are
+  unchanged.
+
 ## 0.5.0 — 2026-11-02
 
 ### Added

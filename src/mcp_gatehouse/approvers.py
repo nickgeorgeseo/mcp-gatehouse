@@ -28,7 +28,7 @@ from mcp.server.elicitation import render_elicitation_schema
 from mcp_types.version import is_version_at_least
 from pydantic import BaseModel, Field, ValidationError
 
-from .policy import ApprovalRequest, Approver
+from .policy import ApprovalRequest, Approver, Caller
 
 # Approvers run in worker threads, so two gated calls can ask at once.
 # One prompt at a time, or the questions and answers interleave.
@@ -63,7 +63,7 @@ def terminal_approver(request: ApprovalRequest) -> bool:
                 return False
             tty.write(
                 f"\n⚠ approval needed → {request.tool} ({request.tier.value}) "
-                f"{request.arguments}\nallow? [y/N] "
+                f"{request.arguments}{_for_whom(request.caller)}\nallow? [y/N] "
             )
             tty.flush()
             left = _seconds_left(request)
@@ -81,6 +81,16 @@ def terminal_approver(request: ApprovalRequest) -> bool:
         return False
     finally:
         _tty_lock.release()
+
+
+def _for_whom(caller: Caller | None) -> str:
+    """The prompt's "for whom" line, or nothing when no one signed in (stdio)."""
+    if caller is None:
+        return ""
+    # repr, as the arguments get: these strings come from a token, and a
+    # control character in one must not get to redraw the prompt.
+    user = "a user the token doesn't name" if caller.subject is None else repr(caller.subject)
+    return f"\n  for {user} via client {caller.client_id!r}"
 
 
 def _seconds_left(request: ApprovalRequest) -> float | None:

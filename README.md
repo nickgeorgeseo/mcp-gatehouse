@@ -45,7 +45,7 @@ refused and one approved, and the audit log they left. No sound.
 |---|---|
 | **Permission tiers** | Every tool is declared `READ`, `WRITE`, or `DESTRUCTIVE` — and the tier also emits honest spec `ToolAnnotations` (`readOnlyHint` / `destructiveHint`), which the wrapper won't let you override to lie. |
 | **Approval gates** | Tiers you choose require a sign-off before the tool runs, asked right in the MCP client (Claude Code, Cursor, VS Code) or by any callable you write: a terminal prompt, a Slack ping, a ticket. **Fails closed:** a gated tool with no approver configured is denied, not waved through. |
-| **Audit log** | Append-only JSONL, one line per call — allowed, denied, failed, or cancelled — with UTC timestamps and durations. The answer to "what did the AI actually do?" six months later. |
+| **Audit log** | Append-only JSONL, one line per call — allowed, denied, failed, or cancelled — with UTC timestamps and durations, and, on servers that sign callers in, who each call was for. The answer to "what did the AI actually do, and for whom?" six months later. |
 | **Redaction** | Argument keys you name (`api_key`, `password`, `token`, `client_secret`, … by default) are masked before they reach the log *or* the approver — however they're spelled: `apiKey`, `API-Key` and `api_key` are the same key. |
 | **Denylist** | Block a tool outright, whatever its tier. |
 
@@ -174,6 +174,39 @@ tool can't be stopped partway: its worker thread runs to the end, and the
 line says `ok` or `error` as usual. The gate only writes the line; the
 cancellation goes on as it would without it.
 
+### Who the call was for
+
+On a server that signs callers in with the SDK's auth (a
+`token_verifier`, over streamable HTTP or SSE), every audit line also
+names the caller, taken from the access token the SDK verified for that
+request:
+
+```json
+{"ts": "2026-11-05T09:14:02+00:00", "tool": "cancel_order", "tier": "destructive", "outcome": "ok", "arguments": {"order_id": "4417"}, "duration_ms": 3.1, "caller": {"client_id": "support-agent", "subject": "alice", "issuer": "https://login.example.com", "scopes": ["orders:read", "orders:write"]}}
+```
+
+It is read per request, so a token the client refreshes mid-session is
+logged as the new one. Approvers get the same thing as `request.caller`
+(a `Caller`), and `terminal_approver` shows it in the prompt, so whoever
+signs off knows whose request it is. An approver can act on it too:
+
+```python
+async def approver(request: ApprovalRequest) -> bool:
+    if request.caller is None:
+        return False  # nobody signed in
+    # ask_in_slack and manager_of are yours to write.
+    return await ask_in_slack(request, notify=manager_of(request.caller.subject))
+```
+
+`subject` is only as good as your token verifier. Fill in
+`AccessToken.subject` (and `claims` with `iss`), or the log can name only
+the client application, not the person. The token itself is never
+logged. Over stdio nobody signs in, so there is no `caller` and the lines
+are as before.
+
+Naming the caller isn't deciding what they may touch. Whether alice may
+cancel order 4417 still has to be checked by your tool or your API.
+
 ## Try the demo
 
 The package ships a runnable order-desk server with all three tiers wired
@@ -253,9 +286,11 @@ template.
   or a full-screen program has it in raw mode. Asking in the client
   (elicitation) sidesteps the terminal entirely. When the approval must
   not come from the client, approve out-of-band: Slack, a ticket, a queue.
-- **What this is not:** authentication, transport encryption, or a sandbox.
-  It's a gate inside your server, not a perimeter around it. See
-  [SECURITY.md](SECURITY.md).
+- **What this is not:** authentication, transport encryption, a sandbox,
+  or a check on which records a caller may touch. It logs the caller the
+  SDK authenticated; your tools and APIs still decide what that caller is
+  allowed to do. It's a gate inside your server, not a perimeter around
+  it. See [SECURITY.md](SECURITY.md).
 
 ## Compatibility
 

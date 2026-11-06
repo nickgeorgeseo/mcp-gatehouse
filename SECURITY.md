@@ -11,10 +11,12 @@ give me a chance to ship the fix first.
 ## What this library does and doesn't do
 
 **Does:** enforce per-tool permission tiers, gate calls behind an approver
-you control, keep an append-only audit trail, and mask configured argument
-keys before they reach logs or approvers.
+you control, keep an append-only audit trail that names the caller when
+the MCP SDK has authenticated one, and mask configured argument keys
+before they reach logs or approvers.
 
-**Doesn't:** authenticate clients, encrypt transports, sandbox tool code,
-or protect against a malicious *server author*. It's a gate inside your
+**Doesn't:** authenticate clients (it reads the identity the SDK's auth
+verified), decide which records a caller may touch, encrypt transports,
+sandbox tool code, or protect against a malicious *server author*. It's a gate inside your
 server, not a perimeter around it. Treat third-party MCP servers with the
 same scrutiny you'd give any software you install.

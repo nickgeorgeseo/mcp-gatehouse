@@ -28,6 +28,33 @@ class AccessTier(enum.Enum):
 
 
 @dataclass(frozen=True)
+class Caller:
+    """Who a call was made for: the identity in the request's access token.
+
+    Taken from the token the MCP SDK verified for this request, so it is
+    only present on transports with authentication (streamable HTTP or SSE
+    with a ``token_verifier``). Over stdio there is no token and no caller.
+
+    It is only as specific as your token verifier makes it. ``subject`` is
+    the user the token speaks for; a verifier that doesn't fill in
+    ``AccessToken.subject`` leaves it ``None``, and then all you know is
+    the client application. The token itself is never kept.
+    """
+
+    client_id: str
+    """The OAuth client (the application) the token was issued to."""
+
+    subject: str | None = None
+    """The token's ``sub``: the user it acts for. Unique only per issuer."""
+
+    issuer: str | None = None
+    """The token's ``iss`` claim, when the verifier supplies claims."""
+
+    scopes: tuple[str, ...] = ()
+    """The scopes the token was granted."""
+
+
+@dataclass(frozen=True)
 class ApprovalRequest:
     """What an approver sees before a gated tool runs.
 
@@ -42,6 +69,10 @@ class ApprovalRequest:
     """``time.monotonic()`` value at which the gate stops waiting and denies
     the call, or ``None`` for no limit. An approver that blocks — a prompt,
     a poll — should give up by then: past it, its answer is ignored."""
+
+    caller: Caller | None = None
+    """Who the call is for, from the request's verified access token, or
+    ``None`` when the transport has no authentication (stdio)."""
 
 
 Approver = Callable[[ApprovalRequest], Union[bool, Awaitable[bool]]]

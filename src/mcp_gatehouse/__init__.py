@@ -15,6 +15,7 @@ from .policy import (
     AccessTier,
     ApprovalRequest,
     Approver,
+    Caller,
     Policy,
     redact_arguments,
 )
@@ -25,6 +26,7 @@ __all__ = [
     "ApprovalRequest",
     "Approver",
     "AuditLog",
+    "Caller",
     "ElicitationApprover",
     "GateDenied",
     "Gatehouse",

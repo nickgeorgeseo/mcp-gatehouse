@@ -2,7 +2,8 @@
 
 Wrap an ``MCPServer``, register tools through the gatekeeper instead of
 directly, and every call gets: denylist enforcement, approval gates on the
-tiers you choose, redacted audit logging, and spec ``ToolAnnotations``
+tiers you choose, redacted audit logging (naming the caller when the
+transport authenticates one), and spec ``ToolAnnotations``
 (``readOnlyHint`` / ``destructiveHint``) derived from the tier — so MCP
 clients see honest hints without you hand-writing them.
 """
@@ -10,6 +11,7 @@ clients see honest hints without you hand-writing them.
 from __future__ import annotations
 
 import copy
+import dataclasses
 import functools
 import inspect
 import time
@@ -17,13 +19,15 @@ from typing import Any, Callable, TypeVar
 
 import anyio
 import anyio.to_thread
+from mcp.server.auth.middleware.auth_context import get_access_token
+from mcp.server.auth.provider import principal_components
 from mcp.server.mcpserver import Context, MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 from mcp.types import InputRequiredResult, ToolAnnotations
 
 from .approvers import ElicitationApprover
 from .audit import AuditLog, NullAuditLog
-from .policy import AccessTier, ApprovalRequest, Policy, redact_arguments
+from .policy import AccessTier, ApprovalRequest, Caller, Policy, redact_arguments
 
 F = TypeVar("F", bound=Callable[..., Any])
 
@@ -135,7 +139,15 @@ class Gatehouse:
         # call's one multi-round channel, so the gate can't ask over it.
         round_trip = not _runs_own_rounds(fn)
 
-        async def enforce(safe_args: dict[str, Any], context: Context | None) -> InputRequiredResult | None:
+        def record(caller: Caller | None, **event: Any) -> None:
+            """One audit line for this tool, naming the caller when there is one."""
+            if caller is not None:
+                event["caller"] = dataclasses.asdict(caller)
+            audit.record(tool=tool_name, tier=tier.value, **event)
+
+        async def enforce(
+            safe_args: dict[str, Any], context: Context | None, caller: Caller | None
+        ) -> InputRequiredResult | None:
             """Raise GateDenied unless the policy allows this call.
 
             Returns an ``InputRequiredResult`` instead when the approval is
@@ -147,10 +159,7 @@ class Gatehouse:
 
             def denied(reason: str, message: str) -> GateDenied:
                 """Record the denial; return the error that tells the model why."""
-                audit.record(
-                    tool=tool_name, tier=tier.value, outcome="denied",
-                    reason=reason, arguments=safe_args,
-                )
+                record(caller, outcome="denied", reason=reason, arguments=safe_args)
                 return GateDenied(message)
 
             if tool_name in policy.deny:
@@ -176,6 +185,7 @@ class Gatehouse:
                 # what the audit log records.
                 arguments=copy.deepcopy(safe_args),
                 deadline=None if timeout is None else time.monotonic() + timeout,
+                caller=caller,
             )
             ask = functools.partial(policy.approver, request)
             if isinstance(policy.approver, ElicitationApprover):
@@ -187,8 +197,8 @@ class Gatehouse:
                         # The call ends here for now, and the client calls
                         # again with the answer. If it never does, this line
                         # is the record that it was asked.
-                        audit.record(
-                            tool=tool_name, tier=tier.value, outcome="pending",
+                        record(
+                            caller, outcome="pending",
                             reason="approval asked in client", arguments=safe_args,
                         )
                         return elicitor.question(request, timeout)
@@ -230,10 +240,7 @@ class Gatehouse:
                 # sees it, and the gate's own timeout never gets this far:
                 # move_on_after catches that one. Log it, then let it carry
                 # on as is: swallowing it would keep a cancelled task running.
-                audit.record(
-                    tool=tool_name, tier=tier.value, outcome="cancelled",
-                    reason="awaiting approval", arguments=safe_args,
-                )
+                record(caller, outcome="cancelled", reason="awaiting approval", arguments=safe_args)
                 raise
             if waiting.cancelled_caught:
                 raise denied(
@@ -249,7 +256,9 @@ class Gatehouse:
             arguments: dict[str, Any], args: tuple, kwargs: dict[str, Any], context: Context | None
         ) -> Any:
             safe_args = redact_arguments(arguments, policy.redact)
-            question = await enforce(safe_args, context)
+            # Read once, so every line this call writes names the same caller.
+            caller = _current_caller()
+            question = await enforce(safe_args, context, caller)
             if question is not None:
                 return question
             start = time.perf_counter()
@@ -260,23 +269,21 @@ class Gatehouse:
                 # routinely embed argument values ("invalid api key: sk-…"),
                 # which would defeat redaction. The client still receives the
                 # full message through the normal tool-error path.
-                audit.record(
-                    tool=tool_name, tier=tier.value, outcome="error",
-                    reason=type(exc).__name__, arguments=safe_args,
+                record(
+                    caller, outcome="error", reason=type(exc).__name__, arguments=safe_args,
                     duration_ms=round((time.perf_counter() - start) * 1000, 2),
                 )
                 raise
             except anyio.get_cancelled_exc_class():
                 # Cancelled mid-run, as in enforce. The tool may have done
                 # part of its work, which is exactly what the trail is for.
-                audit.record(
-                    tool=tool_name, tier=tier.value, outcome="cancelled",
-                    reason="tool running", arguments=safe_args,
+                record(
+                    caller, outcome="cancelled", reason="tool running", arguments=safe_args,
                     duration_ms=round((time.perf_counter() - start) * 1000, 2),
                 )
                 raise
-            audit.record(
-                tool=tool_name, tier=tier.value, outcome="ok", arguments=safe_args,
+            record(
+                caller, outcome="ok", arguments=safe_args,
                 duration_ms=round((time.perf_counter() - start) * 1000, 2),
             )
             return result
@@ -325,6 +332,21 @@ class Gatehouse:
             guarded.__annotations__ = {**getattr(fn, "__annotations__", {}), _CONTEXT_PARAM: Context}
 
         return guarded
+
+
+def _current_caller() -> Caller | None:
+    """Who this request is for, from the access token the SDK verified for it.
+
+    The SDK's auth middleware puts each HTTP request's verified token in a
+    context variable that tool calls inherit, so this is the current
+    request's token, also after a client refreshes it mid-session. ``None``
+    on transports without authentication. The token string is not kept.
+    """
+    token = get_access_token()
+    if token is None:
+        return None
+    client_id, issuer, subject = principal_components(token)
+    return Caller(client_id=client_id, subject=subject, issuer=issuer, scopes=tuple(token.scopes))
 
 
 def _refusal(tool_name: str, reason: str) -> str:

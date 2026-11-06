@@ -541,6 +541,7 @@ they aren't there, creating a `Gatehouse` raises rather than run unguarded. Ship
 
 | `mcp-gatehouse` | SDK | Server class |
 |---|---|---|
+| `0.6.x` | `mcp>=2.3,<3` | `MCPServer` |
 | `0.5.x` | `mcp>=2,<3` | `MCPServer` |
 | `0.4.x` | `mcp>=2,<3` | `MCPServer` |
 | `0.3.x` | `mcp>=2,<3` | `MCPServer` |
@@ -548,9 +549,10 @@ they aren't there, creating a `Gatehouse` raises rather than run unguarded. Ship
 | `0.1.x` | `mcp>=1.27,<2` | `FastMCP` |
 
 The public API (`Gatehouse`, `Policy`, `AuditLog`, `AccessTier`) is
-unchanged across that line, as promised. The authorization invariant (not
-yet released) is the deliberate exception: every tool now needs
-`authorize=`, and a server needs a verified or declared caller. See
+unchanged across that line, as promised, with one deliberate exception:
+0.6.0's authorization invariant. Every tool now needs `authorize=`, a
+server needs a verified or declared caller, and a WRITE or DESTRUCTIVE
+tool that loads a record needs `consistency=`. See
 [CHANGELOG.md](CHANGELOG.md) for the migration. Porting a v1 server is two
 import edits — `FastMCP` became `MCPServer` and moved to
 `mcp.server.mcpserver`; see the SDK's

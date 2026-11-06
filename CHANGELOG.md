@@ -2,10 +2,10 @@
 
 All notable changes to `mcp-gatehouse`. The public API (`Gatehouse`,
 `Policy`, `AuditLog`, `AccessTier`) stays compatible within a minor line,
-with one deliberate exception: the authorization invariant below is
+with one deliberate exception: 0.6.0's authorization invariant is
 breaking, and its release notes say how to migrate.
 
-## Unreleased
+## 0.6.0 — 2026-11-06
 
 ### Breaking: authorization is a runtime invariant
 
@@ -15,9 +15,11 @@ migrate a server:
 
 - Give every tool `authorize=`: your policy, or `any_caller` where any
   verified caller may use it. A tool without one raises at registration.
-- Over stdio, declare who calls are for: `Gatehouse(..., local_caller=Caller(...))`.
-  Without a token or a local caller, calls are denied. `local_caller`
-  never applies to an HTTP request.
+- Over stdio, and for in-memory clients, declare who calls are for:
+  `Gatehouse(..., local_caller=Caller(...))`. Without a token or a local
+  caller, calls are denied. `local_caller` never applies to an HTTP
+  request: an HTTP request without a verified token is denied even on a
+  server that declares one.
 - Create the `Gatehouse` before registering any tool, and register every
   tool through it. A server that already has tools is refused, and
   `@mcp.tool()`, `add_tool`, `MCPServer(tools=...)` and extension tools
@@ -25,12 +27,25 @@ migrate a server:
 - A WRITE or DESTRUCTIVE tool that loads a record needs
   `consistency=`: `Transaction(...)`, `ConditionalWrite()` or
   `AcceptRace("why")`, per tool or as the `Gatehouse` default.
-- A tool that returns a list of records needs `authorize_items=` (or
-  `any_item`).
+- A tool that returns a list of records (`list[T]`, `tuple[T, ...]` or
+  `Sequence[T]` of Pydantic models, dataclasses, TypedDicts or mappings)
+  needs `authorize_items=` (or `any_item`). `authorize_items` on a tool
+  that returns anything else is refused.
+- A `Load` parameter on a tier that requires approval must be a Pydantic
+  model, a dataclass, a TypedDict or a mapping, or give
+  `Load(..., fingerprint=...)`, so the approval can bind to the record's
+  state. Anything else is refused at registration.
+- A `Load` or `Scope` parameter can't have a default, can't be
+  positional-only or variadic, and must carry the marker as its own
+  `Annotated[...]` metadata, not nested in another type. A loader's
+  parameters must name the tool's own arguments.
 - Tool annotations must evaluate at registration. The gate reads them
   with the defining scope's locals, so local classes and loaders work.
 - SDK `Resolve(...)` parameters are refused on gated tools: the SDK runs
   them before the gate.
+- A custom audit class whose `record` lists fixed keywords needs
+  `**kwargs`: the gate now passes `caller`, `authz`, `resources`,
+  `items`, `consistency`, `withheld` and more.
 - Requires `mcp>=2.3`.
 
 ### Added

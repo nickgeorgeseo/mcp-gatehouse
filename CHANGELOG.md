@@ -112,6 +112,12 @@ migrate a server:
 - `examples/orders_postgres.py`: a transaction with row-level security and
   `FOR UPDATE`.
 
+### Docs
+
+- README: "Where it sits" places the gate next to agent-framework
+  approvals and gateways and policy services, by what each layer sees,
+  and says what the library is not by design.
+
 ### Fixed
 
 - A tool annotated `ctx: Context | None` no longer gets a second, hidden

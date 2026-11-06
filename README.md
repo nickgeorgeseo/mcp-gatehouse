@@ -157,6 +157,40 @@ log shows it:
 | Item filtering | tools returning a list of records | `authorize_items=` | `authorize_items=any_item` | `items: "open"` |
 | Check and write in one unit | WRITE/DESTRUCTIVE tools that `Load` | `consistency=` (per tool, or on the `Gatehouse`) | `consistency=AcceptRace("why")` | `consistency: "accept-race"` and the reason |
 
+### Where it sits
+
+Three layers can say no to a tool call. They see different things, and
+they don't compete:
+
+- **Agent-framework approvals** live in the agent process, beside the
+  model. They see the tool's name and the arguments the model proposed,
+  and can ask a person before the call leaves the agent. They don't see
+  the record, and a server reached by another client never meets them.
+- **Gateways, proxies and policy services** sit in front of the server.
+  They see the token, the tool name and the arguments, so they can decide
+  which clients reach which tools, enforce scopes, rate-limit, and route.
+  They don't see the record either, and whether the tool behind them
+  checks it is up to that server.
+- **The gate** is the check inside the server, on the record the call is
+  about, for the caller the transport verified. The layers in front
+  assume someone writes that check. This is the one that makes writing
+  it mandatory: a tool without a policy doesn't register.
+
+Use all three. An identity layer issues the token the SDK verifies and the
+gate reads. A gateway narrows what reaches the server. Framework approvals
+catch the agent's own mistakes early and cheaply. The gate decides on the
+record, and keeps the trail. A team with a central policy engine keeps
+its rules there and lets the gate call it:
+[`examples/policy_opa.py`](examples/policy_opa.py) and
+[`examples/policy_cerbos.py`](examples/policy_cerbos.py) send the caller,
+the tool, the action and the loaded record to the engine, and an engine
+that can't be reached is a denial.
+
+By design, `mcp-gatehouse` is none of the other layers. It is not a
+proxy or a gateway, has no control plane, mints or exchanges no tokens,
+and has no policy language: policies are Python, or a call to the engine
+you already run.
+
 ### Policies
 
 A policy is any callable, sync or async, that takes an

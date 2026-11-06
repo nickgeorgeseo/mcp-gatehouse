@@ -52,6 +52,8 @@ dev = [
     # Imported by the tests' HTTP fixtures (tests/_support.py).
     "uvicorn",
     "httpx2",
+    # tests/conftest.py checks every audit line against docs/audit-line.schema.json.
+    "jsonschema>=4",
     "build",
     # <7 monkeypatches packaging to cap Metadata-Version at 2.4, which
     # rejects the 2.5 metadata hatchling emits.

@@ -50,6 +50,17 @@ migrate a server:
 
 ### Added
 
+- Audit sinks. `AuditLog(sink=...)` hands each record, as a dict, to
+  anything with a `write(record)` method (the `AuditSink` protocol), as
+  an alternative to `path=` and `stream=`. Two sinks ship with the
+  library: `JsonlSink`, the JSON-lines file or stream that `path=` and
+  `stream=` use, and `CallableSink(fn)`. A sink that raises doesn't lose
+  the record: it is written to stderr as one JSON line with a
+  `sink_error` field naming the exception type, and the call goes on.
+  The record's fields are documented in the README, field by field, and
+  in `docs/audit-line.schema.json`, a JSON Schema the test suite checks
+  every audit line against. `examples/audit_otel.py` forwards records to
+  OpenTelemetry logs.
 - Who each call was for. On servers that sign callers in with the MCP
   SDK's auth (a `token_verifier`, over streamable HTTP or SSE), every
   audit line has a `caller` field: the verified token's `client_id`,
@@ -100,6 +111,10 @@ migrate a server:
 
 ### Changed
 
+- An audit log whose destination fails (a full disk, a closed stream, a
+  sink that raises) no longer raises out of the call. The line goes to
+  stderr with `sink_error`, and the call's outcome is what it would have
+  been.
 - On servers that sign callers in, the audit object's `record()` gets a
   `caller` keyword. `AuditLog` takes any keywords; a custom audit class
   whose `record` lists fixed keywords needs `**kwargs`, or calls fail

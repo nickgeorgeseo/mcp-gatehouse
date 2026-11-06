@@ -51,7 +51,7 @@ refused and one approved, and the audit log they left. No sound.
 | **Lists filtered per item** | A tool that returns records gets each one checked: what the caller may not see never reaches the model. |
 | **Permission tiers** | Every tool is declared `READ`, `WRITE`, or `DESTRUCTIVE` — and the tier also emits honest spec `ToolAnnotations` (`readOnlyHint` / `destructiveHint`), which the wrapper won't let you override to lie. |
 | **Approval gates** | Tiers you choose require a sign-off before the tool runs, asked right in the MCP client (Claude Code, Cursor, VS Code) or by any callable you write: a terminal prompt, a Slack ping, a ticket. **Fails closed:** a gated tool with no approver configured is denied, not waved through. |
-| **Audit log** | Append-only JSONL, one line per call — allowed, denied, failed, or cancelled — with UTC timestamps and durations, who each call was for, and the policy's real reason for every refusal. The answer to "what did the AI actually do, and for whom?" six months later. |
+| **Audit log** | One record per call — allowed, denied, failed, or cancelled — with UTC timestamps and durations, who each call was for, and the policy's real reason for every refusal, in a [documented schema](docs/audit-line.schema.json). Append-only JSONL by default, or any sink you give it: a function, OpenTelemetry, your logging pipeline. The answer to "what did the AI actually do, and for whom?" six months later. |
 | **Redaction** | Argument keys you name (`api_key`, `password`, `token`, `client_secret`, … by default) are masked before they reach the log *or* the approver — however they're spelled: `apiKey`, `API-Key` and `api_key` are the same key. |
 | **Denylist** | Block a tool outright, whatever its tier. |
 
@@ -362,7 +362,9 @@ from mcp_gatehouse import DEFAULT_REDACT
 Policy(redact=DEFAULT_REDACT | {"card_pin"}, ...)
 ```
 
-What the audit trail looks like:
+### The audit log
+
+One record per call, whatever happened to it:
 
 ```json
 {"ts": "2026-11-06T14:02:11+00:00", "tool": "list_orders", "tier": "read", "outcome": "ok", "arguments": {}, "duration_ms": 0.31, "withheld": 1, "caller": {"client_id": "local", "subject": "alice", "issuer": null, "scopes": [], "source": "local"}, "authz": "open"}
@@ -371,23 +373,72 @@ What the audit trail looks like:
 {"ts": "2026-11-06T14:05:40+00:00", "tool": "cancel_order", "tier": "destructive", "outcome": "denied", "reason": "approver refused", "arguments": {"order_id": "4417"}, "caller": {…}, "authz": "ask", "resources": {"order": {"order_id": "4417"}}, "consistency": "conditional"}
 ```
 
-`outcome` is `ok`, `denied` (`reason` says why), `error` (the tool
-raised; `reason` is the exception type), `conflict` (a conditional write
-matched nothing because the record changed), `pending`, or `cancelled`.
-`authz` is the policy's decision: `allow`, `ask`, `deny`, or `open` for an
-`any_caller` tool. `resources` names the arguments each record was loaded
-from, never the record itself. `withheld` counts the items a list tool
-returned that the caller may not see.
-`pending` is a call whose approval was asked in the client over the
+The fields, and when each appears. The same table, as a JSON Schema the
+test suite checks every line against, is
+[`docs/audit-line.schema.json`](docs/audit-line.schema.json). No other
+field is ever written.
+
+| Field | Type | When |
+|---|---|---|
+| `ts` | string, ISO-8601 UTC | always |
+| `tool` | string | always |
+| `tier` | `"read"`, `"write"`, `"destructive"` or `null` | always; `null` only for an ungated tool |
+| `outcome` | `"ok"`, `"denied"`, `"error"`, `"conflict"`, `"pending"`, `"cancelled"` | always |
+| `reason` | string | every outcome but `ok`. Denials carry the gate's real reason; errors carry the exception type only, never its message; cancellations say the stage |
+| `arguments` | object | always: the model's arguments after redaction. Never what the gate filled |
+| `duration_ms` | number | `ok`, `conflict`, and `error` or `cancelled` lines whose reason says the tool was running |
+| `caller` | object: `client_id`, `subject`, `issuer`, `scopes`, and `source: "local"` for a declared local caller | once a caller is known: every line but the `ungated tool` and `no verified caller` denials |
+| `authz` | `"allow"`, `"ask"`, `"deny"`, `"open"` | once the policy decided (`open` for `any_caller`). Absent on lines written before it ran: denylist, no caller, missing scope, loader error, not found |
+| `resources` | object: each `Load` parameter's name mapped to the redacted arguments it was loaded from | every line of a tool that loads records. Never the record itself |
+| `items` | `"open"` | every line of a tool with `authorize_items=any_item` |
+| `consistency` | `"transaction"`, `"conditional"`, `"accept-race"` | every line of a tool with `consistency=`, its own or the `Gatehouse` default |
+| `consistency_reason` | string | with `"accept-race"` |
+| `withheld` | integer | `ok` lines of a tool with an item policy: items the caller may not see, removed |
+| `filter_errors` | integer | with `withheld`, when the item policy raised on some items |
+| `scope_mismatch` | `true` | with `withheld`, when a `Scope` was in force: the query and the policy disagree |
+| `sink_error` | string | only on the stderr copy of a line whose sink raised: the exception type |
+
+The outcomes: `ok`, the tool ran. `denied`, the gate refused, and `reason`
+says why. `error`, the tool raised, or the transaction or item filtering
+failed. `conflict`, a conditional write matched nothing because the
+record changed. `pending`, the approval was asked in the client over the
 2026-07-28 round trip: the verdict follows on a line of its own when the
 client comes back, so a `pending` line with nothing after it is a question
-nobody answered. `cancelled` means the client gave
-up, or the server shut down, before the call finished. `reason` says
-when. `authorizing` and `awaiting approval` mean the tool never ran. `tool running` comes
-with `duration_ms`, and the tool may have done part of its work. A sync
-tool can't be stopped partway: its worker thread runs to the end, and the
-line says `ok` or `error` as usual. The gate only writes the line; the
-cancellation goes on as it would without it.
+nobody answered. `cancelled`, the client gave up or the server shut down
+before the call finished: `reason` says when. `authorizing` and `awaiting
+approval` mean the tool never ran. `tool running` comes with `duration_ms`,
+and the tool may have done part of its work. A sync tool can't be stopped
+partway: its worker thread runs to the end, and the line says `ok` or
+`error` as usual. The gate only writes the line; the cancellation goes on
+as it would without it.
+
+#### Sinks
+
+`AuditLog(path=...)` appends JSON lines to a file, and `AuditLog(stream=...)`
+to a text stream. `AuditLog(sink=...)` hands each record, as a dict, to
+anything with a `write(record)` method:
+
+```python
+from mcp_gatehouse import AuditLog, CallableSink
+
+AuditLog(sink=CallableSink(queue.put))                      # your own function
+AuditLog(sink=CallableSink(lambda r: log.info("audit", extra=r)))  # the logging module
+```
+
+Two sinks ship with the library, neither needing anything beyond it:
+`JsonlSink(path=...)` or `JsonlSink(stream=...)`, which is what `path=`
+and `stream=` use, and `CallableSink(fn)`. For OpenTelemetry logs, copy
+[`examples/audit_otel.py`](examples/audit_otel.py): one log record per
+audit record, the record as the body and the fields worth filtering on as
+attributes. An HTTP collector or a logging pipeline is a `CallableSink`
+away.
+
+Records reach the sink one at a time, so it needn't be thread-safe. A sink
+that raises doesn't lose the record and doesn't fail the call: the gate
+writes the line to stderr with a `sink_error` field naming the exception
+type, and goes on. Watch stderr for `sink_error` if the sink is the only
+copy of the trail. `AuditLog.close()` calls the sink's `close()` when it
+has one.
 
 ### Who the call was for
 

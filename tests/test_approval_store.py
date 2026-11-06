@@ -187,9 +187,8 @@ def test_sqlite_store_is_single_use_across_two_processes(tmp_path):
     db = tmp_path / "approvals.db"
     load_example().SqliteApprovalStore(db)  # create the table before the race
     nonces = [f"nonce-{i}" for i in range(40)]
-    command = [sys.executable, "-I", str(EXAMPLE), str(db), *nonces]
-    env = {**os.environ, "PYTHONPATH": str(Path(__file__).resolve().parent.parent / "src")}
-    procs = [subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env) for _ in range(2)]
+    command = [sys.executable, "-I", str(EXAMPLE), str(db), *nonces]  # the example is standard library only
+    procs = [subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True) for _ in range(2)]
     outputs = [p.communicate(timeout=60) for p in procs]
     for (out, err), p in zip(outputs, procs):
         assert p.returncode == 0, err

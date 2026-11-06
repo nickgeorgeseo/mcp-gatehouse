@@ -540,6 +540,26 @@ arguments: keep the log's retention in line with that. Over stdio nobody
 signs in: the lines name the `local_caller` the server declared, marked
 `"source": "local"`, and without one every call is denied.
 
+### What the gate verifies, and what it trusts
+
+The gate checks these itself, every call: the tool was registered through
+it and has a policy; the request has a caller; the loader ran and found
+the record; the policy ran on that record and returned a decision; an
+approval answers the question asked, about the record in the state it was
+asked about, once; and nothing the gate fills came from the model. The
+rest it takes on trust from something you configured. Each row says what
+to do when that trust isn't acceptable.
+
+| Taken on trust | What the gate relies on | When that isn't acceptable |
+|---|---|---|
+| **The token verifier** | Over HTTP the caller is whatever the SDK's `token_verifier` says: `client_id`, `subject`, `issuer`, `scopes`, `claims`. The gate never sees the token and checks no signature itself. | Use a verifier that checks signature, issuer, audience and expiry against your identity provider, and fills in `subject`. Have policies check `claims` (`act`, `authorization_details`) so a token's rights are as narrow as the task. |
+| **`local_caller` over stdio** | Whoever starts the server process is that caller. The gate can't tell the user from another program running under their account. | Serve over streamable HTTP with the SDK's auth and drop `local_caller`, so each caller is a verified token. Over stdio, restrict who can run the server at the operating-system level, and keep DESTRUCTIVE tools behind an approver. |
+| **The client showing elicitation forms to a person** | `ElicitationApprover` verifies that the answer is to its question, in time, once. It can't see whether a person ticked the box: a client or hook set to accept forms on its own approves too. | Use an out-of-band approver (Slack, a ticket, a queue) where neither the model nor the client can answer, as `fallback` or instead. For the tools that matter most, do that whatever the client. |
+| **The `ConditionalWrite` promise** | You promise the write carries the checked state in its own condition and raises `Conflict` when it matches nothing. The gate can't read your query. | Use `Transaction(...)`: the gate runs load, policy, tool and commit in your transaction, and a row locked in the loader can't change under the write. |
+| **`AcceptRace`** | You accept that the record may change between the check and the write, for the reason you gave. The gate only records it on every line. | Don't. Close the window with `Transaction(...)` or `ConditionalWrite()`; `AcceptRace` is for the cases where a race is harmless, and the audit log is where you justify that. |
+| **Your loader and your policy** | The record is what the loader returned; the decision is what the policy returned. A loader that reads the wrong row, or a policy with a hole, is enforced faithfully. | Load through the database's own access control (row-level security under the caller's identity, as `examples/orders_postgres.py` does), so a wrong query returns nothing rather than someone else's record. Keep `authorize_items` on list tools and alarm on `withheld` above zero. |
+| **The audit sink and the approval store** | A sink that raises gets its line on stderr; a store that raises denies the call. Where the records then go, and whether the store is shared by every replica, is the deployment's. | Ship the sink's output somewhere append-only and read `sink_error` from stderr. Share the approval store (`examples/approval_store_sqlite.py`) wherever the SDK's request-state key is shared. |
+
 ## Try the demo
 
 The package ships a runnable order-desk server with all three tiers wired

@@ -117,6 +117,12 @@ migrate a server:
 - README: "Where it sits" places the gate next to agent-framework
   approvals and gateways and policy services, by what each layer sees,
   and says what the library is not by design.
+- README: "What the gate verifies, and what it trusts" lists, in a table,
+  what the gate checks itself and what it takes on trust (the SDK's token
+  verifier, `local_caller` over stdio, the client showing elicitation
+  forms to a person, the `ConditionalWrite` promise, `AcceptRace`, the
+  loader and policy, the audit sink and approval store), and what to do
+  when that trust isn't acceptable.
 
 ### Fixed
 

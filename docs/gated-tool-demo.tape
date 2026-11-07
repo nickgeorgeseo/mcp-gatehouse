@@ -15,7 +15,7 @@ Set Theme "Catppuccin Mocha"
 Set TypingSpeed 45ms
 
 Hide
-Type `note() { printf '\033[1A\033[2K\033[1;33m\xe2\x96\xb6 %s\033[0m\n' "$*"; }; REPO=$PWD; cd "$(mktemp -d)"; cp "$REPO/docs/tool-calls-client.py" "$REPO/docs/typewriter.py" "$REPO/examples/gated_tool.py" .; source "$REPO/.venv/bin/activate"; clear`
+Type `note() { local msg="$*"; local cols; cols=$(stty size 2>/dev/null | cut -d" " -f2); cols=${cols:-${COLUMNS:-143}}; local rows=$(( (${#msg} + 18 + cols - 1) / cols )); printf '\033[%dA\033[J\033[1;33m\xe2\x96\xb6 %s\033[0m\n' "$rows" "$msg"; }; REPO=$PWD; cd "$(mktemp -d)"; cp "$REPO/docs/tool-calls-client.py" "$REPO/docs/typewriter.py" "$REPO/examples/gated_tool.py" .; source "$REPO/.venv/bin/activate"; clear`
 Enter
 Sleep 500ms
 Show
@@ -92,5 +92,8 @@ Enter
 Wait+Screen /conditional/
 Sleep 2s
 Type `note "Audit: every call, the policy's decision, the real reason, and who it was for."`
+Enter
+Sleep 3s
+Type `note "The same record goes to any sink: AuditLog(sink=...). Its shape is documented in docs/audit-line.schema.json."`
 Enter
 Sleep 6s

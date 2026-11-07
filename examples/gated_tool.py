@@ -47,6 +47,7 @@ def owner_only(request: AuthorizationRequest) -> Allow | Deny:
     if order.owner != request.caller.subject:
         return Deny("not the owner")
     return Allow()
+#> Or keep the rule in OPA or Cerbos: examples/policy_opa.py sends the caller and the loaded record to the engine. Unreachable means Deny.
 
 # --- 4. The gate
 # Build the server as the SDK docs show, then put the gate in front of it.
@@ -56,9 +57,11 @@ gatehouse = Gatehouse(
     # DESTRUCTIVE tools need a person's approval, asked in the client's own UI.
     #> Approval gates and tiers: the framework's mechanisms, enforced in the server instead of the prompt.
     policy=Policy(approver=ElicitationApprover()),
+    #> Many replicas? ElicitationApprover(store=...) shares used approvals: one approval, one run. examples/approval_store_sqlite.py
     # One JSON line per call: allowed, denied, failed or cancelled.
     #> Audit: what did the AI do, and for whom.
     audit=AuditLog(path="audit.jsonl"),
+    #> Or AuditLog(sink=...): the same record to OpenTelemetry, a queue or your logging pipeline. examples/audit_otel.py
     # Over stdio nobody signs in, so the server declares who its calls are for.
     #> Delegated identity: over HTTP the caller comes from the verified token. No god-mode service account.
     local_caller=Caller(client_id="local", subject="nick"),

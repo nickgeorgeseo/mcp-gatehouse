@@ -17,7 +17,7 @@ Set Theme "Catppuccin Mocha"
 Set TypingSpeed 45ms
 
 Hide
-Type `note() { printf '\033[1A\033[2K\033[1;33m\xe2\x96\xb6 %s\033[0m\n' "$*"; }; REPO=$PWD; cd "$(mktemp -d)"; cp "$REPO/docs/tool-calls-client.py" .; source "$REPO/.venv/bin/activate"; clear`
+Type `note() { local msg="$*"; local cols; cols=$(stty size 2>/dev/null | cut -d" " -f2); cols=${cols:-${COLUMNS:-143}}; local rows=$(( (${#msg} + 18 + cols - 1) / cols )); printf '\033[%dA\033[J\033[1;33m\xe2\x96\xb6 %s\033[0m\n' "$rows" "$msg"; }; REPO=$PWD; cd "$(mktemp -d)"; cp "$REPO/docs/tool-calls-client.py" "$REPO/docs/audit-line.schema.json" .; source "$REPO/.venv/bin/activate"; clear`
 Enter
 Sleep 500ms
 Show
@@ -129,4 +129,45 @@ Enter
 Sleep 3s
 Type `note "Delegated identity: over stdio the server declared the caller. Over HTTP it comes from the verified token."`
 Enter
-Sleep 7s
+Sleep 4s
+
+# --- screen 4: the record's shape, and where it goes --------------------
+Type "clear"
+Enter
+Sleep 500ms
+Type "# the trail has a documented shape, so a SIEM can rely on it"
+Enter
+Sleep 1s
+Type `python -c 'import json, jsonschema; schema = json.load(open("audit-line.schema.json")); lines = [json.loads(l) for l in open("audit.jsonl")]; [jsonschema.validate(line, schema) for line in lines]; print(len(lines), "audit lines, every one matches docs/audit-line.schema.json")'`
+Enter
+Wait+Screen /every one matches/
+Sleep 1s
+Type `note "Audit sinks: AuditLog(sink=...) hands the same record to OpenTelemetry or your log pipeline. examples/audit_otel.py"`
+Enter
+Sleep 4s
+Type `note "Approvals across replicas: ElicitationApprover(store=...) shares used approvals. examples/approval_store_sqlite.py"`
+Enter
+Sleep 4s
+
+# --- screen 5: where it sits -------------------------------------------
+Type "clear"
+Enter
+Sleep 500ms
+Type "# where the gate sits"
+Enter
+Sleep 1s
+Type `note "Agent-framework approvals live beside the model. They see the tool name and the arguments the model proposed."`
+Enter
+Sleep 3.5s
+Type `note "Gateways and policy services sit in front of the server. They see the token, the tool name and the arguments."`
+Enter
+Sleep 3.5s
+Type `note "The gate is the check inside the server, on the loaded record, for the verified caller. The one layer that makes the check mandatory."`
+Enter
+Sleep 4s
+Type `note "A central policy engine? examples/policy_opa.py and policy_cerbos.py send it the caller and the record. Unreachable is a Deny."`
+Enter
+Sleep 4s
+Type `note "What it trusts: the token verifier, and the client showing the form to a person. If that isn't acceptable, an out-of-band approver."`
+Enter
+Sleep 8s

@@ -29,7 +29,7 @@ proxy, no external policy service, no dependencies beyond the official
 pip install mcp-gatehouse
 ```
 
-![Claude Code asks to cancel order 4418; the server's approval form appears in Claude Code with the arguments; ticking Approve lets it run; the audit log shows the call pending, then ok](https://raw.githubusercontent.com/nickgeorgeseo/mcp-gatehouse/main/docs/claude-code-approval.gif)
+![Claude Code is asked to cancel order 4418; the server's approval form appears in Claude Code, naming who the call is for, the arguments, and the order as the server loaded it; ticking Approve lets it run; the audit log shows the call pending, then ok](https://raw.githubusercontent.com/nickgeorgeseo/mcp-gatehouse/main/docs/claude-code-approval.gif)
 
 The demo server in Claude Code: the model asks to cancel an order, the
 gate asks *you* in Claude Code's own UI, and the audit log records the

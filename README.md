@@ -236,9 +236,11 @@ more, when that's safe to say.
 
 - The loader's parameters name the tool's arguments it loads from. A
   loader that returns `None` means not found.
-- `describe` gives the approver one line about the record ("order 4417 ·
-  Blue Ridge Cabinets · $812.00"), so they see what the call will act on,
-  not only the arguments the model chose.
+- The approver sees the record, not only the arguments the model chose.
+  By default that is its fields as the audit log shows them, secrets
+  masked (`order: id=4417 · customer=Blue Ridge Cabinets · status=packed ·
+  total=812.0`); `describe` replaces it with a line you write ("order 4417
+  · Blue Ridge Cabinets · $812.00").
 - An approval binds to the record's state, by default a redacted snapshot
   of it, or what `fingerprint` returns. If the record changes while a
   person decides, the call is refused rather than run on something they
@@ -332,10 +334,18 @@ misuse visible afterwards.
 ### Approve in the client
 
 `ElicitationApprover` puts the question in front of the person using the
-MCP client, as a form with one box to tick, showing the tool, its tier and
-its arguments (secrets already masked). MCP calls this elicitation. Claude
-Code, Cursor and VS Code support it. The model can't answer the form, and
-you run nothing beside the server.
+MCP client, as a form with one box to tick. It shows the tool and its tier,
+why the policy asked, who the call is for, the arguments (secrets already
+masked) and each record the call acts on, as the server loaded it:
+
+```
+Approval needed (order over $500). The AI wants to run cancel_order (destructive) for "nick" via client "local" with:
+{"order_id": "4417"}
+on order 4417 · Blue Ridge Cabinets · packed · $812.00
+```
+
+MCP calls this elicitation. Claude Code, Cursor and VS Code support it. The
+model can't answer the form, and you run nothing beside the server.
 
 It works under both protocol revisions in use:
 

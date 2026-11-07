@@ -26,7 +26,7 @@ from mcp.types import (
 )
 from mcp.server.elicitation import render_elicitation_schema
 from mcp_types.version import is_version_at_least
-from pydantic import BaseModel, Field, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from .policy import ApprovalRequest, Approver, Caller
 
@@ -231,9 +231,13 @@ class MemoryApprovalStore:
             return True
 
 
+# One required box, nothing pre-ticked, so a client that accepts forms unseen
+# still can't approve by accident. The docstring is the schema's description
+# and the title its name: both reach the person, so they read as the form.
 class _ApprovalForm(BaseModel):
-    """The form the client shows. One required box, nothing pre-ticked, so
-    a client that accepts forms unseen still can't approve by accident."""
+    """Tick Approve to let this call run. Leave it, decline or cancel to refuse."""
+
+    model_config = ConfigDict(title="Approval")
 
     approve: bool = Field(
         title="Approve",
@@ -242,18 +246,26 @@ class _ApprovalForm(BaseModel):
 
 
 def _default_message(request: ApprovalRequest) -> str:
-    # At most three lines: the tool (and why it was asked), its arguments,
-    # and the records it acts on. Clients show only the start of a long
-    # message (Claude Code folds it after three lines), and what is being
-    # approved must never be in the folded part.
+    # The tool (and why it was asked, and for whom), its arguments, and the
+    # records it acts on, one per line. Clients show only the start of a
+    # long message (Claude Code folds it after three lines), so what is
+    # being approved comes first: the first three lines carry the tool, the
+    # arguments and the first record.
     arguments = json.dumps(request.arguments, ensure_ascii=False, default=str)
-    head = f"The AI wants to run {request.tool} ({request.tier.value}) with:"
+    head = f"The AI wants to run {request.tool} ({request.tier.value}){_who(request.caller)} with:"
     if request.reason:
         head = f"Approval needed ({_one_line(request.reason, 120)}). {head}"
-    message = f"{head}\n{arguments}"
-    if request.resources:
-        message += "\non " + " | ".join(_one_line(line) for line in request.resources)
-    return message
+    lines = [head, arguments]
+    lines.extend("on " + _one_line(line) for line in request.resources)
+    return "\n".join(lines)
+
+
+def _who(caller: Caller | None) -> str:
+    """" for whom" in the form's first line, or nothing when no one signed in."""
+    if caller is None:
+        return ""
+    user = "a user the token doesn't name" if caller.subject is None else _shown(caller.subject)
+    return f" for {user} via client {_shown(caller.client_id)}"
 
 
 class ElicitationApprover:

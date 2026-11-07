@@ -28,6 +28,7 @@ import dataclasses
 import functools
 import hashlib
 import inspect
+import json
 import time
 import typing
 from collections.abc import Generator, Mapping
@@ -855,19 +856,23 @@ class Gatehouse:
         fingerprints: dict[str, Any] = {}
         for load in spec.loads:
             found = loaded[load.name]
+            # The record as the audit log would show it: fields, secrets masked.
+            snapshot = redact_arguments({"r": found}, policy.redact)["r"]
+            opaque = isinstance(snapshot, str) and snapshot.startswith("«opaque:")
             if load.marker.describe is not None:
                 try:
                     lines.append(str(load.marker.describe(found)))
                 except Exception as exc:
                     raise _Refused(f"describe error: {type(exc).__name__}") from exc
+            else:
+                lines.append(_describe_record(load.name, found if opaque else snapshot, opaque))
             if load.marker.fingerprint is not None:
                 try:
                     fingerprints[load.name] = load.marker.fingerprint(found)
                 except Exception as exc:
                     raise _Refused(f"fingerprint error: {type(exc).__name__}") from exc
             else:
-                snapshot = redact_arguments({"r": found}, policy.redact)["r"]
-                if isinstance(snapshot, str) and snapshot.startswith("«opaque:"):
+                if opaque:
                     raise _Refused(
                         f"record can't be fingerprinted for approval: {load.name}",
                         f"'{spec.name}' needs approval, but the gate can't tell whether "
@@ -1376,6 +1381,23 @@ def _read_only(mapping: Mapping[str, Any]) -> Mapping[str, Any]:
         return MappingProxyType(copy.deepcopy(dict(mapping)))
     except Exception:
         return MappingProxyType(dict(mapping))
+
+
+def _describe_record(name: str, snapshot: Any, opaque: bool) -> str:
+    """The approver's line for a record whose ``Load`` has no ``describe``:
+    its fields as the audit log shows them (``order: id=4417 · customer=Blue
+    Ridge Cabinets · total=812.0``). Nested values are shown as compact
+    JSON. An opaque record (not a model, dataclass or mapping) is named by
+    type only: a repr can carry a secret."""
+    if opaque:
+        return f"{name}: a {type(snapshot).__name__}"
+    if isinstance(snapshot, Mapping):
+        parts = []
+        for key, value in snapshot.items():
+            shown = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False, default=str)
+            parts.append(f"{key}={shown}")
+        return f"{name}: " + " · ".join(parts)
+    return f"{name}: {json.dumps(snapshot, ensure_ascii=False, default=str)}"
 
 
 def _caller_entry(who: _Who) -> dict[str, Any]:

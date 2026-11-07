@@ -147,9 +147,11 @@ class Load:
     person decides, the call is refused rather than run on something they
     never saw.
 
-    ``describe`` returns one line a person reads when asked to approve
+    ``describe`` returns the line a person reads when asked to approve
     ("4417 · Blue Ridge Cabinets · $812"), so they see what the call will
-    act on, not just the arguments the model chose.
+    act on, not just the arguments the model chose. Without it the approver
+    sees the record's fields as the audit log would show them, secrets
+    masked (``order: id=4417 · customer=Blue Ridge Cabinets · ...``).
     """
 
     loader: Callable[..., Any]

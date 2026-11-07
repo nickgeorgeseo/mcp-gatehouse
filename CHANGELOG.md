@@ -96,7 +96,10 @@ migrate a server:
   reads the same to the model, and the audit log keeps the real reason.
 - Approvals are bound to the record's state. If it changes while a person
   decides, the call is refused. The approval form and terminal prompt show
-  the record (`Load(describe=...)`) and the reason.
+  the record and the reason: the line `Load(describe=...)` returns, or by
+  default the record's fields as the audit log shows them, secrets masked.
+  The form also names who the call is for, puts each record on its own
+  line, and is titled "Approval" for clients that show the schema's name.
 - `consistency=`: `Transaction(factory)` runs load, policy, tool and
   commit in your transaction, never held open during an approval.
   `ConditionalWrite()` with `Conflict`, and `AcceptRace(reason)`.

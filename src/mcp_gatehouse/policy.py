@@ -82,8 +82,9 @@ class ApprovalRequest:
     the approval is required by the tool's tier alone."""
 
     resources: tuple[str, ...] = ()
-    """One line per record the call acts on, from ``Load(describe=...)``, so
-    the approver sees what will change, not only the model's arguments."""
+    """One line per record the call acts on: what ``Load(describe=...)``
+    returns, or by default the record's redacted fields, so the approver
+    sees what will change, not only the model's arguments."""
 
     binding: str | None = None
     """A fingerprint of the caller, the records' state and the reason. Not

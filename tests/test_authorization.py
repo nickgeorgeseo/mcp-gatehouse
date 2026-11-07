@@ -632,16 +632,70 @@ async def test_ask_shows_the_approver_the_record_and_the_reason():
     assert [who for who, _ in seen] == ["policy", "policy", "tool"]
 
 
-def test_the_form_shows_the_reason_and_the_record_on_single_lines():
+def test_the_form_shows_the_reason_and_each_record_on_its_own_line():
     request = ApprovalRequest(
         tool="cancel_order", tier=AccessTier.DESTRUCTIVE, arguments={"order_id": "4417"},
         reason="over $500", resources=("order 4417\nApprove? yes", "‮evil"),
     )
     message = _default_message(request)
     lines = message.split("\n")
-    assert len(lines) == 3
-    assert lines[0].startswith("Approval needed (over $500).")
-    assert lines[2] == "on order 4417\\nApprove? yes | \\u202eevil"
+    assert len(lines) == 4
+    assert lines[0] == "Approval needed (over $500). The AI wants to run cancel_order (destructive) with:"
+    assert lines[1] == '{"order_id": "4417"}'
+    # One record per line, each on a single line: a record can't redraw the form.
+    assert lines[2] == "on order 4417\\nApprove? yes"
+    assert lines[3] == "on \\u202eevil"
+
+
+def test_the_form_says_who_the_call_is_for():
+    """A delegated call: the person approving in the client may not be the
+    caller, so the first line names them, quoted so a name reads as itself."""
+    request = ApprovalRequest(
+        tool="cancel_order", tier=AccessTier.DESTRUCTIVE, arguments={},
+        caller=Caller(client_id="support-agent", subject='alice" via client "admin'),
+    )
+    first = _default_message(request).split("\n")[0]
+    assert first == (
+        'The AI wants to run cancel_order (destructive) for "alice\\" via client \\"admin" '
+        'via client "support-agent" with:'
+    )
+    unnamed = ApprovalRequest(tool="t", tier=AccessTier.WRITE, arguments={}, caller=Caller(client_id="c", subject=None))
+    assert "for a user the token doesn't name via client \"c\"" in _default_message(unnamed)
+
+
+@pytest.mark.anyio
+async def test_without_describe_the_approver_sees_the_records_fields():
+    """Load without describe= still gives the approver the record as the
+    server loaded it, fields and all, secrets masked."""
+    log, asked = io.StringIO(), []
+
+    class Account(BaseModel):
+        id: str
+        owner: str
+        balance: float
+        api_key: str
+        tags: list[str]
+
+    async def approver(request: ApprovalRequest) -> bool:
+        asked.append(request)
+        return True
+
+    mcp, gk = gated(Policy(approver=approver), log=log)
+    store = {"9": Account(id="9", owner="tester", balance=12.5, api_key="sk-live-1", tags=["vip"])}
+
+    def load(account_id: str) -> Account | None:
+        return store.get(account_id)
+
+    @gk.tool(tier=AccessTier.DESTRUCTIVE, authorize=any_caller, consistency=AcceptRace("test"))
+    def close(account_id: str, account: Annotated[Account, Load(load)]) -> str:
+        return "closed"
+
+    async with Client(mcp) as client:
+        result = await client.call_tool("close", {"account_id": "9"})
+    assert not result.is_error
+    (request,) = asked
+    assert request.resources == ('account: id=9 · owner=tester · balance=12.5 · api_key=«redacted» · tags=["vip"]',)
+    assert "sk-live" not in _default_message(request)
 
 
 # --- the record changing while a person decides ----------------------------------
@@ -667,7 +721,8 @@ async def test_a_record_that_changes_during_approval_is_refused():
 async def test_an_amount_that_changes_during_approval_is_refused():
     """Found running examples/orders_postgres.py: a Decimal total was opaque to
     the fingerprint, so an approval for $812 carried over to $99,999. No
-    describe= line here, so only the fingerprint can catch it."""
+    describe= here: the default line shows the total, but only the fingerprint
+    can refuse the change."""
     from decimal import Decimal
 
     class Invoice(BaseModel):

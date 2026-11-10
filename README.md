@@ -183,8 +183,10 @@ record, and keeps the trail. A team with a central policy engine keeps
 its rules there and lets the gate call it:
 [`examples/policy_opa.py`](examples/policy_opa.py) and
 [`examples/policy_cerbos.py`](examples/policy_cerbos.py) send the caller,
-the tool, the action and the loaded record to the engine, and an engine
-that can't be reached is a denial.
+the tool, the action and the loaded record to the engine. An engine that
+can't be reached is a denial, and the model is told the call can be
+retried, so "not now" doesn't read like "no". `on_unavailable=Ask` sends
+those calls to your approver instead.
 
 By design, `mcp-gatehouse` is none of the other layers. It is not a
 proxy or a gateway, has no control plane, mints or exchanges no tokens,

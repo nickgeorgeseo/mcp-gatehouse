@@ -5,6 +5,20 @@ All notable changes to `mcp-gatehouse`. The public API (`Gatehouse`,
 with one deliberate exception: 0.6.0's authorization invariant is
 breaking, and its release notes say how to migrate.
 
+## Unreleased
+
+### Changed
+
+- `examples/policy_opa.py` and `examples/policy_cerbos.py`: an engine that
+  can't be reached still denies, logged as `policy: policy engine
+  unavailable`, but the model is now told the authorization service
+  didn't answer and the call can be retried, instead of the generic "not
+  permitted" it gets for a refusal on the merits. Both factories take
+  `on_unavailable=Deny` (the default) or `on_unavailable=Ask`, which puts
+  those calls to the approver with the reason "policy engine
+  unavailable". An engine that answers with an error or garbage is still
+  a denial either way.
+
 ## 0.6.0 — 2026-11-06
 
 ### Breaking: authorization is a runtime invariant

@@ -41,6 +41,13 @@ breaking, and its release notes say how to migrate.
   `sink_error: "sink closed"`. `sink_error` in the schema and the README
   now lists these two values beside the exception type.
 
+### Packaging
+
+- The sdist leaves out `docs/*.mp4` and `docs/*.gif`: from about 6 MB to
+  about 140 KB. The wheel is unchanged, and the README links its
+  recording by absolute URL, so nothing points at a missing file. The
+  `.tape` sources that make the recordings stay in.
+
 ### Docs
 
 - README, "Approve in the client": the exact `RequestStateSecurity(keys=[...])`

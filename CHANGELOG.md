@@ -19,6 +19,21 @@ breaking, and its release notes say how to migrate.
   unavailable". An engine that answers with an error or garbage is still
   a denial either way.
 
+### Added
+
+- `examples/approval_store_postgres.py`: the `ApprovalStore` contract on
+  Postgres, for replicas on several hosts. Single use under concurrent
+  spenders (primary key and `ON CONFLICT DO NOTHING`), expired rows swept
+  with a grace for clock drift between replicas, and Postgres unreachable
+  raises, so the gate denies. Needs `psycopg`; the library doesn't import
+  it. Its tests run when `GATEHOUSE_TEST_POSTGRES_DSN` names a database,
+  and skip otherwise.
+
+### Docs
+
+- README, "Approve in the client": the exact `RequestStateSecurity(keys=[...])`
+  setup replicas need, and why a store alone isn't enough without it.
+
 ## 0.6.0 — 2026-11-06
 
 ### Breaking: authorization is a runtime invariant

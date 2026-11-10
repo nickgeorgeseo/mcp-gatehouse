@@ -370,21 +370,39 @@ one such channel.
 Used approvals are remembered in an `ApprovalStore`, so each runs its call
 once. The default, `MemoryApprovalStore`, remembers per process. That is
 enough while the SDK's request-state key is per process too, which it is
-by default: an approval minted before a restart, or by another replica,
-fails the SDK's seal check before the gate sees it. Share that key
-(`MCPServer(..., request_state_security=RequestStateSecurity(keys=[...]))`)
-so approvals survive a restart or work across replicas, and the store
-must be shared too, or one approval runs its call once per replica and
-once more after each restart within `approval_timeout`. A store is
-anything with `spend(nonce, expires) -> bool`:
-[`examples/approval_store_sqlite.py`](examples/approval_store_sqlite.py)
-is one on SQLite, standard library only, with the single-use guarantee
-tested across two processes. A store that raises denies the call, logged
-as `approval store error`.
+by default. Each process seals its questions with a key of its own, so an
+approval minted before a restart, or by another replica, fails the SDK's
+seal check before the gate or its store ever sees it.
+
+Replicas behind a load balancer, or a server that should honour approvals
+across a restart, need two things. First, every replica uses the same
+request-state key and the same server name, which the SDK binds each
+question to:
 
 ```python
-ElicitationApprover(store=SqliteApprovalStore("/var/lib/order-desk/approvals.db"))
+from mcp.server.request_state import RequestStateSecurity
+
+KEY = os.environ["MCP_REQUEST_STATE_KEY"]  # 32+ random bytes, the same on every replica
+mcp = MCPServer("order-desk", request_state_security=RequestStateSecurity(keys=[KEY]))
 ```
+
+Second, they share the store, or one approval runs its call once per
+replica, and once more after each restart within `approval_timeout`. A
+store is anything with `spend(nonce, expires) -> bool`. Two are examples
+to copy:
+[`examples/approval_store_sqlite.py`](examples/approval_store_sqlite.py),
+standard library only, for replicas on one host, and
+[`examples/approval_store_postgres.py`](examples/approval_store_postgres.py),
+on `psycopg`, for replicas on several. Both spend each nonce once under
+concurrent spenders and sweep expired ones. A store that raises denies
+the call, logged as `approval store error`.
+
+```python
+ElicitationApprover(store=PostgresApprovalStore(os.environ["APPROVALS_DSN"]))
+```
+
+To rotate the key without dropping questions in flight, the SDK takes a
+ring: `keys=[old, new]`, then `keys=[new, old]`, then `keys=[new]`.
 
 Elicitation trusts the client to show the form to a person. A client or
 hook set to accept forms on its own can approve too. When the approval
@@ -570,7 +588,7 @@ to do when that trust isn't acceptable.
 | **The `ConditionalWrite` promise** | You promise the write carries the checked state in its own condition and raises `Conflict` when it matches nothing. The gate can't read your query. | Use `Transaction(...)`: the gate runs load, policy, tool and commit in your transaction, and a row locked in the loader can't change under the write. |
 | **`AcceptRace`** | You accept that the record may change between the check and the write, for the reason you gave. The gate only records it on every line. | Don't. Close the window with `Transaction(...)` or `ConditionalWrite()`; `AcceptRace` is for the cases where a race is harmless, and the audit log is where you justify that. |
 | **Your loader and your policy** | The record is what the loader returned; the decision is what the policy returned. A loader that reads the wrong row, or a policy with a hole, is enforced faithfully. | Load through the database's own access control (row-level security under the caller's identity, as `examples/orders_postgres.py` does), so a wrong query returns nothing rather than someone else's record. Keep `authorize_items` on list tools and alarm on `withheld` above zero. |
-| **The audit sink and the approval store** | A sink that raises gets its line on stderr; a store that raises denies the call. Where the records then go, and whether the store is shared by every replica, is the deployment's. | Ship the sink's output somewhere append-only and read `sink_error` from stderr. Share the approval store (`examples/approval_store_sqlite.py`) wherever the SDK's request-state key is shared. |
+| **The audit sink and the approval store** | A sink that raises gets its line on stderr; a store that raises denies the call. Where the records then go, and whether the store is shared by every replica, is the deployment's. | Ship the sink's output somewhere append-only and read `sink_error` from stderr. Share the approval store (`examples/approval_store_sqlite.py` on one host, `examples/approval_store_postgres.py` across hosts) wherever the SDK's request-state key is shared. |
 
 ## Try the demo
 

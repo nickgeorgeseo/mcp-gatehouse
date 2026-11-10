@@ -29,6 +29,18 @@ breaking, and its release notes say how to migrate.
   it. Its tests run when `GATEHOUSE_TEST_POSTGRES_DSN` names a database,
   and skip otherwise.
 
+- `BufferedSink(inner, *, maxsize=10_000)`: audit writes off the request
+  path. `write` puts the record on a bounded queue and returns; one
+  background thread writes the queue to `inner` in order. Standard
+  library only. Drop policy: when the queue is full the call never
+  waits; the record goes to stderr as one JSON line with
+  `sink_error: "queue full"` and is not queued, so stderr is its only
+  copy. `close()` drains everything written before it, then closes
+  `inner`; buffers nobody closed are drained at interpreter exit. A
+  record written after `close()` goes to stderr with
+  `sink_error: "sink closed"`. `sink_error` in the schema and the README
+  now lists these two values beside the exception type.
+
 ### Docs
 
 - README, "Approve in the client": the exact `RequestStateSecurity(keys=[...])`

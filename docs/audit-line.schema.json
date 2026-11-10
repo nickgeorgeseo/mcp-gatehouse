@@ -90,7 +90,7 @@
     },
     "sink_error": {
       "type": "string",
-      "description": "Only on the copy of a line written to stderr because the audit sink raised: the exception type. Never in a sink's own output."
+      "description": "Only on the copy of a line written to stderr instead of the sink: the exception type when the sink raised, \"queue full\" when a BufferedSink had no room, \"sink closed\" when a BufferedSink was written to after close. Never in a sink's own output."
     }
   },
   "allOf": [

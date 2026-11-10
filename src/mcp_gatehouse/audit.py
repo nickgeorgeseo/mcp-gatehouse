@@ -6,17 +6,20 @@ grep six months later when someone asks "what did the AI actually do?"
 
 The default sink is an append-only JSONL file. A sink is anything with a
 ``write(record)`` method (:class:`AuditSink`), so the same records can go
-to a logging pipeline, OpenTelemetry, or an HTTP collector instead. The
+to a logging pipeline, OpenTelemetry, or an HTTP collector instead. Wrap
+a slow one in :class:`BufferedSink` to write it off the request path. The
 record's fields are documented in the README and in
 ``docs/audit-line.schema.json``.
 """
 
 from __future__ import annotations
 
+import atexit
 import datetime as _dt
 import io
 import json
 import os
+import queue
 import sys
 import threading
 from collections.abc import Callable
@@ -99,6 +102,103 @@ class CallableSink:
         self.fn(record)
 
 
+_STOP = object()
+
+
+class BufferedSink:
+    """Hands records to ``inner`` from one background thread, so a slow
+    sink never slows a call.
+
+    ``write`` puts the record on a bounded queue and returns at once. One
+    thread takes records off in order and writes them to ``inner``. When
+    the queue is full, the record doesn't wait for room: it goes to stderr
+    as one JSON line with ``sink_error: "queue full"``, and the call goes
+    on. Nothing is dropped silently, but stderr is then the only copy of
+    that line, so size ``maxsize`` for the bursts you expect and watch
+    stderr for ``sink_error``.
+
+    If ``inner`` raises, the record goes to stderr with ``sink_error``
+    naming the exception type, as with any sink. :meth:`close` drains the
+    queue, waiting for every record written before it, then closes
+    ``inner`` if it has a ``close()``. It also runs at interpreter exit for
+    a sink nobody closed. A record written after close goes to stderr with
+    ``sink_error: "sink closed"``.
+
+    Standard library only: one ``queue.Queue`` and one daemon thread.
+    """
+
+    def __init__(self, inner: AuditSink, *, maxsize: int = 10_000) -> None:
+        if not callable(getattr(inner, "write", None)):
+            raise TypeError("inner must have a write(record) method; wrap a function in CallableSink")
+        if isinstance(maxsize, bool) or not isinstance(maxsize, int) or maxsize < 1:
+            raise ValueError("maxsize must be a positive int: an unbounded queue can grow without limit")
+        self.inner = inner
+        """Where the records go, one at a time, from the background thread."""
+        self.maxsize = maxsize
+        self._queue: queue.Queue[Any] = queue.Queue(maxsize)
+        self._state = threading.Lock()  # write's check-and-put against close's flag
+        self._closing = threading.Lock()
+        self._closed = False
+        self._thread = threading.Thread(target=self._drain, name="mcp-gatehouse-audit", daemon=True)
+        self._thread.start()
+        _OPEN_BUFFERS.add(self)
+
+    def write(self, record: dict[str, Any]) -> None:
+        with self._state:
+            if not self._closed:
+                try:
+                    self._queue.put_nowait(record)
+                    return
+                except queue.Full:
+                    why = "queue full"
+            else:
+                why = "sink closed"
+        _to_stderr(record, why)
+
+    def _drain(self) -> None:
+        while True:
+            record = self._queue.get()
+            if record is _STOP:
+                return
+            try:
+                self.inner.write(record)
+            except Exception as exc:
+                _to_stderr(record, exc)
+
+    def close(self) -> None:
+        """Write everything queued so far, stop the thread, close ``inner``."""
+        with self._closing:
+            with self._state:
+                if self._closed:
+                    return
+                self._closed = True
+            _OPEN_BUFFERS.discard(self)
+            # Nothing is queued after the flag. This put blocks while the
+            # queue is full: the thread is emptying it, and every record
+            # already accepted is written before the stop.
+            self._queue.put(_STOP)
+            self._thread.join()
+            close = getattr(self.inner, "close", None)
+            if callable(close):
+                close()
+
+
+# Buffers not yet closed. A plain set: the running thread holds its
+# buffer anyway, so a weak reference would keep nothing shorter.
+_OPEN_BUFFERS: "set[BufferedSink]" = set()
+
+
+@atexit.register
+def _close_at_exit() -> None:
+    """Drain every buffer nobody closed, so the tail of the trail isn't lost
+    with the daemon thread."""
+    for sink in list(_OPEN_BUFFERS):
+        try:
+            sink.close()
+        except Exception:
+            pass  # a failing inner close() must not stop the others draining
+
+
 class AuditLog:
     """Writes one record per call to a sink: a JSONL file (``path=``), a
     text stream (``stream=``), or any :class:`AuditSink` (``sink=``).
@@ -148,12 +248,14 @@ class AuditLog:
         self.close()
 
 
-def _to_stderr(record: dict[str, Any], exc: BaseException) -> None:
-    """The sink failed: the record goes to stderr, saying so. Only the
-    exception type, as everywhere else: error text loves to embed the
-    values the record redacted."""
+def _to_stderr(record: dict[str, Any], error: BaseException | str) -> None:
+    """The sink failed: the record goes to stderr, saying so. For an
+    exception, only its type, as everywhere else: error text loves to
+    embed the values the record redacted. A string is the gate's own
+    reason (``"queue full"``)."""
+    why = error if isinstance(error, str) else type(error).__name__
     try:
-        sys.stderr.write(_line({**record, "sink_error": type(exc).__name__}))
+        sys.stderr.write(_line({**record, "sink_error": why}))
         sys.stderr.flush()
     except Exception:
         pass  # nowhere left to write; nothing can be done about that here

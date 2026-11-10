@@ -479,7 +479,7 @@ field is ever written.
 | `withheld` | integer | `ok` lines of a tool with an item policy: items the caller may not see, removed |
 | `filter_errors` | integer | with `withheld`, when the item policy raised on some items |
 | `scope_mismatch` | `true` | with `withheld`, when a `Scope` was in force: the query and the policy disagree |
-| `sink_error` | string | only on the stderr copy of a line whose sink raised: the exception type |
+| `sink_error` | string | only on the stderr copy of a line that didn't reach the sink: the exception type when the sink raised, `"queue full"` or `"sink closed"` from a `BufferedSink` |
 
 The outcomes: `ok`, the tool ran. `denied`, the gate refused, and `reason`
 says why. `error`, the tool raised, or the transaction or item filtering
@@ -508,9 +508,9 @@ AuditLog(sink=CallableSink(queue.put))                      # your own function
 AuditLog(sink=CallableSink(lambda r: log.info("audit", extra=r)))  # the logging module
 ```
 
-Two sinks ship with the library, neither needing anything beyond it:
+Three sinks ship with the library, none needing anything beyond it:
 `JsonlSink(path=...)` or `JsonlSink(stream=...)`, which is what `path=`
-and `stream=` use, and `CallableSink(fn)`. For OpenTelemetry logs, copy
+and `stream=` use, `CallableSink(fn)`, and `BufferedSink`, below. For OpenTelemetry logs, copy
 [`examples/audit_otel.py`](examples/audit_otel.py): one log record per
 audit record, the record as the body and the fields worth filtering on as
 attributes. An HTTP collector or a logging pipeline is a `CallableSink`
@@ -522,6 +522,23 @@ writes the line to stderr with a `sink_error` field naming the exception
 type, and goes on. Watch stderr for `sink_error` if the sink is the only
 copy of the trail. `AuditLog.close()` calls the sink's `close()` when it
 has one.
+
+A sink is written on the request path, so a slow one (an HTTP collector,
+a remote log) slows every call. Wrap it in `BufferedSink` to write it from
+a background thread instead:
+
+```python
+AuditLog(sink=BufferedSink(CallableSink(post_to_collector), maxsize=10_000))
+```
+
+`write` puts the record on a bounded queue and returns at once; one
+thread writes the queue to the inner sink in order. When the queue is
+full the call doesn't wait. The record goes to stderr with
+`sink_error: "queue full"` instead of the queue, so stderr is then its
+only copy. Size `maxsize` for your bursts and alarm on `sink_error`.
+`close()` writes everything already queued, then closes the inner sink;
+it also runs at exit for a buffer nobody closed. A record written after
+`close()` goes to stderr with `sink_error: "sink closed"`.
 
 ### Who the call was for
 

@@ -29,6 +29,11 @@ breaking, and its release notes say how to migrate.
 
 ### Changed
 
+- Breaking for a policy or loader that takes longer than five seconds:
+  it is now denied. Set `authorization_timeout` on the tool or the
+  Policy, or `None` to keep the old behaviour, which the audit log then
+  shows.
+
 - `examples/policy_opa.py` and `examples/policy_cerbos.py`: an engine that
   can't be reached still denies, logged as `policy: policy engine
   unavailable`, but the model is now told the authorization service
@@ -40,6 +45,23 @@ breaking, and its release notes say how to migrate.
   a denial either way.
 
 ### Added
+
+- An authorization deadline. Loaders, the policy and any `Scope` share
+  `Policy.authorization_timeout` seconds, 5 by default. Past it the call
+  is denied as `authorization timed out: policy` (or `loading <name>`, or
+  `scope <name>`), the tool doesn't run, and the model is told the call
+  can be retried. `@gk.tool(authorization_timeout=...)` overrides it for
+  one tool. `None` turns it off, and every audit line for that tool then
+  carries `"authorization_deadline": "off"`, a new field in the schema.
+- `on_authorization_timeout=Ask`, on the Policy or one tool: a policy that
+  runs out of time puts the call to the approver with the reason
+  `authorization timed out` instead of denying. A loader or `Scope` that
+  runs out still denies.
+- Sync loaders, policies and scopes run on the gate's own worker threads,
+  not anyio's default pool, so hung ones can't leave sync tools without a
+  thread. A sync step past the deadline is abandoned and finishes in the
+  background. Inside a sync `Transaction` the deadline is checked between
+  steps, and a late answer rolls the transaction back.
 
 - `examples/approval_store_postgres.py`: the `ApprovalStore` contract on
   Postgres, for replicas on several hosts. Single use under concurrent

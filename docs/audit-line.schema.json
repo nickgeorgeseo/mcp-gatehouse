@@ -74,6 +74,10 @@
       "type": "string",
       "description": "The AcceptRace reason. With consistency \"accept-race\" only."
     },
+    "authorization_deadline": {
+      "const": "off",
+      "description": "The tool runs without an authorization deadline: authorization_timeout=None on the Policy or the tool. An opt-out, so it is on every line the tool writes."
+    },
     "withheld": {
       "type": "integer",
       "minimum": 0,

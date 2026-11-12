@@ -1,14 +1,17 @@
-"""What a policy that never returns holds today. The gate puts no deadline
-on ``authorize=``; these tests pin down how far a hung policy reaches, so
-a deadline added later has something to be measured against.
+"""How far a policy that doesn't return reaches. tests/test_authorization_deadline.py
+covers the deadline itself; these cover what is left around it.
 
-- A sync policy runs in a worker thread from anyio's default pool, the
-  one sync tools and loaders use too. A hung one blocks its own call and
-  keeps its thread, even after the client gives up.
+- Sync loaders, policies and scopes run on the gate's own worker threads,
+  not anyio's default pool, so a hung one never leaves a sync tool
+  elsewhere on the server without a thread.
+- With the deadline on (the default), a call whose client gives up ends
+  at once: the policy's thread is abandoned and finishes in the
+  background. With ``authorization_timeout=None`` the call waits for the
+  policy, however long that is, as it always did.
 - An async policy runs on the event loop. One that awaits forever blocks
-  only its own call, and goes when the client gives up. One that blocks
-  without awaiting (a sync HTTP call inside ``async def``) stalls the
-  whole server; no deadline the gate sets can interrupt that.
+  only its own call. One that blocks without awaiting (a sync HTTP call
+  inside ``async def``) stalls the whole server; no deadline the gate sets
+  can interrupt that.
 - Inside a sync ``Transaction`` every step, the policy included, runs in
   the transaction's one worker thread, so a hung policy also holds the
   transaction open. A client that gives up meanwhile gets its
@@ -43,10 +46,12 @@ async def until(event: threading.Event) -> None:
             await anyio.sleep(0.01)
 
 
-def server(policy, ran=None):
+def server(policy, ran=None, *, deadline=None):
+    """``deadline=None`` turns the authorization deadline off, so these
+    tests see a hung policy for as long as it hangs."""
     log = io.StringIO()
     mcp = MCPServer("t")
-    gk = Gatehouse(mcp, policy=Policy(), audit=AuditLog(stream=log))
+    gk = Gatehouse(mcp, policy=Policy(authorization_timeout=deadline), audit=AuditLog(stream=log))
 
     @gk.tool(tier=AccessTier.READ, authorize=policy)
     def stuck() -> str:
@@ -84,7 +89,7 @@ async def test_a_hung_sync_policy_blocks_only_its_own_call():
         released.set()
 
 
-async def cancel_during_a_sync_policy(release_after: float):
+async def cancel_during_a_sync_policy(release_after: float, deadline=None):
     """The client gives up while a sync policy is still running; the policy
     returns ``release_after`` seconds later. Returns the elapsed time, the
     last audit line and what ran."""
@@ -95,7 +100,7 @@ async def cancel_during_a_sync_policy(release_after: float):
         released.wait(timeout=10)
         return Allow()
 
-    mcp, log = server(policy, ran)
+    mcp, log = server(policy, ran, deadline=deadline)
     threading.Timer(release_after, released.set).start()
     began = time.monotonic()
     try:
@@ -110,13 +115,23 @@ async def cancel_during_a_sync_policy(release_after: float):
 
 
 @pytest.mark.anyio
-async def test_a_hung_sync_policy_keeps_its_thread_after_the_client_gives_up():
-    """The policy's thread isn't abandoned on cancellation, so the call
-    stays until the policy returns, however long that is. The tool still
-    doesn't run."""
+async def test_without_a_deadline_a_cancelled_call_waits_for_its_sync_policy():
+    """``authorization_timeout=None``: the policy's thread isn't abandoned,
+    so the call stays until the policy returns. The tool still doesn't run."""
     elapsed, line, ran = await cancel_during_a_sync_policy(0.5)
     assert elapsed >= 0.45  # waited for the policy, not for the client
     assert line["outcome"] == "cancelled" and ran == []
+    assert line["authorization_deadline"] == "off"
+
+
+@pytest.mark.anyio
+async def test_with_a_deadline_a_cancelled_call_ends_when_the_client_gives_up():
+    """The deadline is on, so the policy's thread may be abandoned: the call
+    ends with the client, not with the policy."""
+    elapsed, line, ran = await cancel_during_a_sync_policy(1.0, deadline=5.0)
+    assert elapsed < 0.8
+    assert (line["outcome"], line["reason"]) == ("cancelled", "authorizing") and ran == []
+    assert "authorization_deadline" not in line
 
 
 @pytest.mark.anyio
@@ -129,10 +144,10 @@ async def test_a_call_cancelled_during_a_sync_policy_is_logged_as_authorizing():
 
 
 @pytest.mark.anyio
-async def test_hung_sync_policies_can_take_every_thread_sync_tools_need():
-    """The default pool is shared: enough hung sync policies and a sync
-    tool elsewhere on the server waits for a thread. The pool is cut to
-    two threads here; anyio's default is 40."""
+async def test_hung_sync_policies_leave_sync_tools_their_threads():
+    """Policies run on the gate's own threads. With the default pool cut to
+    two threads and two policies hung, with no deadline to end them, a
+    sync tool elsewhere still gets a thread."""
     limiter = anyio.to_thread.current_default_thread_limiter()
     tokens = limiter.total_tokens
     limiter.total_tokens = 2
@@ -153,9 +168,9 @@ async def test_hung_sync_policies_can_take_every_thread_sync_tools_need():
                     with anyio.fail_after(5):
                         while not started.acquire(blocking=False):
                             await anyio.sleep(0.01)
-                with anyio.move_on_after(0.5) as waited:
-                    await client.call_tool("other", {})
-                assert waited.cancelled_caught  # no thread for the sync tool
+                with anyio.fail_after(2):
+                    result = await client.call_tool("other", {})
+                assert not result.is_error
                 released.set()
     finally:
         released.set()

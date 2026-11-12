@@ -261,6 +261,38 @@ more, when that's safe to say.
   never saw. On a tier that requires approval, a record must be a Pydantic
   model, a dataclass or a mapping, or have a `fingerprint`.
 
+#### Deadlines
+
+A call gets five seconds to load its records and reach a decision: the
+loaders, the policy and any `Scope`, together. Past that it is denied,
+logged as `authorization timed out: policy` (or `loading order`, or
+`scope owner`), and the tool doesn't run. The model is told this isn't a
+refusal and the call can be retried, so "not now" doesn't read like "no".
+
+```python
+Policy(authorization_timeout=2.0)            # every tool
+@gk.tool(authorize=report_policy, authorization_timeout=30)  # one tool
+@gk.tool(authorize=refund_policy, on_authorization_timeout=Ask)
+```
+
+`on_authorization_timeout=Ask` puts a call whose policy ran out of time
+to the approver, with the reason `authorization timed out`, instead of
+denying it. A refund then waits for a person rather than being lost. A
+loader or `Scope` that runs out still denies: there is no record yet to
+ask about. `authorization_timeout=None` turns the deadline off, and every
+audit line for that tool says `"authorization_deadline": "off"`.
+
+Python can't stop a thread. A sync loader or policy past the deadline is
+abandoned: the call ends, and the thread finishes in the background with
+its result dropped. Those threads are the gate's own, not the pool sync
+tools draw on, so a hung policy can't leave a tool elsewhere waiting.
+Inside a sync `Transaction` every step runs in one thread, so the
+deadline is checked between steps: a slow policy runs to the end, then
+counts as late, and the transaction rolls back. Set the database's
+statement timeout for a query that hangs there. An `async` policy that
+blocks without awaiting, such as a sync HTTP call inside `async def`,
+stalls the whole server, and no deadline can reach it.
+
 ### The check and the write
 
 Loading once and handing over means the tool acts on the object that was
@@ -488,6 +520,7 @@ field is ever written.
 | `items` | `"open"` | every line of a tool with `authorize_items=any_item` |
 | `consistency` | `"transaction"`, `"conditional"`, `"accept-race"` | every line of a tool with `consistency=`, its own or the `Gatehouse` default |
 | `consistency_reason` | string | with `"accept-race"` |
+| `authorization_deadline` | `"off"` | every line of a tool with `authorization_timeout=None`: the deadline is turned off |
 | `withheld` | integer | `ok` lines of a tool with an item policy: items the caller may not see, removed |
 | `filter_errors` | integer | with `withheld`, when the item policy raised on some items |
 | `scope_mismatch` | `true` | with `withheld`, when a `Scope` was in force: the query and the policy disagree |

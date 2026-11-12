@@ -65,7 +65,16 @@ from .authz import (
     any_caller,
     any_item,
 )
-from .policy import AccessTier, ApprovalRequest, Caller, Policy, _canonical, redact_arguments
+from .policy import (
+    AccessTier,
+    ApprovalRequest,
+    Caller,
+    Policy,
+    _canonical,
+    check_authorization_timeout,
+    check_on_authorization_timeout,
+    redact_arguments,
+)
 
 F = TypeVar("F", bound=Callable[..., Any])
 
@@ -73,6 +82,14 @@ F = TypeVar("F", bound=Callable[..., Any])
 # Sync tools draw on that pool; approvers wait on people. If they shared it,
 # a stack of pending sign-offs would leave no thread for a plain read.
 _APPROVER_THREADS = 40
+
+# Worker threads for sync loaders, policies and scopes, kept apart from the
+# default pool for the same reason: a hung policy must not leave a sync tool
+# elsewhere on the server waiting for a thread.
+_AUTHORIZE_THREADS = 40
+
+# A tool that leaves the authorization deadline to the Policy.
+_INHERIT: Any = object()
 
 # The parameter the guard adds, out of the tool's schema, so MCPServer hands
 # it the call's Context when the tool takes none itself. Asking the client
@@ -149,6 +166,8 @@ class _ToolSpec:
     exposed_signature: inspect.Signature
     exposed_annotations: dict[str, Any]
     round_trip: bool
+    authorization_timeout: float | None
+    on_authorization_timeout: Any
 
     @property
     def open(self) -> bool:
@@ -226,6 +245,24 @@ class _Refused(Exception):
         self.outcome = outcome
 
 
+class _TimedOut(Exception):
+    """A step before the tool ran past the authorization deadline. The
+    driver throws it into the steps at the yield that ran out."""
+
+
+# The reason an approver sees when a policy ran out of time and the tool
+# asks instead of denying. Stable, so the approval binds to it.
+_TIMED_OUT = "authorization timed out"
+
+
+def _timed_out(tool_name: str) -> str:
+    """What the model is told: not a refusal on the merits, and nothing ran."""
+    return (
+        f"'{tool_name}' couldn't be authorized in time, so nothing ran. "
+        "This isn't a refusal; the call can be retried."
+    )
+
+
 class _NeedsApproval(Exception):
     """A person has to decide before the call can go on.
 
@@ -281,6 +318,7 @@ class Gatehouse:
         self.local_caller = local_caller
         self.consistency = consistency
         self._approver_limiter = anyio.CapacityLimiter(_APPROVER_THREADS)
+        self._authorize_limiter = anyio.CapacityLimiter(_AUTHORIZE_THREADS)
         self._registry: dict[str, _Entry] = {}
         self._lock_down()
 
@@ -434,6 +472,8 @@ class Gatehouse:
         authorize_items: Authorizer | None = None,
         consistency: Consistency | None = None,
         scopes: collections.abc.Iterable[str] = (),
+        authorization_timeout: float | None = _INHERIT,
+        on_authorization_timeout: Any = _INHERIT,
         name: str | None = None,
         title: str | None = None,
         description: str | None = None,
@@ -448,6 +488,9 @@ class Gatehouse:
         (``any_item`` opts out). ``consistency`` is required for WRITE and
         DESTRUCTIVE tools that ``Load`` a record, unless the Gatehouse sets
         a default. ``scopes`` are token scopes the caller must hold.
+        ``authorization_timeout`` and ``on_authorization_timeout`` override
+        the Policy's for this tool; ``authorization_timeout=None`` turns the
+        deadline off, and the tool's audit lines say so.
 
         Accepts any extra keyword arguments ``MCPServer.tool`` understands
         and forwards them untouched. ``annotations`` is derived from the
@@ -472,6 +515,10 @@ class Gatehouse:
             raise TypeError("authorize_items must be a callable policy")
         _check_consistency(consistency)
         required_scopes = frozenset({scopes} if isinstance(scopes, str) else scopes)
+        if authorization_timeout is not _INHERIT:
+            check_authorization_timeout(authorization_timeout)
+        if on_authorization_timeout is not _INHERIT:
+            on_authorization_timeout = check_on_authorization_timeout(on_authorization_timeout)
 
         def decorator(fn: F) -> F:
             tool_name = name or fn.__name__
@@ -490,6 +537,8 @@ class Gatehouse:
                 fn, tool_name, tier, authorize, authorize_items,
                 consistency if consistency is not None else self.consistency,
                 required_scopes, self.policy, defined_in,
+                authorization_timeout=authorization_timeout,
+                on_authorization_timeout=on_authorization_timeout,
             )
             guarded = self._guard(spec)
             registering = _REGISTERING.set(self)
@@ -559,6 +608,9 @@ class Gatehouse:
         elif isinstance(spec.consistency, AcceptRace):
             consistency_fields["consistency"] = "accept-race"
             consistency_fields["consistency_reason"] = spec.consistency.reason
+        if spec.authorization_timeout is None:
+            # The deadline is an opt-out like any other: visible on every line.
+            consistency_fields["authorization_deadline"] = "off"
 
         async def run(arguments: dict[str, Any], args: tuple, kwargs: dict[str, Any], context: Any) -> Any:
             safe_args = redact_arguments(arguments, policy.redact)
@@ -697,14 +749,15 @@ class Gatehouse:
         """Load, authorize and run, inside the tool's transaction if it has one."""
         steps = self._steps(call, approved, state)
         transaction = call.spec.consistency if isinstance(call.spec.consistency, Transaction) else None
+        timeout, limiter = call.spec.authorization_timeout, self._authorize_limiter
         if transaction is None:
-            return await _drive_async(steps)
+            return await _drive_async(steps, timeout, limiter)
         if transaction.asynchronous:
-            return await _run_async_transaction(transaction, call.who.caller, steps, state)
+            return await _run_async_transaction(transaction, call.who.caller, steps, state, timeout, limiter)
         # One worker thread for the whole transaction: sync database drivers
         # are often tied to the thread that opened the connection.
         return await anyio.to_thread.run_sync(
-            functools.partial(_run_sync_transaction, transaction, call.who.caller, steps, state)
+            functools.partial(_run_sync_transaction, transaction, call.who.caller, steps, state, timeout)
         )
 
     def _steps(self, call: _Call, approved: str | None, state: _CallState) -> Generator[Callable[[], Any], Any, Any]:
@@ -722,6 +775,8 @@ class Gatehouse:
             step = functools.partial(load.marker.loader, **{arg: call.arguments[arg] for arg in load.argnames})
             try:
                 found = yield step
+            except _TimedOut:
+                raise _Refused(f"authorization timed out: loading {load.name}", _timed_out(spec.name)) from None
             except Exception as exc:
                 raise _Refused(f"loader error: {type(exc).__name__}") from exc
             if found is None:
@@ -737,6 +792,10 @@ class Gatehouse:
         else:
             try:
                 decision = yield functools.partial(spec.authorize, request)
+            except _TimedOut:
+                if spec.on_authorization_timeout is not Ask:
+                    raise _Refused("authorization timed out: policy", _timed_out(spec.name)) from None
+                decision = Ask(_TIMED_OUT)
             except Exception as exc:
                 raise _Refused(f"policy error: {type(exc).__name__}") from exc
             if not isinstance(decision, (Allow, Deny, Ask)):
@@ -756,6 +815,8 @@ class Gatehouse:
         for scope in spec.scope_params:
             try:
                 scoped[scope.name] = yield functools.partial(scope.marker.fn, request)
+            except _TimedOut:
+                raise _Refused(f"authorization timed out: scope {scope.name}", _timed_out(spec.name)) from None
             except Exception as exc:
                 raise _Refused(f"scope error: {type(exc).__name__}") from exc
 
@@ -980,8 +1041,21 @@ def _before_tool() -> None:
 _BEFORE_TOOL: Callable[[], Any] = _before_tool
 
 
-async def _drive_async(steps: Generator[Callable[[], Any], Any, Any]) -> Any:
-    """Run each step on the event loop, sync ones in a worker thread."""
+async def _drive_async(
+    steps: Generator[Callable[[], Any], Any, Any],
+    timeout: float | None = None,
+    limiter: anyio.CapacityLimiter | None = None,
+) -> Any:
+    """Run each step on the event loop, sync ones in a worker thread.
+
+    The steps before the tool (loaders, policy, scopes) share ``timeout``
+    seconds and run sync ones on ``limiter``'s threads. A step still running
+    at the deadline is abandoned: the generator gets ``_TimedOut`` at the
+    step that ran out, and a sync step's thread finishes in the background
+    with its result dropped.
+    """
+    deadline = None if timeout is None else time.monotonic() + timeout
+    authorizing = True
     value: Any = None
     error: BaseException | None = None
     while True:
@@ -997,15 +1071,42 @@ async def _drive_async(steps: Generator[Callable[[], Any], Any, Any]) -> Any:
             # a call cancelled while it was authorized stops at
             # "authorizing" and its tool never starts.
             await anyio.lowlevel.checkpoint_if_cancelled()
+            authorizing = False
             continue
         try:
-            value = await _call(step)
+            if authorizing:
+                value = await _authorizing_step(step, deadline, limiter)
+            else:
+                value = await _call(step)
         except Exception as exc:
             error = exc
 
 
-def _drive_sync(steps: Generator[Callable[[], Any], Any, Any]) -> Any:
-    """Run every step right here, in this thread."""
+async def _authorizing_step(
+    step: Callable[[], Any], deadline: float | None, limiter: anyio.CapacityLimiter | None
+) -> Any:
+    """One step before the tool, within what is left of the deadline."""
+    if deadline is None:
+        return await _call(step, limiter=limiter)
+    left = deadline - time.monotonic()
+    if left <= 0:
+        raise _TimedOut()
+    with anyio.move_on_after(left):
+        return await _call(step, limiter=limiter, abandon_on_cancel=True)
+    raise _TimedOut()
+
+
+def _drive_sync(steps: Generator[Callable[[], Any], Any, Any], timeout: float | None = None) -> Any:
+    """Run every step right here, in this thread.
+
+    A thread can't be interrupted, so the deadline is checked between steps:
+    a step that started in time runs to the end, and if the deadline passed
+    meanwhile the generator gets ``_TimedOut`` as if it had been cut off.
+    Inside a sync transaction, the database's own statement timeout is what
+    stops a query that hangs.
+    """
+    deadline = None if timeout is None else time.monotonic() + timeout
+    authorizing = True
     value: Any = None
     error: BaseException | None = None
     while True:
@@ -1020,20 +1121,29 @@ def _drive_sync(steps: Generator[Callable[[], Any], Any, Any]) -> Any:
             # cancellation here, the transaction rolls back, and the tool
             # never starts.
             anyio.from_thread.check_cancelled()
+            authorizing = False
             continue
         try:
+            if authorizing and deadline is not None and time.monotonic() >= deadline:
+                raise _TimedOut()
             value = step()
             if inspect.isawaitable(value):
                 close = getattr(value, "close", None)
                 if callable(close):
                     close()
                 raise TypeError("an async callable can't run inside a sync transaction")
+            if authorizing and deadline is not None and time.monotonic() > deadline:
+                raise _TimedOut()  # it answered, but too late to count
         except Exception as exc:
             error = exc
 
 
 def _run_sync_transaction(
-    transaction: Transaction, caller: Caller, steps: Generator[Callable[[], Any], Any, Any], state: _CallState
+    transaction: Transaction,
+    caller: Caller,
+    steps: Generator[Callable[[], Any], Any, Any],
+    state: _CallState,
+    timeout: float | None = None,
 ) -> Any:
     """The whole transaction, in the one worker thread this runs in."""
     manager = transaction.factory(caller)
@@ -1045,7 +1155,7 @@ def _run_sync_transaction(
         # set here is seen by every step and nowhere else.
         _TRANSACTION.set(handle)
         try:
-            result = _drive_sync(steps)
+            result = _drive_sync(steps, timeout)
         except BaseException as exc:
             state.signal = exc
             raise
@@ -1056,7 +1166,12 @@ def _run_sync_transaction(
 
 
 async def _run_async_transaction(
-    transaction: Transaction, caller: Caller, steps: Generator[Callable[[], Any], Any, Any], state: _CallState
+    transaction: Transaction,
+    caller: Caller,
+    steps: Generator[Callable[[], Any], Any, Any],
+    state: _CallState,
+    timeout: float | None = None,
+    limiter: anyio.CapacityLimiter | None = None,
 ) -> Any:
     manager = transaction.factory(caller)
     if not hasattr(manager, "__aenter__"):
@@ -1065,7 +1180,7 @@ async def _run_async_transaction(
     async with manager as handle:
         token = _TRANSACTION.set(handle)
         try:
-            result = await _drive_async(steps)
+            result = await _drive_async(steps, timeout, limiter)
         except BaseException as exc:
             state.signal = exc
             raise
@@ -1107,6 +1222,9 @@ def _build_spec(
     scopes: frozenset[str],
     policy: Policy,
     localns: Mapping[str, Any] | None = None,
+    *,
+    authorization_timeout: float | None = _INHERIT,
+    on_authorization_timeout: Any = _INHERIT,
 ) -> _ToolSpec:
     """Work out, once, everything the guard needs, and refuse a tool the gate
     can't enforce on.
@@ -1242,7 +1360,13 @@ def _build_spec(
     if signature.return_annotation is not inspect.Signature.empty:
         exposed_annotations["return"] = signature.return_annotation
 
+    if authorization_timeout is _INHERIT:
+        authorization_timeout = policy.authorization_timeout
+    if on_authorization_timeout is _INHERIT:
+        on_authorization_timeout = policy.on_authorization_timeout
     return _ToolSpec(
+        authorization_timeout=authorization_timeout,
+        on_authorization_timeout=on_authorization_timeout,
         name=tool_name,
         tier=tier,
         fn=fn,

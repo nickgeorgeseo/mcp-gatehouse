@@ -9,6 +9,10 @@ on:
 
 jobs:
   release:
+    # Publishes only from the public repo. The private clone shares this
+    # file but must never reach PyPI or the MCP registry: a tag pushed there
+    # skips this job instead of publishing under the public name.
+    if: github.repository == 'nickgeorgeseo/mcp-gatehouse'
     runs-on: ubuntu-latest
     environment: release
     permissions:

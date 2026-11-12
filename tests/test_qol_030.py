@@ -194,6 +194,19 @@ def test_version_has_one_source_of_truth():
     assert all(p["version"] == expected for p in server["packages"])
 
 
+def test_only_the_public_repo_publishes():
+    """The private clone shares the release workflow. Merging to main must
+    not release, and a version tag pushed here must not publish to PyPI or
+    the MCP registry under the public name."""
+    workflow = (REPO / ".github" / "workflows" / "release.yml").read_text()
+    trigger = workflow.split("\non:", 1)[1].split("\njobs:", 1)[0]
+    assert "tags:" in trigger and "branches" not in trigger
+    assert "pull_request" not in trigger and "workflow_dispatch" not in trigger
+    jobs = workflow.split("\njobs:", 1)[1]
+    assert "if: github.repository == 'nickgeorgeseo/mcp-gatehouse'" in jobs
+    assert jobs.count("runs-on:") == 1  # one job, and it is the guarded one
+
+
 def test_package_ships_type_information():
     assert (Path(mcp_gatehouse.__file__).parent / "py.typed").exists()
 

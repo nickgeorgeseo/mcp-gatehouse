@@ -1,7 +1,154 @@
 # Changelog
 
 All notable changes to `mcp-gatehouse`. The public API (`Gatehouse`,
-`Policy`, `AuditLog`, `AccessTier`) stays compatible within a minor line.
+`Policy`, `AuditLog`, `AccessTier`) stays compatible within a minor line,
+with one deliberate exception: 0.6.0's authorization invariant is
+breaking, and its release notes say how to migrate.
+
+## 0.6.0 — 2026-11-06
+
+### Breaking: authorization is a runtime invariant
+
+Every tool call now needs a verified caller, an explicit policy, and a
+decision on the record it acts on. Anything missing fails closed. To
+migrate a server:
+
+- Give every tool `authorize=`: your policy, or `any_caller` where any
+  verified caller may use it. A tool without one raises at registration.
+- Over stdio, and for in-memory clients, declare who calls are for:
+  `Gatehouse(..., local_caller=Caller(...))`. Without a token or a local
+  caller, calls are denied. `local_caller` never applies to an HTTP
+  request: an HTTP request without a verified token is denied even on a
+  server that declares one.
+- Create the `Gatehouse` before registering any tool, and register every
+  tool through it. A server that already has tools is refused, and
+  `@mcp.tool()`, `add_tool`, `MCPServer(tools=...)` and extension tools
+  are refused on a gated server.
+- A WRITE or DESTRUCTIVE tool that loads a record needs
+  `consistency=`: `Transaction(...)`, `ConditionalWrite()` or
+  `AcceptRace("why")`, per tool or as the `Gatehouse` default.
+- A tool that returns a list of records (`list[T]`, `tuple[T, ...]` or
+  `Sequence[T]` of Pydantic models, dataclasses, TypedDicts or mappings)
+  needs `authorize_items=` (or `any_item`). `authorize_items` on a tool
+  that returns anything else is refused.
+- A `Load` parameter on a tier that requires approval must be a Pydantic
+  model, a dataclass, a TypedDict or a mapping, or give
+  `Load(..., fingerprint=...)`, so the approval can bind to the record's
+  state. Anything else is refused at registration.
+- A `Load` or `Scope` parameter can't have a default, can't be
+  positional-only or variadic, and must carry the marker as its own
+  `Annotated[...]` metadata, not nested in another type. A loader's
+  parameters must name the tool's own arguments.
+- Tool annotations must evaluate at registration. The gate reads them
+  with the defining scope's locals, so local classes and loaders work.
+- SDK `Resolve(...)` parameters are refused on gated tools: the SDK runs
+  them before the gate.
+- A custom audit class whose `record` lists fixed keywords needs
+  `**kwargs`: the gate now passes `caller`, `authz`, `resources`,
+  `items`, `consistency`, `withheld` and more.
+- Requires `mcp>=2.3`.
+
+### Added
+
+- Audit sinks. `AuditLog(sink=...)` hands each record, as a dict, to
+  anything with a `write(record)` method (the `AuditSink` protocol), as
+  an alternative to `path=` and `stream=`. Two sinks ship with the
+  library: `JsonlSink`, the JSON-lines file or stream that `path=` and
+  `stream=` use, and `CallableSink(fn)`. A sink that raises doesn't lose
+  the record: it is written to stderr as one JSON line with a
+  `sink_error` field naming the exception type, and the call goes on.
+  The record's fields are documented in the README, field by field, and
+  in `docs/audit-line.schema.json`, a JSON Schema the test suite checks
+  every audit line against. `examples/audit_otel.py` forwards records to
+  OpenTelemetry logs.
+- `ApprovalStore`: where the round-trip approver remembers used
+  approvals, as `spend(nonce, expires) -> bool`. `MemoryApprovalStore` is
+  the default and remembers per process; `ElicitationApprover(store=...)`
+  takes another. `examples/approval_store_sqlite.py` is one on SQLite,
+  standard library only, for servers that share the SDK's request-state
+  key across replicas or restarts; its single-use guarantee is tested
+  across two processes. A store that raises denies the call, logged as
+  `approval store error: <ExceptionType>`.
+- External policy engines as the policy behind the gate:
+  `examples/policy_opa.py` and `examples/policy_cerbos.py`. Each sends
+  the caller, the tool, the action and the loaded record's attributes to
+  the engine over HTTP, standard library only, and maps the answer to
+  `Allow`, `Deny` or `Ask`. An engine that can't be reached is
+  `Deny("policy engine unavailable")`. Each file carries the engine-side
+  policy for the order-desk demo. The library imports neither.
+- Who each call was for. On servers that sign callers in with the MCP
+  SDK's auth (a `token_verifier`, over streamable HTTP or SSE), every
+  audit line has a `caller` field: the verified token's `client_id`,
+  `subject`, `issuer` and `scopes`, never the token itself. It is read
+  per request, so a token refreshed mid-session is logged as the new
+  one. Approvers get the same as `ApprovalRequest.caller`, a new
+  `Caller` type, and `terminal_approver` names the user and client in
+  its prompt. Names there are JSON-quoted with everything outside
+  printable ASCII escaped and cut at 80 characters, so a crafted
+  subject can't redraw the prompt or pass for someone else. Over stdio
+  nobody signs in: there is no `caller`, and audit lines are unchanged.
+- `Load(loader)`: a parameter the gate fills. It loads the record from the
+  model's arguments, your policy decides on it, and the tool gets that same
+  object. Hidden from the input schema, and registration fails if the SDK
+  would ever expose it.
+- Policies return `Allow()`, `Deny(reason)` or `Ask(reason)`. `Ask` puts
+  the call to the approver with the reason. Every refusal on authorization
+  reads the same to the model, and the audit log keeps the real reason.
+- Approvals are bound to the record's state. If it changes while a person
+  decides, the call is refused. The approval form and terminal prompt show
+  the record and the reason: the line `Load(describe=...)` returns, or by
+  default the record's fields as the audit log shows them, secrets masked.
+  The form also names who the call is for, puts each record on its own
+  line, and is titled "Approval" for clients that show the schema's name.
+- `consistency=`: `Transaction(factory)` runs load, policy, tool and
+  commit in your transaction, never held open during an approval.
+  `ConditionalWrite()` with `Conflict`, and `AcceptRace(reason)`.
+  `current_transaction()` reaches the handle.
+- `authorize_items=` filters list results item by item, and `Scope(fn)`
+  passes a caller-computed query filter to the tool. Audit lines count
+  `withheld` and flag `scope_mismatch`.
+- `scopes=` on a tool, and token claims for policies
+  (`AuthorizationRequest.claims`, never logged).
+- Audit fields `authz`, `resources`, `items`, `consistency`, `withheld`,
+  `filter_errors`, `scope_mismatch`, outcome `conflict`, cancellation
+  reason `authorizing`, and `"source": "local"` for the local caller.
+- `examples/orders_postgres.py`: a transaction with row-level security and
+  `FOR UPDATE`.
+
+### Docs
+
+- README: "Where it sits" places the gate next to agent-framework
+  approvals and gateways and policy services, by what each layer sees,
+  and says what the library is not by design.
+- README: "What the gate verifies, and what it trusts" lists, in a table,
+  what the gate checks itself and what it takes on trust (the SDK's token
+  verifier, `local_caller` over stdio, the client showing elicitation
+  forms to a person, the `ConditionalWrite` promise, `AcceptRace`, the
+  loader and policy, the audit sink and approval store), and what to do
+  when that trust isn't acceptable.
+
+### Fixed
+
+- A tool annotated `ctx: Context | None` no longer gets a second, hidden
+  `gatehouse_context` parameter in its input schema that the model could
+  fill.
+- Redacted sets come out sorted, so they read the same in every process.
+- `Decimal`, `date`, `datetime` and `time` values are logged and shown to
+  approvers as their values, not `«opaque:…»`. They can't carry text, and
+  an approval's fingerprint has to see an amount change: before, an
+  approval for an $812 order still applied after the order changed to
+  $99,999.
+
+### Changed
+
+- An audit log whose destination fails (a full disk, a closed stream, a
+  sink that raises) no longer raises out of the call. The line goes to
+  stderr with `sink_error`, and the call's outcome is what it would have
+  been.
+- On servers that sign callers in, the audit object's `record()` gets a
+  `caller` keyword. `AuditLog` takes any keywords; a custom audit class
+  whose `record` lists fixed keywords needs `**kwargs`, or calls fail
+  with a `TypeError`.
 
 ## 0.5.0 — 2026-11-02
 

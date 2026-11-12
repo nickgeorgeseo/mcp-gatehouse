@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import io
 import json
 
 from mcp_gatehouse import AccessTier, AuditLog, Policy, redact_arguments
@@ -42,8 +41,8 @@ def test_write_gating_opt_in():
 def test_audit_log_writes_jsonl_with_timestamp(tmp_path):
     path = tmp_path / "logs" / "audit.jsonl"
     with AuditLog(path=path) as log:
-        log.record(tool="x", outcome="ok")
-        log.record(tool="y", outcome="denied")
+        log.record(tool="x", tier="read", outcome="ok", arguments={})
+        log.record(tool="y", tier="read", outcome="denied", reason="denylist", arguments={})
     lines = path.read_text().splitlines()
     assert len(lines) == 2
     first = json.loads(lines[0])
@@ -51,10 +50,3 @@ def test_audit_log_writes_jsonl_with_timestamp(tmp_path):
     assert first["ts"].endswith("+00:00")
 
 
-def test_audit_log_requires_exactly_one_sink():
-    import pytest
-
-    with pytest.raises(ValueError):
-        AuditLog()
-    with pytest.raises(ValueError):
-        AuditLog(path="x.jsonl", stream=io.StringIO())

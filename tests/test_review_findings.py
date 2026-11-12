@@ -17,7 +17,9 @@ from mcp.server.mcpserver import Context, MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 from pydantic import BaseModel
 
-from mcp_gatehouse import AccessTier, AuditLog, GateDenied, Gatehouse, Policy
+from mcp_gatehouse import AccessTier, AuditLog, GateDenied, Policy
+
+from _support import OpenGatehouse as Gatehouse
 from mcp_gatehouse.policy import DEFAULT_REDACT, REDACTED, redact_arguments
 
 
@@ -63,6 +65,20 @@ def test_opaque_objects_never_pass_through():
     assert "leaky" not in json.dumps(safe)
     assert safe["thing"] == "«opaque:Mystery»"
     assert safe["blob"] == "«opaque:bytes»"
+
+
+def test_numbers_and_dates_are_shown_as_values():
+    """A Decimal or a date can't carry free text, so it isn't opaque: the log
+    shows the amount, and an approval's fingerprint sees it change."""
+    import datetime
+    from decimal import Decimal
+
+    safe = redact_arguments(
+        {"amount": Decimal("812.50"), "due": datetime.date(2026, 11, 6),
+         "at": datetime.datetime(2026, 11, 6, 9, 30, tzinfo=datetime.timezone.utc)},
+        DEFAULT_REDACT,
+    )
+    assert safe == {"amount": "812.50", "due": "2026-11-06", "at": "2026-11-06T09:30:00+00:00"}
 
 
 def test_tuples_and_sets_are_recursed():
@@ -116,7 +132,7 @@ def test_unicode_line_separators_cannot_forge_records():
     log = io.StringIO()
     audit = AuditLog(stream=log)
     evil = 'x {"ts":"0","tool":"forged","outcome":"ok"}'
-    audit.record(tool="real", outcome="ok", arguments={"note": evil})
+    audit.record(tool="real", tier="read", outcome="ok", arguments={"note": evil})
     raw = log.getvalue()
     assert raw.count("\n") == 1
     assert len(raw.splitlines()) == 1  # even line-aware readers see ONE record

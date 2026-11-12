@@ -10,7 +10,9 @@ import pytest
 from mcp import Client
 from mcp.server.mcpserver import MCPServer
 
-from mcp_gatehouse import AccessTier, AuditLog, Gatehouse, Policy
+from mcp_gatehouse import AccessTier, AuditLog, Policy
+
+from _support import OpenGatehouse as Gatehouse
 
 
 def build_server(policy: Policy, log_stream: io.StringIO) -> MCPServer:

@@ -7,8 +7,8 @@ build-backend = "hatchling.build"
 
 [project]
 name = "mcp-gatehouse"
-version = "0.5.0"
-description = "Permission tiers, approval gates, and audit logging for MCP servers — the server is the gatekeeper."
+version = "0.6.0"
+description = "Authorization as a runtime invariant for MCP servers: caller, policy and a decision on the record, checked in the server before every tool runs. Tiers, approval gates and an audit log around it."
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.10"
@@ -34,7 +34,7 @@ classifiers = [
     "Topic :: Software Development :: Libraries",
     "Topic :: Security",
 ]
-dependencies = ["mcp>=2,<3"]
+dependencies = ["mcp>=2.3,<3"]
 
 [project.scripts]
 mcp-gatehouse-demo = "mcp_gatehouse.demo:main"
@@ -49,6 +49,11 @@ Repository = "https://github.com/nickgeorgeseo/mcp-gatehouse"
 dev = [
     "pytest>=8",
     "anyio>=4",
+    # Imported by the tests' HTTP fixtures (tests/_support.py).
+    "uvicorn",
+    "httpx2",
+    # tests/conftest.py checks every audit line against docs/audit-line.schema.json.
+    "jsonschema>=4",
     "build",
     # <7 monkeypatches packaging to cap Metadata-Version at 2.4, which
     # rejects the 2.5 metadata hatchling emits.

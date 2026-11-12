@@ -9,7 +9,7 @@ reach the audit log.
 from __future__ import annotations
 
 import enum
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
 from typing import Any, Union
 
@@ -28,6 +28,36 @@ class AccessTier(enum.Enum):
 
 
 @dataclass(frozen=True)
+class Caller:
+    """Who a call was made for.
+
+    Over streamable HTTP or SSE with a ``token_verifier``, it is the identity
+    in the access token the MCP SDK verified for this request. Over stdio
+    nobody signs in, so it is the ``local_caller`` the server declared to
+    its :class:`~mcp_gatehouse.Gatehouse`; a server that declares none
+    denies every call. An HTTP request without a verified token is nobody,
+    never the local caller.
+
+    It is only as specific as your token verifier makes it. ``subject`` is
+    the user the token speaks for; a verifier that doesn't fill in
+    ``AccessToken.subject`` leaves it ``None``, and then all you know is
+    the client application. The token itself is never kept.
+    """
+
+    client_id: str
+    """The OAuth client (the application) the token was issued to."""
+
+    subject: str | None = None
+    """The token's ``sub``: the user it acts for. Unique only per issuer."""
+
+    issuer: str | None = None
+    """The token's ``iss`` claim, when the verifier supplies claims."""
+
+    scopes: tuple[str, ...] = ()
+    """The scopes the token was granted."""
+
+
+@dataclass(frozen=True)
 class ApprovalRequest:
     """What an approver sees before a gated tool runs.
 
@@ -42,6 +72,24 @@ class ApprovalRequest:
     """``time.monotonic()`` value at which the gate stops waiting and denies
     the call, or ``None`` for no limit. An approver that blocks — a prompt,
     a poll — should give up by then: past it, its answer is ignored."""
+
+    caller: Caller | None = None
+    """Who the call is for: the request's verified access token, or the
+    server's declared ``local_caller`` on stdio."""
+
+    reason: str | None = None
+    """Why the policy asked, when it answered ``Ask(reason)``; ``None`` when
+    the approval is required by the tool's tier alone."""
+
+    resources: tuple[str, ...] = ()
+    """One line per record the call acts on: what ``Load(describe=...)``
+    returns, or by default the record's redacted fields, so the approver
+    sees what will change, not only the model's arguments."""
+
+    binding: str | None = None
+    """A fingerprint of the caller, the records' state and the reason. Not
+    for showing: an approval given for one binding never runs a call with
+    another, so a record that changed while a person decided is refused."""
 
 
 Approver = Callable[[ApprovalRequest], Union[bool, Awaitable[bool]]]
@@ -112,7 +160,7 @@ class Policy:
 REDACTED = "«redacted»"
 
 
-def redact_arguments(arguments: dict[str, Any], keys: frozenset[str]) -> dict[str, Any]:
+def redact_arguments(arguments: Mapping[str, Any], keys: frozenset[str]) -> dict[str, Any]:
     """Return a deep copy of ``arguments`` with sensitive values masked.
 
     Matching is by whole key name at any nesting depth, ignoring case,
@@ -125,19 +173,32 @@ def redact_arguments(arguments: dict[str, Any], keys: frozenset[str]) -> dict[st
     closed here too.
     """
     import dataclasses as _dc
-    from collections.abc import Mapping, Sequence
+    import datetime as _dt
+    from collections.abc import Sequence
+    from decimal import Decimal
 
     lowered = {_normalize_key(k) for k in keys}
 
     def scrub(value: Any) -> Any:
         if value is None or isinstance(value, (str, int, float, bool)):
             return value
+        if isinstance(value, Decimal):
+            # Numbers and dates are shown as what they are: they can't carry
+            # text, and an approval's fingerprint must see an amount change.
+            return str(value)
+        if isinstance(value, (_dt.date, _dt.time)):  # datetime is a date
+            return value.isoformat()
         if isinstance(value, Mapping):
             return {
                 str(k): (REDACTED if _normalize_key(str(k)) in lowered else scrub(v))
                 for k, v in value.items()
             }
-        if isinstance(value, (list, tuple, set, frozenset)) or (
+        if isinstance(value, (set, frozenset)):
+            # Sorted: a set's order depends on PYTHONHASHSEED, and approvals
+            # bind to a fingerprint of the redacted record, which must read
+            # the same in every worker process.
+            return sorted((scrub(v) for v in value), key=_canonical)
+        if isinstance(value, (list, tuple)) or (
             isinstance(value, Sequence) and not isinstance(value, bytes)
         ):
             return [scrub(v) for v in value]
@@ -152,3 +213,10 @@ def redact_arguments(arguments: dict[str, Any], keys: frozenset[str]) -> dict[st
         return f"«opaque:{type(value).__name__}»"
 
     return scrub(dict(arguments))
+
+
+def _canonical(value: Any) -> str:
+    """One stable text for a JSON-shaped value, for sorting and fingerprints."""
+    import json
+
+    return json.dumps(value, sort_keys=True, ensure_ascii=True, default=str)

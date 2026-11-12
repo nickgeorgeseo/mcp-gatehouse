@@ -1,0 +1,119 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/nickgeorgeseo/mcp-gatehouse/blob/main/docs/audit-line.schema.json",
+  "title": "mcp-gatehouse audit line",
+  "description": "One record per tool call, as mcp-gatehouse hands it to the audit sink and as JsonlSink writes it, one JSON object per line. The README's audit section says when each field appears.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["ts", "tool", "tier", "outcome", "arguments"],
+  "properties": {
+    "ts": {
+      "type": "string",
+      "format": "date-time",
+      "description": "When the line was written, UTC, ISO-8601 (+00:00)."
+    },
+    "tool": {
+      "type": "string",
+      "description": "The tool the model called."
+    },
+    "tier": {
+      "enum": ["read", "write", "destructive", null],
+      "description": "The tool's declared tier. null when the tool wasn't registered through the gate (reason \"ungated tool\")."
+    },
+    "outcome": {
+      "enum": ["ok", "denied", "error", "conflict", "pending", "cancelled"],
+      "description": "ok: the tool ran. denied: the gate refused. error: the tool, the transaction, or item filtering failed. conflict: a conditional write matched nothing. pending: the approval was asked in the client over the 2026-07-28 round trip; the verdict is a later line. cancelled: the client gave up or the server shut down."
+    },
+    "reason": {
+      "type": "string",
+      "description": "Why, for every outcome but ok. Denials carry the gate's real reason (\"policy: not the owner\", \"not found: order\", \"approver refused\", \"approval timed out\", \"no verified caller\", \"ungated tool\", \"denylist\", \"missing scope: …\"); errors carry the exception type only, never its message; cancellations say the stage (\"authorizing\", \"awaiting approval\", \"tool running\")."
+    },
+    "arguments": {
+      "type": "object",
+      "description": "The model's arguments after redaction. Values under Policy.redact keys read \"«redacted»\"; values the redactor can't take apart read \"«opaque:TypeName»\". Never includes what the gate filled (Load, Scope, Context)."
+    },
+    "duration_ms": {
+      "type": "number",
+      "minimum": 0,
+      "description": "How long the tool itself ran, in milliseconds. On ok, conflict, and on error or cancelled lines whose reason says the tool was running."
+    },
+    "caller": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["client_id", "subject", "issuer", "scopes"],
+      "properties": {
+        "client_id": {"type": "string", "description": "The OAuth client the token was issued to, or the declared local caller's."},
+        "subject": {"type": ["string", "null"], "description": "The token's sub: the user it acts for. null when the verifier sets none."},
+        "issuer": {"type": ["string", "null"], "description": "The token's iss claim, when the verifier supplies claims."},
+        "scopes": {"type": "array", "items": {"type": "string"}, "description": "The scopes the token was granted."},
+        "source": {"const": "local", "description": "Present only when the caller is the server's declared local_caller (stdio, in-memory), not a verified token."}
+      },
+      "description": "Who the call was for. Absent on the two denials written before a caller is known: \"ungated tool\" and \"no verified caller\"."
+    },
+    "authz": {
+      "enum": ["allow", "ask", "deny", "open"],
+      "description": "The policy's decision on the call: open for an any_caller tool. Absent on lines written before the policy ran (denylist, no caller, missing scope, loader error, not found, cancelled while loading)."
+    },
+    "resources": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "object",
+        "description": "The redacted arguments this record was loaded from, by argument name. Never the record itself."
+      },
+      "description": "One entry per Load parameter, by parameter name. On every line of a tool that loads records."
+    },
+    "items": {
+      "const": "open",
+      "description": "The tool declared authorize_items=any_item: every item is shown to any caller. On every line of such a tool."
+    },
+    "consistency": {
+      "enum": ["transaction", "conditional", "accept-race"],
+      "description": "How the window between the check and the write is closed. On every line of a tool with consistency= (its own or the Gatehouse default)."
+    },
+    "consistency_reason": {
+      "type": "string",
+      "description": "The AcceptRace reason. With consistency \"accept-race\" only."
+    },
+    "withheld": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Items a list tool returned that the caller may not see, so they were removed. On ok lines of tools with authorize_items (other than any_item)."
+    },
+    "filter_errors": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "How many of the withheld items were withheld because the item policy raised. With withheld, only when above zero."
+    },
+    "scope_mismatch": {
+      "const": true,
+      "description": "A Scope was in force and the gate still had to withhold items: the query and the policy disagree. With withheld, only when true."
+    },
+    "sink_error": {
+      "type": "string",
+      "description": "Only on the copy of a line written to stderr because the audit sink raised: the exception type. Never in a sink's own output."
+    }
+  },
+  "allOf": [
+    {
+      "if": {"properties": {"outcome": {"const": "ok"}}},
+      "then": {"not": {"required": ["reason"]}},
+      "else": {"required": ["reason"]}
+    },
+    {
+      "if": {"required": ["consistency_reason"]},
+      "then": {"properties": {"consistency": {"const": "accept-race"}}, "required": ["consistency"]}
+    },
+    {
+      "if": {"required": ["filter_errors"]},
+      "then": {"required": ["withheld"]}
+    },
+    {
+      "if": {"required": ["scope_mismatch"]},
+      "then": {"required": ["withheld"]}
+    },
+    {
+      "if": {"properties": {"tier": {"const": null}}},
+      "then": {"properties": {"outcome": {"const": "denied"}, "reason": {"const": "ungated tool"}}}
+    }
+  ]
+}

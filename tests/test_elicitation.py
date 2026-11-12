@@ -18,7 +18,9 @@ from mcp import Client, MCPError
 from mcp.server.mcpserver import Context, MCPServer
 from mcp.types import ElicitResult, InputRequiredResult
 
-from mcp_gatehouse import AccessTier, AuditLog, ElicitationApprover, Gatehouse, Policy
+from mcp_gatehouse import AccessTier, AuditLog, ElicitationApprover, Policy
+
+from _support import OpenGatehouse as Gatehouse
 
 ARGUMENTS = {"order_id": "4417", "api_key": "sk-live-not-for-the-form"}
 LOGGED = {"order_id": "4417", "api_key": "«redacted»"}

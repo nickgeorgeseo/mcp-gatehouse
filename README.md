@@ -193,6 +193,18 @@ proxy or a gateway, has no control plane, mints or exchanges no tokens,
 and has no policy language: policies are Python, or a call to the engine
 you already run.
 
+It is also not a workflow layer. The gate checks one call at a time and
+keeps no workflow state, so a job that another agent picks up after a
+dropped call resumes from wherever your workflow stores it, not from the
+gate. Nor does it confirm what landed. `outcome: "ok"` means the tool
+returned without raising; under `Transaction` it also means the commit
+succeeded. For a tool that calls a calendar, a CRM or a payment service,
+it means the call returned, not that the change is there. Two things
+help a retry: `Load` reads the record again, so the policy decides on its
+current state, not the state the last attempt saw, and a policy that
+checks status refuses to cancel an order twice. Idempotency keys and
+"did it land" checks belong to the tool or the workflow above it.
+
 ### Policies
 
 A policy is any callable, sync or async, that takes an

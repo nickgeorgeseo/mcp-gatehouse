@@ -50,6 +50,11 @@ breaking, and its release notes say how to migrate.
 
 ### Docs
 
+- README, "Where it sits": the gate is not a workflow layer. It keeps no
+  workflow state and doesn't confirm that a change landed in an external
+  system; what `outcome: "ok"` does and doesn't mean, and what helps a
+  retry.
+
 - README, "Approve in the client": the exact `RequestStateSecurity(keys=[...])`
   setup replicas need, and why a store alone isn't enough without it.
 

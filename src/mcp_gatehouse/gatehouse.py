@@ -36,6 +36,7 @@ from types import MappingProxyType
 from typing import Annotated, Any, Callable, Literal, TypeVar, get_args, get_origin
 
 import anyio
+import anyio.from_thread
 import anyio.lowlevel
 import anyio.to_thread
 from mcp.server.auth.middleware.auth_context import get_access_token
@@ -973,8 +974,9 @@ def _before_tool() -> None:
     """Marks the point between the gate's steps and the tool. Never called."""
 
 
-# The last step the gate yields before the tool runs. The event-loop driver
-# takes a pending cancellation there; the sync driver passes through.
+# The last step the gate yields before the tool runs. Both drivers take a
+# pending cancellation there: the event-loop driver at a checkpoint, the
+# sync-transaction driver from its worker thread.
 _BEFORE_TOOL: Callable[[], Any] = _before_tool
 
 
@@ -1013,6 +1015,11 @@ def _drive_sync(steps: Generator[Callable[[], Any], Any, Any]) -> Any:
             return done.value
         value, error = None, None
         if step is _BEFORE_TOOL:
+            # Same point, from inside the transaction's worker thread: a
+            # client that gave up while the gate was authorizing gets its
+            # cancellation here, the transaction rolls back, and the tool
+            # never starts.
+            anyio.from_thread.check_cancelled()
             continue
         try:
             value = step()

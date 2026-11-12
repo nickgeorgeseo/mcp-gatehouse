@@ -504,8 +504,10 @@ before the call finished: `reason` says when. `authorizing` and `awaiting
 approval` mean the tool never ran. `tool running` comes with `duration_ms`,
 and the tool may have done part of its work. A sync tool can't be stopped
 partway: its worker thread runs to the end, and the line says `ok` or
-`error` as usual. The gate only writes the line; the cancellation goes on
-as it would without it.
+`error` as usual. A sync policy or loader can't be stopped either, but
+the gate takes the cancellation as soon as it returns, before the tool
+starts. Inside a `Transaction` that rolls the transaction back. The gate
+only writes the line; the cancellation goes on as it would without it.
 
 #### Sinks
 

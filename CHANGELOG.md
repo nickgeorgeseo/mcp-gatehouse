@@ -16,6 +16,13 @@ breaking, and its release notes say how to migrate.
   gate had moved on. The gate now takes it before the tool starts: the
   line says `authorizing`, and the tool doesn't run. A sync tool that
   finishes before the cancellation lands is still `ok`.
+- Inside a sync `Transaction`, a client that gave up while the gate was
+  authorizing didn't stop the call: the transaction's worker thread went
+  on to run the tool and commit, and the line said `ok`. The gate now
+  checks for the cancellation from that thread before the tool starts,
+  so the transaction rolls back, the tool doesn't run, and the line says
+  `cancelled` with reason `authorizing`. A tool that has already started
+  still runs to the end and commits, as before.
 - A call cancelled after its tool returned, while `authorize_items`
   filtered the result, was logged as `authorizing`. It now says
   `tool running`, with the tool's `duration_ms`.

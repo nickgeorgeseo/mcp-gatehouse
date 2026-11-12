@@ -11,15 +11,20 @@ a deadline added later has something to be measured against.
   whole server; no deadline the gate sets can interrupt that.
 - Inside a sync ``Transaction`` every step, the policy included, runs in
   the transaction's one worker thread, so a hung policy also holds the
-  transaction open. Not exercised here.
+  transaction open. A client that gives up meanwhile gets its
+  cancellation once the policy returns, before the tool: the transaction
+  rolls back and the tool never runs.
 """
 
 from __future__ import annotations
 
+import contextlib
 import io
 import json
+import sqlite3
 import threading
 import time
+from typing import Annotated
 
 import anyio
 import anyio.to_thread
@@ -27,7 +32,7 @@ import pytest
 from mcp import Client
 from mcp.server.mcpserver import MCPServer
 
-from mcp_gatehouse import AccessTier, Allow, AuditLog, Policy
+from mcp_gatehouse import AccessTier, Allow, AuditLog, Load, Policy, Transaction, current_transaction
 
 from _support import OpenGatehouse as Gatehouse
 
@@ -206,3 +211,98 @@ async def test_a_call_cancelled_while_its_items_are_filtered_says_the_tool_ran()
     line = json.loads(log.getvalue().splitlines()[-1])
     assert (line["outcome"], line["reason"]) == ("cancelled", "tool running")
     assert "duration_ms" in line
+
+
+# --- inside a sync Transaction ------------------------------------------------
+
+
+def transactional_server(db_path, policy, tool_started=None, tool_takes=0.0):
+    """A write tool in a sync SQLite transaction. The loader writes a row,
+    so a rollback is visible afterwards."""
+    log = io.StringIO()
+    mcp = MCPServer("t")
+    gk = Gatehouse(mcp, policy=Policy(), audit=AuditLog(stream=log))
+
+    @contextlib.contextmanager
+    def transaction(caller):
+        conn = sqlite3.connect(db_path)
+        try:
+            with conn:  # commits on success, rolls back on any exception
+                yield conn
+        finally:
+            conn.close()
+
+    def load(order_id: str) -> dict:
+        current_transaction().execute("INSERT INTO touched VALUES ('loader')")
+        return {"id": order_id}
+
+    @gk.tool(tier=AccessTier.WRITE, authorize=policy, consistency=Transaction(transaction))
+    def write(order_id: str, order: Annotated[dict, Load(load)]) -> str:
+        current_transaction().execute("INSERT INTO touched VALUES ('tool')")
+        if tool_started is not None:
+            tool_started.set()
+        time.sleep(tool_takes)
+        return "written"
+
+    return mcp, log
+
+
+def touched(db_path) -> list[str]:
+    with contextlib.closing(sqlite3.connect(db_path)) as conn:
+        return [r[0] for r in conn.execute("SELECT what FROM touched")]
+
+
+@pytest.fixture
+def db(tmp_path):
+    path = tmp_path / "t.db"
+    with contextlib.closing(sqlite3.connect(path)) as conn:
+        conn.execute("CREATE TABLE touched (what TEXT)")
+        conn.commit()
+    return path
+
+
+async def cancel_when(event: threading.Event, mcp) -> None:
+    async with Client(mcp) as client:
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(client.call_tool, "write", {"order_id": "1"})
+            await until(event)
+            tg.cancel_scope.cancel()
+
+
+@pytest.mark.anyio
+async def test_a_transaction_cancelled_while_authorizing_rolls_back_before_the_tool(db):
+    """The client gives up while a sync policy runs inside the transaction.
+    The policy finishes in its thread, the gate takes the cancellation
+    before the tool, and the transaction rolls back: the loader's write is
+    gone and the tool never ran."""
+    started, released = threading.Event(), threading.Event()
+
+    def policy(request):
+        started.set()
+        released.wait(timeout=10)
+        return Allow()
+
+    mcp, log = transactional_server(db, policy)
+    threading.Timer(0.2, released.set).start()
+    try:
+        await cancel_when(started, mcp)
+    finally:
+        released.set()
+    await anyio.sleep(0.3)  # let the worker thread finish its rollback
+    assert touched(db) == []
+    line = json.loads(log.getvalue().splitlines()[-1])
+    assert (line["outcome"], line["reason"]) == ("cancelled", "authorizing")
+    assert "duration_ms" not in line
+
+
+@pytest.mark.anyio
+async def test_a_transaction_whose_tool_already_started_still_commits(db):
+    """Once the tool is running, the gate doesn't stop it: the tool's
+    thread finishes, the transaction commits, and the line says ok."""
+    tool_started = threading.Event()
+    mcp, log = transactional_server(db, lambda request: Allow(), tool_started, tool_takes=0.3)
+    await cancel_when(tool_started, mcp)
+    await anyio.sleep(0.5)
+    assert touched(db) == ["loader", "tool"]
+    line = json.loads(log.getvalue().splitlines()[-1])
+    assert line["outcome"] == "ok"

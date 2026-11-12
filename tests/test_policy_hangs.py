@@ -115,12 +115,9 @@ async def test_a_hung_sync_policy_keeps_its_thread_after_the_client_gives_up():
 
 
 @pytest.mark.anyio
-@pytest.mark.xfail(strict=True, reason=(
-    "Known: the cancellation lands at the tool's first checkpoint, after the "
-    "gate set the stage to 'tool running', so the line says the tool was "
-    "running (with duration_ms) though it never started. Reported, not fixed."
-))
 async def test_a_call_cancelled_during_a_sync_policy_is_logged_as_authorizing():
+    """The cancellation is taken as soon as the policy's thread returns, so
+    the line says where the call was, and the tool never starts."""
     _, line, ran = await cancel_during_a_sync_policy(0.2)
     assert ran == []
     assert line["reason"] == "authorizing" and "duration_ms" not in line
@@ -179,3 +176,33 @@ async def test_a_hung_async_policy_blocks_only_its_call_and_goes_when_the_client
                 tg.cancel_scope.cancel()
     line = json.loads(log.getvalue().splitlines()[-1])
     assert (line["tool"], line["outcome"], line["reason"]) == ("stuck", "cancelled", "authorizing")
+
+
+@pytest.mark.anyio
+async def test_a_call_cancelled_while_its_items_are_filtered_says_the_tool_ran():
+    """The tool returned; the client gave up while an async item policy ran.
+    The line says the tool was running, with its duration, not "authorizing"."""
+    started = anyio.Event()
+
+    async def items(request):
+        started.set()
+        await anyio.sleep(10)
+        return Allow()
+
+    log = io.StringIO()
+    mcp = MCPServer("t")
+    gk = Gatehouse(mcp, policy=Policy(), audit=AuditLog(stream=log))
+
+    @gk.tool(tier=AccessTier.READ, authorize_items=items)
+    def listing() -> list[dict]:
+        return [{"id": "a"}]
+
+    async with Client(mcp) as client:
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(client.call_tool, "listing", {})
+            with anyio.fail_after(5):
+                await started.wait()
+            tg.cancel_scope.cancel()
+    line = json.loads(log.getvalue().splitlines()[-1])
+    assert (line["outcome"], line["reason"]) == ("cancelled", "tool running")
+    assert "duration_ms" in line

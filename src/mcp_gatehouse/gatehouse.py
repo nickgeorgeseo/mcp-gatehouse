@@ -36,6 +36,7 @@ from types import MappingProxyType
 from typing import Annotated, Any, Callable, Literal, TypeVar, get_args, get_origin
 
 import anyio
+import anyio.lowlevel
 import anyio.to_thread
 from mcp.server.auth.middleware.auth_context import get_access_token
 from mcp.server.auth.provider import principal_components
@@ -650,7 +651,8 @@ class Gatehouse:
                     # a cancelled task running. A tool cut off mid-run may
                     # have done part of its work, which is what the trail is
                     # for; inside a transaction, that work rolls back.
-                    if state.stage == "tool running":
+                    # Filtering and committing come after the tool ran.
+                    if state.stage != "authorizing":
                         record(
                             outcome="cancelled", reason="tool running", arguments=safe_args,
                             duration_ms=state.elapsed_ms(),
@@ -756,6 +758,7 @@ class Gatehouse:
             except Exception as exc:
                 raise _Refused(f"scope error: {type(exc).__name__}") from exc
 
+        yield _BEFORE_TOOL
         state.stage = "tool running"
         state.start = time.perf_counter()
         result = yield functools.partial(spec.fn, *call.args, **call.kwargs, **loaded, **scoped)
@@ -966,6 +969,15 @@ class Gatehouse:
 # --- driving the steps --------------------------------------------------------
 
 
+def _before_tool() -> None:
+    """Marks the point between the gate's steps and the tool. Never called."""
+
+
+# The last step the gate yields before the tool runs. The event-loop driver
+# takes a pending cancellation there; the sync driver passes through.
+_BEFORE_TOOL: Callable[[], Any] = _before_tool
+
+
 async def _drive_async(steps: Generator[Callable[[], Any], Any, Any]) -> Any:
     """Run each step on the event loop, sync ones in a worker thread."""
     value: Any = None
@@ -976,6 +988,14 @@ async def _drive_async(steps: Generator[Callable[[], Any], Any, Any]) -> Any:
         except StopIteration as done:
             return done.value
         value, error = None, None
+        if step is _BEFORE_TOOL:
+            # A sync step's thread isn't abandoned on cancellation: a policy
+            # or loader finishes, and the cancellation waits for the next
+            # checkpoint. Take it here, before the gate moves to the tool, so
+            # a call cancelled while it was authorized stops at
+            # "authorizing" and its tool never starts.
+            await anyio.lowlevel.checkpoint_if_cancelled()
+            continue
         try:
             value = await _call(step)
         except Exception as exc:
@@ -992,6 +1012,8 @@ def _drive_sync(steps: Generator[Callable[[], Any], Any, Any]) -> Any:
         except StopIteration as done:
             return done.value
         value, error = None, None
+        if step is _BEFORE_TOOL:
+            continue
         try:
             value = step()
             if inspect.isawaitable(value):

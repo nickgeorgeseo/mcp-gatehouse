@@ -7,6 +7,19 @@ breaking, and its release notes say how to migrate.
 
 ## Unreleased
 
+### Fixed
+
+- A call cancelled while a sync policy or loader was running was logged
+  as `cancelled` with reason `tool running` and a `duration_ms`, though
+  its tool never started. The worker thread can't be interrupted, so the
+  cancellation used to land at the tool's first checkpoint, after the
+  gate had moved on. The gate now takes it before the tool starts: the
+  line says `authorizing`, and the tool doesn't run. A sync tool that
+  finishes before the cancellation lands is still `ok`.
+- A call cancelled after its tool returned, while `authorize_items`
+  filtered the result, was logged as `authorizing`. It now says
+  `tool running`, with the tool's `duration_ms`.
+
 ### Changed
 
 - `examples/policy_opa.py` and `examples/policy_cerbos.py`: an engine that

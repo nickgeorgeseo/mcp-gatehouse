@@ -15,9 +15,31 @@ import urllib.request
 from collections.abc import Mapping
 from typing import Any
 
-from mcp_gatehouse import AuthorizationRequest, Deny
+from mcp_gatehouse import Ask, AuthorizationRequest, Decision, Deny
 
-UNAVAILABLE = Deny("policy engine unavailable")
+#: What the audit line says when the engine can't be reached in time.
+UNAVAILABLE_REASON = "policy engine unavailable"
+
+#: The default answer when the engine can't be reached. The reason goes to
+#: the audit log; the message goes to the model, so it can tell "not now"
+#: from "no" and try again later instead of giving up on the request.
+UNAVAILABLE = Deny(
+    UNAVAILABLE_REASON,
+    message="The authorization service did not answer, so this call was not run. "
+    "Nothing was changed. The call can be retried.",
+)
+
+
+def unavailable_decision(on_unavailable: type[Deny] | type[Ask]) -> Decision:
+    """What an unreachable engine decides: ``Deny`` (the default) refuses
+    the call with :data:`UNAVAILABLE`; ``Ask`` puts it to the approver
+    with the reason ``"policy engine unavailable"``. Anything else is a
+    mistake in the server's setup, so it raises at startup."""
+    if on_unavailable is Deny:
+        return UNAVAILABLE
+    if on_unavailable is Ask:
+        return Ask(UNAVAILABLE_REASON)
+    raise ValueError(f"on_unavailable must be Deny or Ask, not {on_unavailable!r}")
 
 
 class EngineError(Exception):
@@ -33,10 +55,10 @@ def post(url: str, payload: dict[str, Any], timeout: float) -> Any:
     """POST JSON, return the decoded JSON answer.
 
     Raises ``ConnectionError`` when the engine can't be reached in time
-    (the caller turns that into ``Deny("policy engine unavailable")``), and
+    (the caller turns that into its ``on_unavailable`` decision), and
     ``EngineError`` when it answers with an HTTP error or something that
-    isn't JSON. Either way the call is denied: a policy that can't decide
-    has decided no.
+    isn't JSON. That is always a denial, whatever ``on_unavailable`` says:
+    the engine answered, and the answer can't be used.
     """
     body = json.dumps(payload, default=str).encode("utf-8")
     request = urllib.request.Request(url, data=body, method="POST", headers={"Content-Type": "application/json"})

@@ -183,13 +183,27 @@ record, and keeps the trail. A team with a central policy engine keeps
 its rules there and lets the gate call it:
 [`examples/policy_opa.py`](examples/policy_opa.py) and
 [`examples/policy_cerbos.py`](examples/policy_cerbos.py) send the caller,
-the tool, the action and the loaded record to the engine, and an engine
-that can't be reached is a denial.
+the tool, the action and the loaded record to the engine. An engine that
+can't be reached is a denial, and the model is told the call can be
+retried, so "not now" doesn't read like "no". `on_unavailable=Ask` sends
+those calls to your approver instead.
 
 By design, `mcp-gatehouse` is none of the other layers. It is not a
 proxy or a gateway, has no control plane, mints or exchanges no tokens,
 and has no policy language: policies are Python, or a call to the engine
 you already run.
+
+It is also not a workflow layer. The gate checks one call at a time and
+keeps no workflow state, so a job that another agent picks up after a
+dropped call resumes from wherever your workflow stores it, not from the
+gate. Nor does it confirm what landed. `outcome: "ok"` means the tool
+returned without raising; under `Transaction` it also means the commit
+succeeded. For a tool that calls a calendar, a CRM or a payment service,
+it means the call returned, not that the change is there. Two things
+help a retry: `Load` reads the record again, so the policy decides on its
+current state, not the state the last attempt saw, and a policy that
+checks status refuses to cancel an order twice. Idempotency keys and
+"did it land" checks belong to the tool or the workflow above it.
 
 ### Policies
 
@@ -246,6 +260,38 @@ more, when that's safe to say.
   person decides, the call is refused rather than run on something they
   never saw. On a tier that requires approval, a record must be a Pydantic
   model, a dataclass or a mapping, or have a `fingerprint`.
+
+#### Deadlines
+
+A call gets five seconds to load its records and reach a decision: the
+loaders, the policy and any `Scope`, together. Past that it is denied,
+logged as `authorization timed out: policy` (or `loading order`, or
+`scope owner`), and the tool doesn't run. The model is told this isn't a
+refusal and the call can be retried, so "not now" doesn't read like "no".
+
+```python
+Policy(authorization_timeout=2.0)            # every tool
+@gk.tool(authorize=report_policy, authorization_timeout=30)  # one tool
+@gk.tool(authorize=refund_policy, on_authorization_timeout=Ask)
+```
+
+`on_authorization_timeout=Ask` puts a call whose policy ran out of time
+to the approver, with the reason `authorization timed out`, instead of
+denying it. A refund then waits for a person rather than being lost. A
+loader or `Scope` that runs out still denies: there is no record yet to
+ask about. `authorization_timeout=None` turns the deadline off, and every
+audit line for that tool says `"authorization_deadline": "off"`.
+
+Python can't stop a thread. A sync loader or policy past the deadline is
+abandoned: the call ends, and the thread finishes in the background with
+its result dropped. Those threads are the gate's own, not the pool sync
+tools draw on, so a hung policy can't leave a tool elsewhere waiting.
+Inside a sync `Transaction` every step runs in one thread, so the
+deadline is checked between steps: a slow policy runs to the end, then
+counts as late, and the transaction rolls back. Set the database's
+statement timeout for a query that hangs there. An `async` policy that
+blocks without awaiting, such as a sync HTTP call inside `async def`,
+stalls the whole server, and no deadline can reach it.
 
 ### The check and the write
 
@@ -368,21 +414,39 @@ one such channel.
 Used approvals are remembered in an `ApprovalStore`, so each runs its call
 once. The default, `MemoryApprovalStore`, remembers per process. That is
 enough while the SDK's request-state key is per process too, which it is
-by default: an approval minted before a restart, or by another replica,
-fails the SDK's seal check before the gate sees it. Share that key
-(`MCPServer(..., request_state_security=RequestStateSecurity(keys=[...]))`)
-so approvals survive a restart or work across replicas, and the store
-must be shared too, or one approval runs its call once per replica and
-once more after each restart within `approval_timeout`. A store is
-anything with `spend(nonce, expires) -> bool`:
-[`examples/approval_store_sqlite.py`](examples/approval_store_sqlite.py)
-is one on SQLite, standard library only, with the single-use guarantee
-tested across two processes. A store that raises denies the call, logged
-as `approval store error`.
+by default. Each process seals its questions with a key of its own, so an
+approval minted before a restart, or by another replica, fails the SDK's
+seal check before the gate or its store ever sees it.
+
+Replicas behind a load balancer, or a server that should honour approvals
+across a restart, need two things. First, every replica uses the same
+request-state key and the same server name, which the SDK binds each
+question to:
 
 ```python
-ElicitationApprover(store=SqliteApprovalStore("/var/lib/order-desk/approvals.db"))
+from mcp.server.request_state import RequestStateSecurity
+
+KEY = os.environ["MCP_REQUEST_STATE_KEY"]  # 32+ random bytes, the same on every replica
+mcp = MCPServer("order-desk", request_state_security=RequestStateSecurity(keys=[KEY]))
 ```
+
+Second, they share the store, or one approval runs its call once per
+replica, and once more after each restart within `approval_timeout`. A
+store is anything with `spend(nonce, expires) -> bool`. Two are examples
+to copy:
+[`examples/approval_store_sqlite.py`](examples/approval_store_sqlite.py),
+standard library only, for replicas on one host, and
+[`examples/approval_store_postgres.py`](examples/approval_store_postgres.py),
+on `psycopg`, for replicas on several. Both spend each nonce once under
+concurrent spenders and sweep expired ones. A store that raises denies
+the call, logged as `approval store error`.
+
+```python
+ElicitationApprover(store=PostgresApprovalStore(os.environ["APPROVALS_DSN"]))
+```
+
+To rotate the key without dropping questions in flight, the SDK takes a
+ring: `keys=[old, new]`, then `keys=[new, old]`, then `keys=[new]`.
 
 Elicitation trusts the client to show the form to a person. A client or
 hook set to accept forms on its own can approve too. When the approval
@@ -456,10 +520,11 @@ field is ever written.
 | `items` | `"open"` | every line of a tool with `authorize_items=any_item` |
 | `consistency` | `"transaction"`, `"conditional"`, `"accept-race"` | every line of a tool with `consistency=`, its own or the `Gatehouse` default |
 | `consistency_reason` | string | with `"accept-race"` |
+| `authorization_deadline` | `"off"` | every line of a tool with `authorization_timeout=None`: the deadline is turned off |
 | `withheld` | integer | `ok` lines of a tool with an item policy: items the caller may not see, removed |
 | `filter_errors` | integer | with `withheld`, when the item policy raised on some items |
 | `scope_mismatch` | `true` | with `withheld`, when a `Scope` was in force: the query and the policy disagree |
-| `sink_error` | string | only on the stderr copy of a line whose sink raised: the exception type |
+| `sink_error` | string | only on the stderr copy of a line that didn't reach the sink: the exception type when the sink raised, `"queue full"` or `"sink closed"` from a `BufferedSink` |
 
 The outcomes: `ok`, the tool ran. `denied`, the gate refused, and `reason`
 says why. `error`, the tool raised, or the transaction or item filtering
@@ -472,8 +537,10 @@ before the call finished: `reason` says when. `authorizing` and `awaiting
 approval` mean the tool never ran. `tool running` comes with `duration_ms`,
 and the tool may have done part of its work. A sync tool can't be stopped
 partway: its worker thread runs to the end, and the line says `ok` or
-`error` as usual. The gate only writes the line; the cancellation goes on
-as it would without it.
+`error` as usual. A sync policy or loader can't be stopped either, but
+the gate takes the cancellation as soon as it returns, before the tool
+starts. Inside a `Transaction` that rolls the transaction back. The gate
+only writes the line; the cancellation goes on as it would without it.
 
 #### Sinks
 
@@ -488,9 +555,9 @@ AuditLog(sink=CallableSink(queue.put))                      # your own function
 AuditLog(sink=CallableSink(lambda r: log.info("audit", extra=r)))  # the logging module
 ```
 
-Two sinks ship with the library, neither needing anything beyond it:
+Three sinks ship with the library, none needing anything beyond it:
 `JsonlSink(path=...)` or `JsonlSink(stream=...)`, which is what `path=`
-and `stream=` use, and `CallableSink(fn)`. For OpenTelemetry logs, copy
+and `stream=` use, `CallableSink(fn)`, and `BufferedSink`, below. For OpenTelemetry logs, copy
 [`examples/audit_otel.py`](examples/audit_otel.py): one log record per
 audit record, the record as the body and the fields worth filtering on as
 attributes. An HTTP collector or a logging pipeline is a `CallableSink`
@@ -502,6 +569,23 @@ writes the line to stderr with a `sink_error` field naming the exception
 type, and goes on. Watch stderr for `sink_error` if the sink is the only
 copy of the trail. `AuditLog.close()` calls the sink's `close()` when it
 has one.
+
+A sink is written on the request path, so a slow one (an HTTP collector,
+a remote log) slows every call. Wrap it in `BufferedSink` to write it from
+a background thread instead:
+
+```python
+AuditLog(sink=BufferedSink(CallableSink(post_to_collector), maxsize=10_000))
+```
+
+`write` puts the record on a bounded queue and returns at once; one
+thread writes the queue to the inner sink in order. When the queue is
+full the call doesn't wait. The record goes to stderr with
+`sink_error: "queue full"` instead of the queue, so stderr is then its
+only copy. Size `maxsize` for your bursts and alarm on `sink_error`.
+`close()` writes everything already queued, then closes the inner sink;
+it also runs at exit for a buffer nobody closed. A record written after
+`close()` goes to stderr with `sink_error: "sink closed"`.
 
 ### Who the call was for
 
@@ -568,7 +652,7 @@ to do when that trust isn't acceptable.
 | **The `ConditionalWrite` promise** | You promise the write carries the checked state in its own condition and raises `Conflict` when it matches nothing. The gate can't read your query. | Use `Transaction(...)`: the gate runs load, policy, tool and commit in your transaction, and a row locked in the loader can't change under the write. |
 | **`AcceptRace`** | You accept that the record may change between the check and the write, for the reason you gave. The gate only records it on every line. | Don't. Close the window with `Transaction(...)` or `ConditionalWrite()`; `AcceptRace` is for the cases where a race is harmless, and the audit log is where you justify that. |
 | **Your loader and your policy** | The record is what the loader returned; the decision is what the policy returned. A loader that reads the wrong row, or a policy with a hole, is enforced faithfully. | Load through the database's own access control (row-level security under the caller's identity, as `examples/orders_postgres.py` does), so a wrong query returns nothing rather than someone else's record. Keep `authorize_items` on list tools and alarm on `withheld` above zero. |
-| **The audit sink and the approval store** | A sink that raises gets its line on stderr; a store that raises denies the call. Where the records then go, and whether the store is shared by every replica, is the deployment's. | Ship the sink's output somewhere append-only and read `sink_error` from stderr. Share the approval store (`examples/approval_store_sqlite.py`) wherever the SDK's request-state key is shared. |
+| **The audit sink and the approval store** | A sink that raises gets its line on stderr; a store that raises denies the call. Where the records then go, and whether the store is shared by every replica, is the deployment's. | Ship the sink's output somewhere append-only and read `sink_error` from stderr. Share the approval store (`examples/approval_store_sqlite.py` on one host, `examples/approval_store_postgres.py` across hosts) wherever the SDK's request-state key is shared. |
 
 ## Try the demo
 

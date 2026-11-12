@@ -19,7 +19,7 @@ Then an in-memory store would let one approval run its call once per
 replica, and once more after each restart. This store puts the nonces in
 one SQLite file every replica on the host can see. For replicas on
 different hosts, the same `INSERT ... ON CONFLICT DO NOTHING` works on
-any SQL database; only the connection changes.
+any SQL database; `examples/approval_store_postgres.py` is that on Postgres.
 
 Standard library only. The single-use guarantee is tested across two
 processes in `tests/test_approval_store.py`. Wire it in with:

@@ -74,6 +74,10 @@
       "type": "string",
       "description": "The AcceptRace reason. With consistency \"accept-race\" only."
     },
+    "authorization_deadline": {
+      "const": "off",
+      "description": "The tool runs without an authorization deadline: authorization_timeout=None on the Policy or the tool. An opt-out, so it is on every line the tool writes."
+    },
     "withheld": {
       "type": "integer",
       "minimum": 0,
@@ -90,7 +94,7 @@
     },
     "sink_error": {
       "type": "string",
-      "description": "Only on the copy of a line written to stderr because the audit sink raised: the exception type. Never in a sink's own output."
+      "description": "Only on the copy of a line written to stderr instead of the sink: the exception type when the sink raised, \"queue full\" when a BufferedSink had no room, \"sink closed\" when a BufferedSink was written to after close. Never in a sink's own output."
     }
   },
   "allOf": [

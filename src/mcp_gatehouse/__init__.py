@@ -10,7 +10,7 @@ gates, and an audit log of every call.
 from importlib.metadata import PackageNotFoundError, version
 
 from .approvers import ApprovalStore, ElicitationApprover, MemoryApprovalStore, terminal_approver
-from .audit import AuditLog, AuditSink, CallableSink, JsonlSink, NullAuditLog
+from .audit import AuditLog, AuditSink, BufferedSink, CallableSink, JsonlSink, NullAuditLog
 from .authz import (
     AcceptRace,
     Allow,
@@ -53,6 +53,7 @@ __all__ = [
     "AuditSink",
     "AuthorizationRequest",
     "Authorizer",
+    "BufferedSink",
     "CallableSink",
     "Caller",
     "ConditionalWrite",

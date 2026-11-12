@@ -148,13 +148,49 @@ class Policy:
     waits as long as the approver takes. Running out of time is a denial,
     so the gate still fails closed."""
 
+    authorization_timeout: float | None = 5.0
+    """Seconds a call gets to load its records and reach a decision: the
+    loaders, the policy and any ``Scope``, together. Past it the call is
+    denied as "authorization timed out" and the model is told it can retry.
+    ``None`` turns the deadline off, and every audit line for the tool then
+    says ``"authorization_deadline": "off"``. A tool can set its own."""
+
+    on_authorization_timeout: Any = None
+    """What a policy that runs out of time counts as: ``Deny`` (the default)
+    or ``Ask``, which puts the call to the approver with the reason
+    "authorization timed out". A loader or ``Scope`` that runs out of time
+    always denies: there is no record yet to ask about."""
+
     def __post_init__(self) -> None:
         # `not > 0` rather than `<= 0`, so NaN is rejected too.
         if self.approval_timeout is not None and not self.approval_timeout > 0:
             raise ValueError("approval_timeout must be a positive number of seconds, or None")
+        check_authorization_timeout(self.authorization_timeout)
+        object.__setattr__(
+            self, "on_authorization_timeout", check_on_authorization_timeout(self.on_authorization_timeout)
+        )
 
     def needs_approval(self, tier: AccessTier) -> bool:
         return tier in self.require_approval
+
+
+def check_authorization_timeout(value: Any) -> None:
+    """A positive, finite number of seconds, or ``None`` for no deadline."""
+    if value is None:
+        return
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not 0 < value < float("inf"):
+        raise ValueError("authorization_timeout must be a positive number of seconds, or None")
+
+
+def check_on_authorization_timeout(value: Any) -> Any:
+    """``Deny`` or ``Ask`` (the classes); ``None`` means ``Deny``."""
+    from .authz import Ask, Deny  # authz imports this module
+
+    if value is None:
+        return Deny
+    if value is Deny or value is Ask:
+        return value
+    raise ValueError("on_authorization_timeout must be Deny or Ask (the class, not an instance)")
 
 
 REDACTED = "«redacted»"

@@ -26,8 +26,14 @@ What OPA answers, as `result`:
     {"effect": "ask", "reason": "order over $500"}
 
 Anything else is a denial, and the audit line says what came back. OPA
-unreachable, or slow past `timeout`, is `Deny("policy engine unavailable")`:
-a policy that can't decide has decided no.
+unreachable, or slow past `timeout`, is `Deny("policy engine unavailable")`
+by default: a policy that can't decide has decided no. The model is told
+the authorization service didn't answer and the call can be retried, so
+"not now" doesn't read like "no". `on_unavailable=Ask` sends those calls
+to the approver instead, with the reason "policy engine unavailable"; with
+no approver configured they are still denied. For one item of a list
+result, only `Allow` shows the item, so an unreachable engine withholds it
+either way.
 
 The engine-side policy for the order-desk demo (owner check, shipped
 check, approval over $500), as `gatehouse.rego`:
@@ -69,14 +75,25 @@ from __future__ import annotations
 
 from typing import Any
 
-from _engine_http import UNAVAILABLE, EngineError, attributes, post, record_of, subject_of
+from _engine_http import EngineError, attributes, post, record_of, subject_of, unavailable_decision
 
 from mcp_gatehouse import Allow, Ask, AuthorizationRequest, Authorizer, Decision, Deny
 
 
-def opa_policy(url: str, *, rule: str = "gatehouse/decision", timeout: float = 2.0) -> Authorizer:
-    """A gate policy that asks OPA at ``url`` for ``data.<rule>``."""
+def opa_policy(
+    url: str,
+    *,
+    rule: str = "gatehouse/decision",
+    timeout: float = 2.0,
+    on_unavailable: type[Deny] | type[Ask] = Deny,
+) -> Authorizer:
+    """A gate policy that asks OPA at ``url`` for ``data.<rule>``.
+
+    ``on_unavailable`` is what OPA unreachable decides: ``Deny`` refuses
+    the call and tells the model it can retry; ``Ask`` puts it to the
+    approver."""
     endpoint = url.rstrip("/") + "/v1/data/" + rule.strip("/")
+    unavailable = unavailable_decision(on_unavailable)
 
     def decide(request: AuthorizationRequest) -> Decision:
         _, record = record_of(request)
@@ -92,7 +109,7 @@ def opa_policy(url: str, *, rule: str = "gatehouse/decision", timeout: float = 2
         try:
             answer = post(endpoint, payload, timeout)
         except ConnectionError:
-            return UNAVAILABLE
+            return unavailable
         except EngineError as exc:
             return Deny(exc.reason)
         return to_decision(answer.get("result") if isinstance(answer, dict) else None)

@@ -24,8 +24,14 @@ Denied on the first: `Deny`. For one item of a list result the action is
 
 The model's arguments are not sent: the engine decides on the record the
 server loaded. Cerbos unreachable, or slow past `timeout`, is
-`Deny("policy engine unavailable")`: a policy that can't decide has
-decided no. An answer without the actions asked about is a denial too.
+`Deny("policy engine unavailable")` by default: a policy that can't decide
+has decided no. The model is told the authorization service didn't answer
+and the call can be retried, so "not now" doesn't read like "no".
+`on_unavailable=Ask` sends those calls to the approver instead, with the
+reason "policy engine unavailable"; with no approver configured they are
+still denied. For one item of a list result, only `Allow` shows the item,
+so an unreachable engine withholds it either way. An answer without the
+actions asked about is a denial.
 
 The engine-side policy for the order-desk demo (owner check, shipped
 check, approval over $500), as `order.yaml` in the Cerbos policy
@@ -74,7 +80,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from _engine_http import UNAVAILABLE, EngineError, attributes, post, record_of, subject_of
+from _engine_http import EngineError, attributes, post, record_of, subject_of, unavailable_decision
 
 from mcp_gatehouse import Allow, Ask, AuthorizationRequest, Authorizer, Decision, Deny
 
@@ -83,11 +89,21 @@ UNATTENDED = ":unattended"
 
 
 def cerbos_policy(
-    url: str, *, kind: str, roles: tuple[str, ...] = ("user",), timeout: float = 2.0
+    url: str,
+    *,
+    kind: str,
+    roles: tuple[str, ...] = ("user",),
+    timeout: float = 2.0,
+    on_unavailable: type[Deny] | type[Ask] = Deny,
 ) -> Authorizer:
     """A gate policy that asks the Cerbos PDP at ``url`` about resources
-    of ``kind``. ``roles`` are the principal's roles; Cerbos needs one."""
+    of ``kind``. ``roles`` are the principal's roles; Cerbos needs one.
+
+    ``on_unavailable`` is what Cerbos unreachable decides: ``Deny`` refuses
+    the call and tells the model it can retry; ``Ask`` puts it to the
+    approver."""
     endpoint = url.rstrip("/") + "/api/check/resources"
+    unavailable = unavailable_decision(on_unavailable)
 
     def decide(request: AuthorizationRequest) -> Decision:
         _, record = record_of(request)
@@ -113,7 +129,7 @@ def cerbos_policy(
         try:
             answer = post(endpoint, payload, timeout)
         except ConnectionError:
-            return UNAVAILABLE
+            return unavailable
         except EngineError as exc:
             return Deny(exc.reason)
         return to_decision(answer, action)

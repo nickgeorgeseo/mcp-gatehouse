@@ -9,6 +9,10 @@ on:
 
 jobs:
   release:
+    # Publishes only from the public repo. The private clone shares this
+    # file but must never reach PyPI or the MCP registry: a tag pushed there
+    # skips this job instead of publishing under the public name.
+    if: github.repository == 'nickgeorgeseo/mcp-gatehouse'
     runs-on: ubuntu-latest
     environment: release
     permissions:
@@ -50,6 +54,11 @@ jobs:
             echo "::error::CHANGELOG.md has no '## $VERSION' section"
             exit 1
           fi
+          # The heading is "## 0.6.0 — unreleased" until release day.
+          if ! grep -Eq "^## $VERSION — [0-9]{4}-[0-9]{2}-[0-9]{2}$" CHANGELOG.md; then
+            echo "::error::CHANGELOG.md's '## $VERSION' heading has no release date"
+            exit 1
+          fi
 
       - name: Install build tooling
         # twine <7 monkeypatches packaging's metadata-version allowlist and caps
@@ -58,6 +67,20 @@ jobs:
 
       - run: pip install -e ".[dev]"
       - run: pytest -q
+
+      # The registry checks server.json only after PyPI has the release, and
+      # a PyPI version can't be uploaded twice: a description one character
+      # over the schema's limit would cost a version number. Check it first.
+      - name: server.json must match the registry schema
+        run: |
+          python - <<'EOF'
+          import json, urllib.request, jsonschema
+          server = json.load(open("server.json"))
+          with urllib.request.urlopen(server["$schema"]) as r:
+              schema = json.load(r)
+          jsonschema.validate(server, schema)
+          print("server.json is valid against", server["$schema"])
+          EOF
 
       - name: Build
         run: python -m build

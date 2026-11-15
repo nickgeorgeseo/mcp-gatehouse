@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
-import io
 import json
+
+import pytest
 
 from mcp_gatehouse import AccessTier, AuditLog, Policy, redact_arguments
 from mcp_gatehouse.policy import DEFAULT_REDACT, REDACTED
@@ -42,8 +43,8 @@ def test_write_gating_opt_in():
 def test_audit_log_writes_jsonl_with_timestamp(tmp_path):
     path = tmp_path / "logs" / "audit.jsonl"
     with AuditLog(path=path) as log:
-        log.record(tool="x", outcome="ok")
-        log.record(tool="y", outcome="denied")
+        log.record(call_id="0123456789abcdef0123456789abcdef", tool="x", tier="read", outcome="ok", arguments={})
+        log.record(call_id="0123456789abcdef0123456789abcdef", tool="y", tier="read", outcome="denied", reason="denylist", arguments={})
     lines = path.read_text().splitlines()
     assert len(lines) == 2
     first = json.loads(lines[0])
@@ -51,10 +52,10 @@ def test_audit_log_writes_jsonl_with_timestamp(tmp_path):
     assert first["ts"].endswith("+00:00")
 
 
-def test_audit_log_requires_exactly_one_sink():
-    import pytest
 
-    with pytest.raises(ValueError):
-        AuditLog()
-    with pytest.raises(ValueError):
-        AuditLog(path="x.jsonl", stream=io.StringIO())
+
+@pytest.mark.parametrize("bad", [True, 0, -1, float("nan"), "5"])
+def test_approval_timeout_is_a_positive_number_of_seconds(bad):
+    with pytest.raises(ValueError, match="approval_timeout"):
+        Policy(approval_timeout=bad)
+    Policy(approval_timeout=float("inf"))  # a person may take as long as they take

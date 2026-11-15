@@ -15,14 +15,24 @@ import pytest
 from mcp import Client, MCPError
 from mcp.server.mcpserver import MCPServer
 
-from mcp_gatehouse import AccessTier, AuditLog, Gatehouse, Policy
+from mcp_gatehouse import AccessTier, AuditLog, Policy
+
+from _support import LOCAL_ENTRY, signed_in, token
+from _support import OpenGatehouse as Gatehouse
 
 ARGUMENTS = {"order_id": "4417", "api_key": "sk-live-not-for-the-log"}
 LOGGED_ARGUMENTS = {"order_id": "4417", "api_key": "«redacted»"}
 
 
 def events(stream: io.StringIO) -> list[dict]:
-    return [json.loads(line) for line in stream.getvalue().split("\n") if line]
+    """The lines, less what differs every run: the call's id, the request's,
+    and its timings. Each is checked here before it goes."""
+    lines = [json.loads(line) for line in stream.getvalue().split("\n") if line]
+    for line in lines:
+        assert len(line.pop("call_id")) == 32
+        line.pop("request_id", None)
+        assert line.pop("timings_ms")["total"] >= 0
+    return lines
 
 
 async def until(started: threading.Event) -> None:
@@ -102,6 +112,7 @@ async def test_cancelled_while_awaiting_approval(interrupt):
     assert event == {
         "tool": "refund", "tier": "destructive", "outcome": "cancelled",
         "reason": "awaiting approval", "arguments": LOGGED_ARGUMENTS,
+        "caller": LOCAL_ENTRY, "authz": "open",
     }
 
 
@@ -139,6 +150,7 @@ async def test_cancelled_while_a_sync_approver_waits(interrupt):
     assert event == {
         "tool": "refund", "tier": "destructive", "outcome": "cancelled",
         "reason": "awaiting approval", "arguments": LOGGED_ARGUMENTS,
+        "caller": LOCAL_ENTRY, "authz": "open",
     }
 
 
@@ -164,6 +176,7 @@ async def test_cancelled_inside_an_async_tool(interrupt):
     assert event == {
         "tool": "refund", "tier": "destructive", "outcome": "cancelled",
         "reason": "tool running", "arguments": LOGGED_ARGUMENTS,
+        "caller": LOCAL_ENTRY, "authz": "open",
     }
 
 
@@ -225,7 +238,7 @@ async def test_cancellation_reaches_the_caller_unchanged(phase):
     log = io.StringIO()
     approver = slow_human if phase == "approval" else (lambda request: True)
     gk = Gatehouse(MCPServer("t"), policy=Policy(approver=approver), audit=AuditLog(stream=log))
-    guarded = gk._guard(refund, "refund", AccessTier.DESTRUCTIVE)
+    guarded = gk.guard(refund, "refund", AccessTier.DESTRUCTIVE)
     raised = []
 
     async def call() -> None:
@@ -235,10 +248,11 @@ async def test_cancellation_reaches_the_caller_unchanged(phase):
             raised.append(exc)
             raise
 
-    async with anyio.create_task_group() as tg:
-        tg.start_soon(call)
-        await until(started)
-        tg.cancel_scope.cancel()
+    with signed_in(token("alice")):
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(call)
+            await until(started)
+            tg.cancel_scope.cancel()
 
     (exc,) = raised
     assert isinstance(exc, anyio.get_cancelled_exc_class())

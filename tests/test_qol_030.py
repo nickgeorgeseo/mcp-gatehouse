@@ -18,7 +18,9 @@ from mcp import Client
 from mcp.server.mcpserver import MCPServer
 
 import mcp_gatehouse
-from mcp_gatehouse import DEFAULT_REDACT, AccessTier, AuditLog, Gatehouse, Policy, redact_arguments
+from mcp_gatehouse import DEFAULT_REDACT, AccessTier, AuditLog, Policy, redact_arguments
+
+from _support import OpenGatehouse as Gatehouse
 from mcp_gatehouse import demo
 
 REPO = Path(__file__).resolve().parent.parent
@@ -192,6 +194,19 @@ def test_version_has_one_source_of_truth():
     assert all(p["version"] == expected for p in server["packages"])
 
 
+def test_only_the_public_repo_publishes():
+    """The private clone shares the release workflow. Merging to main must
+    not release, and a version tag pushed here must not publish to PyPI or
+    the MCP registry under the public name."""
+    workflow = (REPO / ".github" / "workflows" / "release.yml").read_text()
+    trigger = workflow.split("\non:", 1)[1].split("\njobs:", 1)[0]
+    assert "tags:" in trigger and "branches" not in trigger
+    assert "pull_request" not in trigger and "workflow_dispatch" not in trigger
+    jobs = workflow.split("\njobs:", 1)[1]
+    assert "if: github.repository == 'nickgeorgeseo/mcp-gatehouse'" in jobs
+    assert jobs.count("runs-on:") == 1  # one job, and it is the guarded one
+
+
 def test_package_ships_type_information():
     assert (Path(mcp_gatehouse.__file__).parent / "py.typed").exists()
 
@@ -262,8 +277,9 @@ async def test_demo_tools_are_documented_and_work_end_to_end():
             for name, prop in tool.input_schema.get("properties", {}).items():
                 assert prop.get("description"), f"{tool.name}.{name} has no description"
 
-        listing = (await client.call_tool("list_orders", {})).content[0].text
+        listing = " ".join(c.text for c in (await client.call_tool("list_orders", {})).content)
         assert "4417" in listing and "4418" in listing
+        assert "4420" not in listing  # someone else's: the gate withholds it
         await client.call_tool("add_note", {"order_id": "4418", "note": "rush", "api_key": "sk-live-1"})
         assert "rush" in (await client.call_tool("lookup_order", {"order_id": "4418"})).content[0].text
 

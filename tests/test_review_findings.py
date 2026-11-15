@@ -132,7 +132,7 @@ def test_unicode_line_separators_cannot_forge_records():
     log = io.StringIO()
     audit = AuditLog(stream=log)
     evil = 'x {"ts":"0","tool":"forged","outcome":"ok"}'
-    audit.record(tool="real", tier="read", outcome="ok", arguments={"note": evil})
+    audit.record(call_id="0123456789abcdef0123456789abcdef", tool="real", tier="read", outcome="ok", arguments={"note": evil})
     raw = log.getvalue()
     assert raw.count("\n") == 1
     assert len(raw.splitlines()) == 1  # even line-aware readers see ONE record

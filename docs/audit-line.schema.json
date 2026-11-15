@@ -5,12 +5,51 @@
   "description": "One record per tool call, as mcp-gatehouse hands it to the audit sink and as JsonlSink writes it, one JSON object per line. The README's audit section says when each field appears.",
   "type": "object",
   "additionalProperties": false,
-  "required": ["ts", "tool", "tier", "outcome", "arguments"],
+  "required": ["ts", "call_id", "tool", "tier", "outcome", "arguments"],
   "properties": {
     "ts": {
       "type": "string",
       "format": "date-time",
       "description": "When the line was written, UTC, ISO-8601 (+00:00)."
+    },
+    "call_id": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{32}$",
+      "description": "The gate's id for one tool call, new for each call. Every line the call writes carries it, so a call's lines can be grouped. ApprovalRequest.call_id carries the same value to the approver."
+    },
+    "request_id": {
+      "type": "string",
+      "maxLength": 128,
+      "description": "The MCP request's JSON-RPC id, as a string, cut to 128 characters. Chosen by the client and unique only per session. Absent when no live request is behind the call (MCPServer.call_tool from code)."
+    },
+    "trace_id": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{32}$",
+      "description": "The OpenTelemetry trace the call runs in: the trace the client sent as traceparent in the request's _meta, or one a configured OpenTelemetry SDK started. Joins the line to the client's and the server's spans. Absent when there is neither."
+    },
+    "span_id": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{16}$",
+      "description": "The current span when the gate wrote the line: the MCP SDK's tools/call server span when an OpenTelemetry SDK is configured, else the client's span from traceparent. With trace_id."
+    },
+    "continues": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{32}$",
+      "description": "On the round that answers a round-trip approval: the call_id of the round that asked (its \"pending\" line). Present whatever the verdict, so an approval, a refusal and a replay all point back to the question."
+    },
+    "timings_ms": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["total"],
+      "properties": {
+        "authorize": {"type": "number", "minimum": 0, "description": "Loading records, the policy and Scope parameters, added up over both passes when an approval came between them."},
+        "approval": {"type": "number", "minimum": 0, "description": "Waiting for the approver. On a pending line, only the time to build the question."},
+        "tool": {"type": "number", "minimum": 0, "description": "The tool itself; the same as duration_ms on lines that have it."},
+        "filter": {"type": "number", "minimum": 0, "description": "The item policy over a list result. Only for tools with authorize_items (other than any_item)."},
+        "commit": {"type": "number", "minimum": 0, "description": "Closing the Transaction. Only for tools with consistency=Transaction."},
+        "total": {"type": "number", "minimum": 0, "description": "From the gate taking the call to this line."}
+      },
+      "description": "Milliseconds per stage the call reached, and the total. Absent on the two denials written before the call reaches its tool's gate: \"ungated tool\" and \"no verified caller\" from call_tool."
     },
     "tool": {
       "type": "string",
@@ -94,7 +133,7 @@
     },
     "sink_error": {
       "type": "string",
-      "description": "Only on the copy of a line written to stderr instead of the sink: the exception type when the sink raised, \"queue full\" when a BufferedSink had no room, \"sink closed\" when a BufferedSink was written to after close. Never in a sink's own output."
+      "description": "Only on the copy of a line written to stderr instead of the sink: the exception type when the sink raised, \"queue full\" when a BufferedSink had no room, \"sink closed\" when a BufferedSink was written to after close, \"terminated\" when SIGTERM ended the process with the record still in a BufferedSink (the one being written then may also be in the sink). Never in a sink's own output."
     }
   },
   "allOf": [

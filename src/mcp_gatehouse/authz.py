@@ -56,6 +56,11 @@ class Deny:
     reason: str
     message: str | None = None
 
+    def __post_init__(self) -> None:
+        _check_reason(self)
+        if self.message is not None and not isinstance(self.message, str):
+            raise TypeError("Deny(message=...) must be a str or None")
+
 
 @dataclass(frozen=True)
 class Ask:
@@ -67,6 +72,16 @@ class Ask:
     """
 
     reason: str
+
+    def __post_init__(self) -> None:
+        _check_reason(self)
+
+
+def _check_reason(decision: Deny | Ask) -> None:
+    """A reason is what the audit log and the approver are told: without
+    one, an ``Ask`` could read as no question at all."""
+    if not isinstance(decision.reason, str) or not decision.reason.strip():
+        raise TypeError(f"{type(decision).__name__}(reason) must be a non-empty str")
 
 
 Decision = Union[Allow, Deny, Ask]

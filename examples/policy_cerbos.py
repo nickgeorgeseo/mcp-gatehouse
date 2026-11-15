@@ -63,6 +63,14 @@ directory. Deny rules win, and nothing matched is a deny:
                 of:
                   - expr: request.resource.attr.owner == request.principal.id
                   - expr: request.resource.attr.total <= 500
+        # Every tool that may run without a person needs its own
+        # ':unattended' rule; without one the tool always asks.
+        - actions: ["lookup_order:unattended", "add_note:unattended"]
+          effect: EFFECT_ALLOW
+          roles: ["user"]
+          condition:
+            match:
+              expr: request.resource.attr.owner == request.principal.id
 
 Run Cerbos with it (`cerbos server --config=...`, the PDP on :3592) and
 wire the policy into any tool that loads one record:
@@ -132,22 +140,26 @@ def cerbos_policy(
             return unavailable
         except EngineError as exc:
             return Deny(exc.reason)
-        return to_decision(answer, action)
+        return to_decision(answer, actions)
 
     return decide
 
 
-def to_decision(answer: Any, action: str) -> Decision:
-    """Cerbos's check answer as the gate's decision. Anything unexpected denies."""
+def to_decision(answer: Any, actions: list[str]) -> Decision:
+    """Cerbos's check answer as the gate's decision. ``actions`` are the ones
+    asked about: the action, then (for a call) its ``:unattended`` twin.
+    Anything unexpected denies, including an answer that skips one."""
     try:
         (result,) = answer["results"]
         effects: dict[str, Any] = result["actions"]
     except (KeyError, TypeError, ValueError):
         return Deny("policy engine returned no decision")
-    if action not in effects:
-        return Deny(f"policy engine returned no decision for {action!r}")
+    missing = [a for a in actions if a not in effects]
+    if missing:
+        return Deny(f"policy engine returned no decision for {missing[0]!r}")
+    action = actions[0]
     if effects[action] != ALLOW:
         return Deny(f"policy engine: {effects[action]}")
-    if action + UNATTENDED in effects and effects[action + UNATTENDED] != ALLOW:
+    if len(actions) > 1 and effects[actions[1]] != ALLOW:
         return Ask("policy engine requires approval")
     return Allow()

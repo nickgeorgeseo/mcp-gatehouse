@@ -12,8 +12,11 @@ give me a chance to ship the fix first.
 
 **Does:** refuse any tool call without a verified caller and an explicit
 policy; enforce your policy on the record the call acts on, loaded by the
-server and handed to the tool as checked; refuse tools registered around
-the gate; filter list results item by item; run the check and the write in
+server and handed to the tool as checked; refuse tools, resources, prompts,
+completions, and SDK extension methods and `tools/call` interceptors
+registered around the gate (a resource or prompt that is
+the same for every caller is served only when you open it with
+`open_resource` / `open_prompt`, and still needs a verified caller); filter list results item by item; run the check and the write in
 one transaction you supply; enforce per-tool permission tiers and token
 scopes; gate calls behind an approver you control, bound to the record's
 state; keep an append-only audit trail that names the caller; and mask
@@ -23,8 +26,7 @@ configured argument keys before they reach logs or approvers.
 verified, or the local caller a stdio server declares), write your
 policies or queries, infer what the user intended (a manipulated agent can
 still do what the user is allowed to: keep grants narrow and put a person
-in front of what can't be undone), gate MCP resources or prompts, encrypt
-transports, sandbox tool code, or protect against a malicious *server
-author*. It's a gate inside your server, not a perimeter around it. Treat
+in front of what can't be undone), encrypt transports, sandbox tool code,
+or protect against a malicious *server author*. It's a gate inside your server, not a perimeter around it. Treat
 third-party MCP servers with the same scrutiny you'd give any software you
 install.

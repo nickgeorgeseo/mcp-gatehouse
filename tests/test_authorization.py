@@ -22,7 +22,7 @@ import pytest
 from mcp import Client
 from mcp.client.session import ClientSession
 from mcp.client.streamable_http import streamable_http_client
-from mcp.server.extension import Extension, ToolBinding
+from mcp.server.extension import Extension, MethodBinding, ToolBinding
 from mcp.server.mcpserver import Context, MCPServer, Resolve
 from mcp.server.mcpserver.tools.base import Tool
 from mcp.server.mcpserver.tools.tool_manager import ToolManager
@@ -139,6 +139,56 @@ class ExtraTools(Extension):
 def test_a_server_with_tools_already_on_it_is_refused(make):
     with pytest.raises(ValueError, match="outside the gate: sneaky"):
         Gatehouse(make(), local_caller=LOCAL)
+
+
+class _Params(BaseModel):
+    order_id: str = ""
+
+
+async def _read_order(ctx, params):
+    return {"leak": "order 4420"}
+
+
+class ExtraMethod(Extension):
+    """An SDK extension method: no policy, no caller check, no audit line."""
+
+    identifier = "com.example/orders"
+
+    def methods(self):
+        return (MethodBinding(method="com.example/orders.read", params_type=_Params, handler=_read_order),)
+
+
+class Interceptor(Extension):
+    """An SDK tools/call interceptor: it runs before the gate, and can answer
+    a call itself."""
+
+    identifier = "com.example/intercept"
+
+    async def intercept_tool_call(self, params, ctx, call_next):
+        return await call_next(ctx)
+
+
+class Additive(Extension):
+    """Settings only: nothing around the gate."""
+
+    identifier = "com.example/settings"
+
+    def settings(self):
+        return {"on": True}
+
+
+@pytest.mark.parametrize(
+    "extension, refused",
+    [(ExtraMethod(), "com.example/orders.read"), (Interceptor(), "intercept_tool_call")],
+    ids=["method", "interceptor"],
+)
+def test_an_extension_that_serves_around_the_gate_is_refused(extension, refused):
+    with pytest.raises(ValueError, match=refused):
+        Gatehouse(MCPServer("t", extensions=[extension]), local_caller=LOCAL)
+
+
+def test_an_extension_that_adds_nothing_around_the_gate_is_accepted():
+    Gatehouse(MCPServer("t", extensions=[Additive()]), local_caller=LOCAL)
 
 
 def _with_decorated_tool(mcp: MCPServer) -> MCPServer:

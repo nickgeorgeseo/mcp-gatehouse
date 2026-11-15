@@ -9,9 +9,10 @@ that are worth filtering on (tool, tier, outcome, authz, caller) are
 repeated as attributes.
 
 Needs `pip install opentelemetry-sdk`, and an exporter for your backend,
-such as `opentelemetry-exporter-otlp`. The library itself depends on
-nothing but the `mcp` SDK; this file is the only place OpenTelemetry is
-imported.
+such as `opentelemetry-exporter-otlp`. The library itself depends only on
+the `mcp` SDK and `opentelemetry-api` (which the SDK already requires, and
+which the gate uses only for trace IDs); the OpenTelemetry SDK is needed
+only here.
 
 Run it to see the records on stdout, as the console exporter prints them:
 

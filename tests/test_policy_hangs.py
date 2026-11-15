@@ -178,6 +178,55 @@ async def test_hung_sync_policies_leave_sync_tools_their_threads():
 
 
 @pytest.mark.anyio
+async def test_hung_policies_in_sync_transactions_leave_sync_tools_their_threads():
+    """A sync transaction runs its policy and tool in one thread that can't
+    be abandoned. Those threads are the tool's own too: with the default
+    pool cut to two and two transactions stuck in their policy, a plain
+    sync tool still gets a thread."""
+    limiter = anyio.to_thread.current_default_thread_limiter()
+    tokens = limiter.total_tokens
+    limiter.total_tokens = 2
+    started, released = threading.Semaphore(0), threading.Event()
+
+    def policy(request):
+        started.release()
+        released.wait(timeout=10)
+        return Allow()
+
+    @contextlib.contextmanager
+    def tx(caller):
+        yield None
+
+    mcp = MCPServer("t")
+    gk = Gatehouse(mcp, policy=Policy(authorization_timeout=0.5), audit=AuditLog(stream=io.StringIO()))
+
+    @gk.tool(tier=AccessTier.WRITE, authorize=policy, consistency=Transaction(tx))
+    def stuck() -> str:
+        return "ran"
+
+    @gk.tool(tier=AccessTier.READ)
+    def other() -> str:
+        return "other ran"
+
+    try:
+        async with Client(mcp) as client:
+            async with anyio.create_task_group() as tg:
+                tg.start_soon(client.call_tool, "stuck", {})
+                tg.start_soon(client.call_tool, "stuck", {})
+                for _ in range(2):
+                    with anyio.fail_after(5):
+                        while not started.acquire(blocking=False):
+                            await anyio.sleep(0.01)
+                with anyio.fail_after(2):
+                    result = await client.call_tool("other", {})
+                assert not result.is_error
+                released.set()
+    finally:
+        released.set()
+        limiter.total_tokens = tokens
+
+
+@pytest.mark.anyio
 async def test_a_hung_async_policy_blocks_only_its_call_and_goes_when_the_client_does():
     started = threading.Event()
 
@@ -321,3 +370,175 @@ async def test_a_transaction_whose_tool_already_started_still_commits(db):
     assert touched(db) == ["loader", "tool"]
     line = json.loads(log.getvalue().splitlines()[-1])
     assert line["outcome"] == "ok"
+
+
+# --- hung sync policies: per tool, and bounded --------------------------------
+
+
+def two_tools(hung_policy, *, deadline):
+    """``stuck`` has the hung policy; ``other`` a quick sync one."""
+    log = io.StringIO()
+    mcp = MCPServer("t")
+    gk = Gatehouse(mcp, policy=Policy(authorization_timeout=deadline), audit=AuditLog(stream=log))
+
+    @gk.tool(tier=AccessTier.READ, authorize=hung_policy)
+    def stuck() -> str:
+        return "ran"
+
+    def quick(request):
+        return Allow()
+
+    @gk.tool(tier=AccessTier.READ, authorize=quick)
+    def other() -> str:
+        return "other ran"
+
+    return mcp, log
+
+
+@pytest.mark.anyio
+async def test_hung_policies_on_one_tool_leave_other_tools_authorization_alone(monkeypatch):
+    """Each tool has its own authorization threads. With every one of
+    ``stuck``'s taken by a hung policy, ``other``'s sync policy still
+    answers at once, not when the hung calls' deadline passes."""
+    import mcp_gatehouse.gatehouse as gatehouse_module
+
+    monkeypatch.setattr(gatehouse_module, "_AUTHORIZE_THREADS", 2)
+    started, released = threading.Semaphore(0), threading.Event()
+
+    def hung(request):
+        started.release()
+        released.wait(timeout=10)
+        return Allow()
+
+    mcp, _ = two_tools(hung, deadline=3)
+    try:
+        async with Client(mcp) as client:
+            async with anyio.create_task_group() as tg:
+                tg.start_soon(client.call_tool, "stuck", {})
+                tg.start_soon(client.call_tool, "stuck", {})
+                for _ in range(2):
+                    with anyio.fail_after(5):
+                        while not started.acquire(blocking=False):
+                            await anyio.sleep(0.01)
+                began = time.monotonic()
+                result = await client.call_tool("other", {})
+                waited = time.monotonic() - began
+                released.set()
+            assert not result.is_error
+            assert waited < 1, f"other's policy waited {waited:.1f} s for a thread"
+    finally:
+        released.set()
+
+
+@pytest.mark.anyio
+async def test_abandoned_policy_threads_are_bounded_per_tool(monkeypatch, capsys):
+    """A thread past the deadline is abandoned but keeps its place until it
+    really returns, so a policy that never does can hold at most the
+    tool's own threads: later calls are denied at the deadline without
+    starting another. Once the threads return, the tool works again."""
+    import mcp_gatehouse.gatehouse as gatehouse_module
+
+    monkeypatch.setattr(gatehouse_module, "_AUTHORIZE_THREADS", 2)
+    entered: list[int] = []
+    released = threading.Event()
+
+    def hung(request):
+        entered.append(1)
+        if not released.is_set():
+            released.wait(timeout=10)
+        return Allow()
+
+    mcp, log = two_tools(hung, deadline=0.2)
+    try:
+        async with Client(mcp) as client:
+            for _ in range(6):
+                result = await client.call_tool("stuck", {})
+                assert result.is_error
+            assert len(entered) == 2  # only the tool's two threads ever started
+            reasons = [json.loads(line)["reason"] for line in log.getvalue().splitlines()]
+            assert reasons == ["authorization timed out: policy"] * 6
+            assert "abandoned" in capsys.readouterr().err
+            released.set()
+            with anyio.fail_after(5):
+                while True:  # the abandoned threads give their places back as they return
+                    result = await client.call_tool("stuck", {})
+                    if not result.is_error:
+                        break
+                    await anyio.sleep(0.05)
+    finally:
+        released.set()
+
+
+def test_places_held_by_abandoned_threads_come_back_on_the_next_event_loop(capsys):
+    """An abandoned thread that returns after its event loop has ended
+    still gives its place back: the same Gatehouse used under a second
+    ``anyio.run`` (a notebook, a sync framework calling ``asyncio.run``)
+    must not find the tool's places gone for good."""
+    from mcp_gatehouse.gatehouse import _Places
+    import math
+
+    places = _Places("t", 2, anyio.CapacityLimiter(math.inf))
+    returned = threading.Semaphore(0)
+
+    def slow_step():
+        time.sleep(0.3)
+        returned.release()
+        return 1
+
+    async def first_loop():
+        for _ in range(2):
+            with anyio.move_on_after(0.05):
+                await places.run(slow_step, abandon_on_cancel=True)
+        assert places._places.borrowed_tokens == 2
+
+    anyio.run(first_loop)
+    for _ in range(2):  # both threads return after the loop has gone
+        assert returned.acquire(timeout=5)
+
+    async def second_loop():
+        with anyio.fail_after(2):
+            return await places.run(lambda: "quick", abandon_on_cancel=True)
+
+    assert anyio.run(second_loop) == "quick"
+    assert places._places.borrowed_tokens == 0
+
+
+def test_an_abandoned_thread_never_waits_on_the_event_loop(monkeypatch):
+    """Giving the place back must not block the returning thread on the
+    loop: a loop stopped but not yet closed drops the callback, and a
+    thread waiting for it would hang the interpreter at exit."""
+    import anyio.from_thread as from_thread
+
+    def blocking(*args, **kwargs):
+        raise AssertionError("the thread waited on the event loop")
+
+    monkeypatch.setattr(from_thread, "run_sync", blocking)
+    from mcp_gatehouse.gatehouse import _Places
+    import math
+
+    places = _Places("t", 1, anyio.CapacityLimiter(math.inf))
+    errors: list[BaseException] = []
+    gone = threading.Event()
+
+    def slow_step():
+        try:
+            time.sleep(0.2)
+        finally:
+            gone.set()
+        return 1
+
+    async def main():
+        with anyio.move_on_after(0.05):
+            await places.run(slow_step, abandon_on_cancel=True)
+        with anyio.fail_after(5):
+            while not gone.is_set():
+                await anyio.sleep(0.01)
+        await anyio.sleep(0.05)  # the wake-up runs on the loop
+        assert places._places.borrowed_tokens == 0
+
+    threading.excepthook, old = (lambda a: errors.append(a.exc_value)), threading.excepthook
+    try:
+        anyio.run(main)
+    finally:
+        threading.excepthook = old
+    assert not errors

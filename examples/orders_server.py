@@ -1,6 +1,6 @@
 """A copyable template: the demo order-desk server, spelled out.
 
-This is the same server `mcp-gatehouse-demo` runs — copy it and swap the
+A trimmed copy of the server `mcp-gatehouse-demo` runs — copy it and swap the
 OrderDesk for your real system. What it shows:
 
 - Every tool names its policy. The gate loads the order from the model's

@@ -27,7 +27,16 @@ def every_audit_line_matches_the_schema(monkeypatch):
 
     def record(self, **event):
         original(self, **event)
-        as_read = json.loads(json.dumps({"ts": "2026-01-01T00:00:00+00:00", **event}, ensure_ascii=True, default=str))
+        try:
+            # allow_nan=False: strict JSON readers (jq, JSON.parse) reject
+            # NaN and Infinity, so a line carrying them isn't a valid line.
+            text = json.dumps(
+                {"ts": "2026-01-01T00:00:00+00:00", **event}, ensure_ascii=True, default=str, allow_nan=False
+            )
+        except ValueError as exc:
+            problems.append(f"not strict JSON ({exc}) in {event}")
+            return
+        as_read = json.loads(text)
         for error in AUDIT_LINE.iter_errors(as_read):
             problems.append(f"{error.json_path}: {error.message} in {as_read}")
 

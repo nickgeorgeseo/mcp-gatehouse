@@ -18,7 +18,7 @@ from mcp import Client
 from mcp.server.mcpserver import MCPServer
 from pydantic import BaseModel
 
-from mcp_gatehouse import AccessTier, Allow, Ask, AuditLog, Caller, ConditionalWrite, Deny, Load, Policy, any_caller
+from mcp_gatehouse import AccessTier, Allow, Ask, AuditLog, Caller, ConditionalWrite, Deny, Load, Policy
 from mcp_gatehouse.authz import AuthorizationRequest
 
 from _support import OpenGatehouse as Gatehouse
@@ -224,6 +224,11 @@ def test_cerbos_item_checks_ask_about_read_only(engine):
         ({"cancel_order": "EFFECT_ALLOW", "cancel_order:unattended": "EFFECT_DENY"}, Ask("policy engine requires approval")),
         ({"cancel_order": "EFFECT_DENY", "cancel_order:unattended": "EFFECT_DENY"}, Deny("policy engine: EFFECT_DENY")),
         ({"cancel_order:unattended": "EFFECT_ALLOW"}, Deny("policy engine returned no decision for 'cancel_order'")),
+        # Skipping the approval check isn't an allow: it was asked about.
+        (
+            {"cancel_order": "EFFECT_ALLOW"},
+            Deny("policy engine returned no decision for 'cancel_order:unattended'"),
+        ),
     ],
 )
 def test_cerbos_maps_the_effects(engine, effects, decision):

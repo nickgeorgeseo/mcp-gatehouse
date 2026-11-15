@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import io
 import json
+import subprocess
+import sys
 from typing import Annotated
 
 import jsonschema
@@ -25,6 +27,58 @@ pytestmark = pytest.mark.anyio
 # --- sinks -------------------------------------------------------------------
 
 
+_DISK_FILLS = r"""
+import json, resource, signal, sys
+from mcp_gatehouse import JsonlSink
+
+path = sys.argv[1]
+signal.signal(signal.SIGXFSZ, signal.SIG_IGN)  # a write past the limit fails with EFBIG instead
+sink = JsonlSink(path=path)
+failed = []
+
+def record(n):
+    try:
+        sink.write({"n": n, "padding": "x" * 300})
+    except OSError:
+        failed.append(n)
+
+resource.setrlimit(resource.RLIMIT_FSIZE, (1000, resource.RLIM_INFINITY))  # the disk fills
+for n in range(5):
+    record(n)
+resource.setrlimit(resource.RLIMIT_FSIZE, (resource.RLIM_INFINITY, resource.RLIM_INFINITY))  # space returns
+for n in range(5, 8):
+    record(n)
+sink.close()
+print(json.dumps(failed))
+"""
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="needs RLIMIT_FSIZE")
+def test_a_full_disk_leaves_only_whole_lines(tmp_path):
+    """While the disk is full a record's write fails part way. The file keeps
+    whole lines only (no torn record), and a record that failed, and so went
+    to stderr, never turns up in the file later as well."""
+    path = tmp_path / "audit.jsonl"
+    run = subprocess.run([sys.executable, "-c", _DISK_FILLS, str(path)], capture_output=True, text=True, check=True)
+    failed = json.loads(run.stdout)
+    assert failed, "the disk never filled"
+    raw = path.read_text()
+    assert raw.endswith("\n")
+    written = [json.loads(line)["n"] for line in raw.splitlines()]  # every line parses
+    assert not set(written) & set(failed)
+    assert sorted(written + failed) == list(range(8))
+
+
+def test_writes_after_close_raise_rather_than_reach_another_file(tmp_path):
+    sink = JsonlSink(path=tmp_path / "audit.jsonl")
+    sink.write({"n": 1})
+    sink.close()
+    with pytest.raises(ValueError):
+        sink.write({"n": 2})
+    sink.close()  # twice is fine
+    assert [json.loads(line) for line in (tmp_path / "audit.jsonl").read_text().splitlines()] == [{"n": 1}]
+
+
 def test_exactly_one_destination():
     with pytest.raises(ValueError):
         AuditLog()
@@ -41,7 +95,7 @@ def test_jsonl_file_is_the_default_sink(tmp_path):
     with AuditLog(path=path) as log:
         assert isinstance(log.sink, JsonlSink)
         assert log.path == path.absolute()
-        log.record(tool="x", tier="read", outcome="ok", arguments={})
+        log.record(call_id="0123456789abcdef0123456789abcdef", tool="x", tier="read", outcome="ok", arguments={})
     (line,) = path.read_text().splitlines()
     assert json.loads(line)["tool"] == "x"
 
@@ -49,7 +103,7 @@ def test_jsonl_file_is_the_default_sink(tmp_path):
 def test_callable_sink_gets_the_record_as_a_dict():
     seen: list[dict] = []
     log = AuditLog(sink=CallableSink(seen.append))
-    log.record(tool="x", tier="read", outcome="ok", arguments={"a": 1})
+    log.record(call_id="0123456789abcdef0123456789abcdef", tool="x", tier="read", outcome="ok", arguments={"a": 1})
     (record,) = seen
     assert record["tool"] == "x" and record["arguments"] == {"a": 1}
     assert record["ts"].endswith("+00:00")
@@ -71,7 +125,7 @@ def test_any_object_with_write_is_a_sink():
     collector = Collector()
     assert isinstance(collector, AuditSink)
     with AuditLog(sink=collector) as log:
-        log.record(tool="x", tier="read", outcome="ok", arguments={})
+        log.record(call_id="0123456789abcdef0123456789abcdef", tool="x", tier="read", outcome="ok", arguments={})
     assert [r["tool"] for r in collector.records] == ["x"]
     assert collector.closed
 
@@ -86,8 +140,8 @@ def test_a_sink_that_raises_sends_the_line_to_stderr_and_goes_on(capsys):
             raise ConnectionError("collector down: secret-value-here")
 
     log = AuditLog(sink=CallableSink(flaky))
-    log.record(tool="x", tier="read", outcome="ok", arguments={})  # the sink fails
-    log.record(tool="y", tier="read", outcome="ok", arguments={})  # the sink works
+    log.record(call_id="0123456789abcdef0123456789abcdef", tool="x", tier="read", outcome="ok", arguments={})  # the sink fails
+    log.record(call_id="0123456789abcdef0123456789abcdef", tool="y", tier="read", outcome="ok", arguments={})  # the sink works
     (line,) = capsys.readouterr().err.splitlines()
     fallen_back = json.loads(line)
     assert fallen_back["tool"] == "x"
@@ -128,14 +182,14 @@ def test_the_schema_file_is_a_valid_schema():
 @pytest.mark.parametrize(
     "bad",
     [
-        {"ts": "2026-01-01T00:00:00+00:00", "tool": "x", "tier": "read", "outcome": "ok", "arguments": {}, "extra": 1},
-        {"ts": "2026-01-01T00:00:00+00:00", "tool": "x", "tier": "read", "outcome": "denied", "arguments": {}},
-        {"ts": "2026-01-01T00:00:00+00:00", "tool": "x", "tier": "read", "outcome": "ok", "arguments": {}, "reason": "?"},
-        {"ts": "2026-01-01T00:00:00+00:00", "tool": "x", "tier": "admin", "outcome": "ok", "arguments": {}},
-        {"ts": "2026-01-01T00:00:00+00:00", "tool": "x", "tier": "read", "outcome": "ok", "arguments": {}, "authz": "maybe"},
-        {"ts": "2026-01-01T00:00:00+00:00", "tool": "x", "tier": "read", "outcome": "ok", "arguments": {},
+        {"ts": "2026-01-01T00:00:00+00:00", "call_id": "0" * 32, "tool": "x", "tier": "read", "outcome": "ok", "arguments": {}, "extra": 1},
+        {"ts": "2026-01-01T00:00:00+00:00", "call_id": "0" * 32, "tool": "x", "tier": "read", "outcome": "denied", "arguments": {}},
+        {"ts": "2026-01-01T00:00:00+00:00", "call_id": "0" * 32, "tool": "x", "tier": "read", "outcome": "ok", "arguments": {}, "reason": "?"},
+        {"ts": "2026-01-01T00:00:00+00:00", "call_id": "0" * 32, "tool": "x", "tier": "admin", "outcome": "ok", "arguments": {}},
+        {"ts": "2026-01-01T00:00:00+00:00", "call_id": "0" * 32, "tool": "x", "tier": "read", "outcome": "ok", "arguments": {}, "authz": "maybe"},
+        {"ts": "2026-01-01T00:00:00+00:00", "call_id": "0" * 32, "tool": "x", "tier": "read", "outcome": "ok", "arguments": {},
          "caller": {"client_id": "c", "subject": None, "issuer": None, "scopes": [], "token": "secret"}},
-        {"ts": "2026-01-01T00:00:00+00:00", "tool": "x", "tier": "write", "outcome": "ok", "arguments": {},
+        {"ts": "2026-01-01T00:00:00+00:00", "call_id": "0" * 32, "tool": "x", "tier": "write", "outcome": "ok", "arguments": {},
          "consistency": "conditional", "consistency_reason": "why"},
     ],
     ids=["unknown field", "denied without reason", "ok with reason", "unknown tier", "unknown authz",
@@ -196,3 +250,25 @@ async def test_every_kind_of_line_the_gate_writes_fits_the_schema():
     for record in seen:
         assert record["caller"]["source"] == "local"
         AUDIT_LINE.validate(json.loads(json.dumps(record, default=str)))
+
+
+async def test_an_infinite_argument_is_still_strict_json():
+    """Wire JSON can carry 1e999 (the SDK parses it to inf). The line must
+    stay readable to jq and JSON.parse, which reject Infinity."""
+    from _support import signed_in, token
+
+    stream = io.StringIO()
+    gate = Gatehouse(MCPServer("audit"), policy=Policy(), audit=AuditLog(stream=stream))
+
+    def refund(amount: float) -> str:
+        return "ok"
+
+    guarded = gate.guard(refund, "refund", AccessTier.READ)
+    with signed_in(token("alice")):
+        await guarded(amount=float("inf"))
+
+    def no_constants(name):
+        raise ValueError(name)
+
+    line = json.loads(stream.getvalue().splitlines()[-1], parse_constant=no_constants)
+    assert line["arguments"] == {"amount": "inf"}

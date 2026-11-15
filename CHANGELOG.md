@@ -5,102 +5,7 @@ All notable changes to `mcp-gatehouse`. The public API (`Gatehouse`,
 with one deliberate exception: 0.6.0's authorization invariant is
 breaking, and its release notes say how to migrate.
 
-## Unreleased
-
-### Fixed
-
-- A call cancelled while a sync policy or loader was running was logged
-  as `cancelled` with reason `tool running` and a `duration_ms`, though
-  its tool never started. The worker thread can't be interrupted, so the
-  cancellation used to land at the tool's first checkpoint, after the
-  gate had moved on. The gate now takes it before the tool starts: the
-  line says `authorizing`, and the tool doesn't run. A sync tool that
-  finishes before the cancellation lands is still `ok`.
-- Inside a sync `Transaction`, a client that gave up while the gate was
-  authorizing didn't stop the call: the transaction's worker thread went
-  on to run the tool and commit, and the line said `ok`. The gate now
-  checks for the cancellation from that thread before the tool starts,
-  so the transaction rolls back, the tool doesn't run, and the line says
-  `cancelled` with reason `authorizing`. A tool that has already started
-  still runs to the end and commits, as before.
-- A call cancelled after its tool returned, while `authorize_items`
-  filtered the result, was logged as `authorizing`. It now says
-  `tool running`, with the tool's `duration_ms`.
-
-### Changed
-
-- Breaking for a policy or loader that takes longer than five seconds:
-  it is now denied. Set `authorization_timeout` on the tool or the
-  Policy, or `None` to keep the old behaviour, which the audit log then
-  shows.
-
-- `examples/policy_opa.py` and `examples/policy_cerbos.py`: an engine that
-  can't be reached still denies, logged as `policy: policy engine
-  unavailable`, but the model is now told the authorization service
-  didn't answer and the call can be retried, instead of the generic "not
-  permitted" it gets for a refusal on the merits. Both factories take
-  `on_unavailable=Deny` (the default) or `on_unavailable=Ask`, which puts
-  those calls to the approver with the reason "policy engine
-  unavailable". An engine that answers with an error or garbage is still
-  a denial either way.
-
-### Added
-
-- An authorization deadline. Loaders, the policy and any `Scope` share
-  `Policy.authorization_timeout` seconds, 5 by default. Past it the call
-  is denied as `authorization timed out: policy` (or `loading <name>`, or
-  `scope <name>`), the tool doesn't run, and the model is told the call
-  can be retried. `@gk.tool(authorization_timeout=...)` overrides it for
-  one tool. `None` turns it off, and every audit line for that tool then
-  carries `"authorization_deadline": "off"`, a new field in the schema.
-- `on_authorization_timeout=Ask`, on the Policy or one tool: a policy that
-  runs out of time puts the call to the approver with the reason
-  `authorization timed out` instead of denying. A loader or `Scope` that
-  runs out still denies.
-- Sync loaders, policies and scopes run on the gate's own worker threads,
-  not anyio's default pool, so hung ones can't leave sync tools without a
-  thread. A sync step past the deadline is abandoned and finishes in the
-  background. Inside a sync `Transaction` the deadline is checked between
-  steps, and a late answer rolls the transaction back.
-
-- `examples/approval_store_postgres.py`: the `ApprovalStore` contract on
-  Postgres, for replicas on several hosts. Single use under concurrent
-  spenders (primary key and `ON CONFLICT DO NOTHING`), expired rows swept
-  with a grace for clock drift between replicas, and Postgres unreachable
-  raises, so the gate denies. Needs `psycopg`; the library doesn't import
-  it. Its tests run when `GATEHOUSE_TEST_POSTGRES_DSN` names a database,
-  and skip otherwise.
-
-- `BufferedSink(inner, *, maxsize=10_000)`: audit writes off the request
-  path. `write` puts the record on a bounded queue and returns; one
-  background thread writes the queue to `inner` in order. Standard
-  library only. Drop policy: when the queue is full the call never
-  waits; the record goes to stderr as one JSON line with
-  `sink_error: "queue full"` and is not queued, so stderr is its only
-  copy. `close()` drains everything written before it, then closes
-  `inner`; buffers nobody closed are drained at interpreter exit. A
-  record written after `close()` goes to stderr with
-  `sink_error: "sink closed"`. `sink_error` in the schema and the README
-  now lists these two values beside the exception type.
-
-### Packaging
-
-- The sdist leaves out `docs/*.mp4` and `docs/*.gif`: from about 6 MB to
-  about 140 KB. The wheel is unchanged, and the README links its
-  recording by absolute URL, so nothing points at a missing file. The
-  `.tape` sources that make the recordings stay in.
-
-### Docs
-
-- README, "Where it sits": the gate is not a workflow layer. It keeps no
-  workflow state and doesn't confirm that a change landed in an external
-  system; what `outcome: "ok"` does and doesn't mean, and what helps a
-  retry.
-
-- README, "Approve in the client": the exact `RequestStateSecurity(keys=[...])`
-  setup replicas need, and why a store alone isn't enough without it.
-
-## 0.6.0 — 2026-11-06
+## 0.6.0 — 2026-11-15
 
 ### Breaking: authorization is a runtime invariant
 
@@ -119,12 +24,26 @@ migrate a server:
   tool through it. A server that already has tools is refused, and
   `@mcp.tool()`, `add_tool`, `MCPServer(tools=...)` and extension tools
   are refused on a gated server.
+- Resources, prompts and completions are refused on a gated server, like
+  tools registered around the gate: they reached the same data with no
+  policy and no caller check. Register content that is the same for every
+  caller with `@gatehouse.open_resource(uri)` or `@gatehouse.open_prompt()`
+  (a verified caller is required to read it). Move anything per caller,
+  including a resource template that picks a record, to a READ tool with a
+  policy. A server that already has any of them when the `Gatehouse` is
+  created is refused.
+- A server with an SDK `Extension` that serves request methods of its own
+  (`Extension.methods()`) or overrides `intercept_tool_call` is refused
+  when the `Gatehouse` is created: both answered with no policy and no
+  audit line, and an interceptor ran before the gate.
 - A WRITE or DESTRUCTIVE tool that loads a record needs
   `consistency=`: `Transaction(...)`, `ConditionalWrite()` or
   `AcceptRace("why")`, per tool or as the `Gatehouse` default.
 - A tool that returns a list of records (`list[T]`, `tuple[T, ...]` or
   `Sequence[T]` of Pydantic models, dataclasses, TypedDicts or mappings)
-  needs `authorize_items=` (or `any_item`). `authorize_items` on a tool
+  needs `authorize_items=` (or `any_item`). That includes one arm of a
+  union (`list[Order] | None`), items that may be records
+  (`list[Order | None]`) and `type` aliases. `authorize_items` on a tool
   that returns anything else is refused.
 - A `Load` parameter on a tier that requires approval must be a Pydantic
   model, a dataclass, a TypedDict or a mapping, or give
@@ -141,15 +60,51 @@ migrate a server:
 - A custom audit class whose `record` lists fixed keywords needs
   `**kwargs`: the gate now passes `caller`, `authz`, `resources`,
   `items`, `consistency`, `withheld` and more.
+- Authorization has a deadline: a loader, policy or `Scope` that takes
+  longer than five seconds in total is denied. Set
+  `authorization_timeout` on the tool or the Policy, or `None` to turn
+  the deadline off, which the audit log then shows.
 - Requires `mcp>=2.3`.
 
 ### Added
+
+- An authorization deadline. Loaders, the policy and any `Scope` share
+  `Policy.authorization_timeout` seconds, 5 by default. Past it the call
+  is denied as `authorization timed out: policy` (or `loading <name>`, or
+  `scope <name>`), the tool doesn't run, and the model is told the call
+  can be retried. `@gatehouse.tool(authorization_timeout=...)` overrides it for
+  one tool. `None` turns it off, and every audit line for that tool then
+  carries `"authorization_deadline": "off"`.
+- `on_authorization_timeout=Ask`, on the Policy or one tool: a policy that
+  runs out of time puts the call to the approver with the reason
+  `authorization timed out` instead of denying. A loader or `Scope` that
+  runs out still denies.
+- Sync loaders, policies and scopes run on the gate's own worker threads,
+  not anyio's default pool, so hung ones can't leave sync tools without a
+  thread. Each tool has its own 40, so a policy hung on one tool doesn't
+  slow another tool's authorization. A sync step past the deadline is
+  abandoned and finishes in the background, keeping its place until it
+  does, with a warning on stderr: a policy that never returns ties up at
+  most its own tool's 40 threads, and that tool's later calls are denied
+  at the deadline without starting more. Inside a sync `Transaction` the deadline is checked between
+  steps, and a late answer rolls the transaction back. The transaction's
+  one thread is also the tool's own (40 per tool), not the default pool,
+  so a policy hung inside it can't leave sync tools elsewhere without a
+  thread.
+- A call cancelled while the gate is authorizing doesn't start its tool,
+  sync or async, inside a `Transaction` or not: the transaction rolls
+  back and the line says `cancelled` with reason `authorizing`. A call
+  cancelled after its tool started says `tool running`, with the tool's
+  `duration_ms`.
 
 - Audit sinks. `AuditLog(sink=...)` hands each record, as a dict, to
   anything with a `write(record)` method (the `AuditSink` protocol), as
   an alternative to `path=` and `stream=`. Two sinks ship with the
   library: `JsonlSink`, the JSON-lines file or stream that `path=` and
-  `stream=` use, and `CallableSink(fn)`. A sink that raises doesn't lose
+  `stream=` use, and `CallableSink(fn)`. A file `JsonlSink` opens gets
+  each record as one unbuffered write of the whole line; a write that
+  fails part way (a full disk) is cut back off, so the file holds only
+  whole lines and a record sent to stderr never lands in it later. A sink that raises doesn't lose
   the record: it is written to stderr as one JSON line with a
   `sink_error` field naming the exception type, and the call goes on.
   The record's fields are documented in the README, field by field, and
@@ -164,13 +119,41 @@ migrate a server:
   key across replicas or restarts; its single-use guarantee is tested
   across two processes. A store that raises denies the call, logged as
   `approval store error: <ExceptionType>`.
+- `examples/approval_store_postgres.py`: the `ApprovalStore` contract on
+  Postgres, for replicas on several hosts. Single use under concurrent
+  spenders (primary key and `ON CONFLICT DO NOTHING`), expired rows swept
+  with a grace for clock drift between replicas, and Postgres unreachable
+  raises, so the gate denies. Needs `psycopg`; the library doesn't import
+  it. Its tests run when `GATEHOUSE_TEST_POSTGRES_DSN` names a database,
+  and skip otherwise.
+- `BufferedSink(inner, *, maxsize=10_000)`: audit writes off the request
+  path. `write` puts the record on a bounded queue and returns; one
+  background thread writes the queue to `inner` in order. Standard
+  library only. Drop policy: when the queue is full the call never
+  waits; the record goes to stderr as one JSON line with
+  `sink_error: "queue full"` and is not queued, so stderr is its only
+  copy. `close()` drains everything written before it, then closes
+  `inner`; buffers nobody closed are drained at interpreter exit. A
+  record written after `close()` goes to stderr with
+  `sink_error: "sink closed"`. SIGTERM skips exit hooks, so a buffer
+  created on the main thread installs a SIGTERM handler when none is set
+  (one already there is never replaced): records still queued go to
+  stderr with `sink_error: "terminated"`, then the default SIGTERM ends
+  the process. An inner sink that raises anything, even a
+  `CancelledError`, loses only that record to stderr, and the buffer
+  goes on.
 - External policy engines as the policy behind the gate:
   `examples/policy_opa.py` and `examples/policy_cerbos.py`. Each sends
   the caller, the tool, the action and the loaded record's attributes to
   the engine over HTTP, standard library only, and maps the answer to
   `Allow`, `Deny` or `Ask`. An engine that can't be reached is
-  `Deny("policy engine unavailable")`. Each file carries the engine-side
-  policy for the order-desk demo. The library imports neither.
+  `Deny("policy engine unavailable")`, and the model is told the
+  authorization service didn't answer and the call can be retried;
+  `on_unavailable=Ask` puts those calls to the approver instead. An
+  engine that answers with an error or garbage, or leaves out an action
+  it was asked about, is a denial either way.
+  Each file carries the engine-side policy for the order-desk demo. The
+  library imports neither.
 - Who each call was for. On servers that sign callers in with the MCP
   SDK's auth (a `token_verifier`, over streamable HTTP or SSE), every
   audit line has a `caller` field: the verified token's `client_id`,
@@ -181,14 +164,17 @@ migrate a server:
   its prompt. Names there are JSON-quoted with everything outside
   printable ASCII escaped and cut at 80 characters, so a crafted
   subject can't redraw the prompt or pass for someone else. Over stdio
-  nobody signs in: there is no `caller`, and audit lines are unchanged.
+  nobody signs in: lines name the declared `local_caller`, marked
+  `"source": "local"`; without one, every call is denied.
 - `Load(loader)`: a parameter the gate fills. It loads the record from the
   model's arguments, your policy decides on it, and the tool gets that same
   object. Hidden from the input schema, and registration fails if the SDK
   would ever expose it.
 - Policies return `Allow()`, `Deny(reason)` or `Ask(reason)`. `Ask` puts
-  the call to the approver with the reason. Every refusal on authorization
-  reads the same to the model, and the audit log keeps the real reason.
+  the call to the approver with the reason, on any tier. Every refusal on
+  authorization reads the same to the model, and the audit log keeps the
+  real reason. A reason must be a non-empty string: `Ask(None)` raises,
+  and the gate denies the call as a policy error.
 - Approvals are bound to the record's state. If it changes while a person
   decides, the call is refused. The approval form and terminal prompt show
   the record and the reason: the line `Load(describe=...)` returns, or by
@@ -209,9 +195,25 @@ migrate a server:
   reason `authorizing`, and `"source": "local"` for the local caller.
 - `examples/orders_postgres.py`: a transaction with row-level security and
   `FOR UPDATE`.
+- Correlation in the audit trail. Every line has a `call_id`, the same on
+  every line one call writes and on `ApprovalRequest.call_id`. Lines
+  written inside a request have its JSON-RPC `request_id`, and, when the
+  call runs in an OpenTelemetry trace (the client's `traceparent` in
+  `_meta`, which the MCP SDK already picks up), `trace_id` and `span_id`.
+  The round that answers a round-trip approval has `continues`: the
+  `call_id` of the round that asked.
+- `timings_ms` on every line the tool's gate writes: milliseconds spent
+  authorizing, awaiting approval, in the tool, filtering items and
+  committing a `Transaction`, and the total. `duration_ms` stays, and is
+  the same number as `timings_ms.tool`.
 
 ### Docs
 
+- README, "Where it sits": the gate guards calls through this server only.
+  A path to the backend that skips the server never meets it, so enforce
+  the same checks in the backend too (row-level security under the
+  caller, as `examples/orders_postgres.py` does) and give the server the
+  narrowest credential it needs.
 - README: "Where it sits" places the gate next to agent-framework
   approvals and gateways and policy services, by what each layer sees,
   and says what the library is not by design.
@@ -221,6 +223,21 @@ migrate a server:
   forms to a person, the `ConditionalWrite` promise, `AcceptRace`, the
   loader and policy, the audit sink and approval store), and what to do
   when that trust isn't acceptable.
+- README, "Where it sits": the gate is not a workflow layer. It keeps no
+  workflow state and doesn't confirm that a change landed in an external
+  system; what `outcome: "ok"` does and doesn't mean, and what helps a
+  retry.
+- README, "Approve in the client": the exact `RequestStateSecurity(keys=[...])`
+  setup replicas need, and why a store alone isn't enough without it.
+
+### Packaging
+
+- `opentelemetry-api` is a declared dependency. The MCP SDK already
+  requires it, so nothing new is installed.
+- The sdist leaves out `docs/*.mp4` and `docs/*.gif`: from about 6 MB to
+  about 185 KB. The wheel is unchanged, and the README links its
+  recording by absolute URL, so nothing points at a missing file. The
+  `.tape` sources that make the recordings stay in.
 
 ### Fixed
 
@@ -232,7 +249,30 @@ migrate a server:
   approvers as their values, not `«opaque:…»`. They can't carry text, and
   an approval's fingerprint has to see an amount change: before, an
   approval for an $812 order still applied after the order changed to
-  $99,999.
+  $99,999. The same now goes for `Enum` values (shown as their value),
+  `UUID`s, IP addresses and paths. A record with a field the gate can
+  still only show by its type (`bytes`, an arbitrary object) can't be
+  approved without `Load(..., fingerprint=...)`: a change there would go
+  unseen.
+- An approver's answer approves only when it is `True`. A string, a
+  response object or any other truthy value used to approve; it is now
+  denied as `approver error: returned <type>`.
+- The approval form in the client takes only a real tick: `"yes"`,
+  `"true"` or `1` for `approve` is a malformed answer, and a refusal.
+- In the approval form, the model's arguments can't add lines: line and
+  paragraph separators, control and bidi characters in them are escaped,
+  as they already were for the record lines, and a long argument list is
+  cut so it can't push the record out of view. `terminal_approver`'s
+  prompt shows them the same way: JSON on one line, cut at 400
+  characters (it printed them in full, as a Python dict).
+- Redaction: a `NamedTuple` is redacted by field name (a `password`
+  field was logged); `bytearray` and `memoryview` are opaque like
+  `bytes` (their contents were logged as numbers); infinite and NaN
+  numbers are written as strings, so every audit line is strict JSON.
+- `MemoryApprovalStore` remembers a spent approval for five minutes past
+  its expiry, so a clock stepped back can't make it spendable again.
+  `examples/approval_store_sqlite.py` does the same (`sweep_grace=`) and
+  now closes its connections.
 
 ### Changed
 
@@ -289,8 +329,11 @@ migrate a server:
   asking, on macOS and Linux.
 - `terminal_approver` denies instead of prompting when a full-screen
   program, such as an MCP client's terminal UI, is using the terminal.
-- Pending approvals no longer block sync tools: approvers have their own
-  thread pool.
+- Pending approvals no longer block sync tools: sync approvers have their
+  own threads, 40 per tool. An approver still blocked when the approval
+  times out keeps its thread's place until it returns, with a warning on
+  stderr. So one that ignores `request.deadline` ties up at most its own
+  tool's 40, and approvals for other tools are unaffected.
 - Cancelled calls are logged as `outcome: "cancelled"`. A call cancelled
   during approval or while an async tool ran used to leave no record.
 

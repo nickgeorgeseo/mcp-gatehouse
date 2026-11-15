@@ -21,6 +21,7 @@ tier.
 
 from __future__ import annotations
 
+import asyncio
 import collections.abc
 import contextvars
 import copy
@@ -29,8 +30,13 @@ import functools
 import hashlib
 import inspect
 import json
+import math
+import sys
+import threading
 import time
+import types
 import typing
+import uuid
 from collections.abc import Generator, Mapping
 from types import MappingProxyType
 from typing import Annotated, Any, Callable, Literal, TypeVar, get_args, get_origin
@@ -43,10 +49,13 @@ from mcp.server.auth.middleware.auth_context import get_access_token
 from mcp.server.auth.provider import principal_components
 from mcp.server.mcpserver import Context, MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
+from mcp.shared.exceptions import MCPError
+from mcp_types import INVALID_REQUEST
 from mcp.types import InputRequiredResult, ToolAnnotations
+from opentelemetry import trace as _otel_trace
 from pydantic import BaseModel
 
-from .approvers import ElicitationApprover
+from .approvers import ElicitationApprover, asking_call
 from .audit import AuditLog, NullAuditLog
 from .authz import (
     _TRANSACTION,
@@ -58,6 +67,7 @@ from .authz import (
     ConditionalWrite,
     Conflict,
     Consistency,
+    Decision,
     Deny,
     Load,
     Scope,
@@ -71,22 +81,37 @@ from .policy import (
     Caller,
     Policy,
     _canonical,
-    check_authorization_timeout,
-    check_on_authorization_timeout,
+    _holds_opaque,
+    _OPAQUE_PREFIX,
+    _check_authorization_timeout,
+    _check_on_authorization_timeout,
     redact_arguments,
 )
 
 F = TypeVar("F", bound=Callable[..., Any])
 
-# Worker threads for sync approvers, kept apart from anyio's default pool.
-# Sync tools draw on that pool; approvers wait on people. If they shared it,
-# a stack of pending sign-offs would leave no thread for a plain read.
+# Worker threads for sync approvers, per tool, kept apart from anyio's
+# default pool. Sync tools draw on that pool; approvers wait on people. If
+# they shared it, a stack of pending sign-offs would leave no thread for a
+# plain read. Per tool, and held until the thread returns, as for the
+# authorization threads below: an approver still blocked when the approval
+# times out can't make another tool's approvals wait, or start more threads.
 _APPROVER_THREADS = 40
 
-# Worker threads for sync loaders, policies and scopes, kept apart from the
-# default pool for the same reason: a hung policy must not leave a sync tool
-# elsewhere on the server waiting for a thread.
+# Worker threads for sync loaders, policies and scopes, per tool, kept apart
+# from the default pool for the same reason: a hung policy must not leave a
+# sync tool elsewhere on the server waiting for a thread. Per tool, so a
+# policy that hangs on one tool can't make another tool's authorization wait,
+# and a thread abandoned at the deadline keeps its place until it returns,
+# so one that never does can't start more than this many.
 _AUTHORIZE_THREADS = 40
+
+# Worker threads for whole sync transactions, per tool. A sync transaction
+# runs its loader, policy and tool in one thread that can't be abandoned
+# (the connection is tied to it), so it is kept off the default pool too: a
+# policy hung inside one holds only its own tool's threads, never the ones
+# plain sync tools run on.
+_TRANSACTION_THREADS = 40
 
 # A tool that leaves the authorization deadline to the Policy.
 _INHERIT: Any = object()
@@ -200,25 +225,53 @@ class _Who:
     local: bool
 
 
+_Stage = Literal["authorizing", "awaiting approval", "tool running", "filtering", "committing"]
+
+# Each stage's name in the audit line's ``timings_ms``.
+_TIMING_KEYS: dict[str, str] = {
+    "authorizing": "authorize",
+    "awaiting approval": "approval",
+    "tool running": "tool",
+    "filtering": "filter",
+    "committing": "commit",
+}
+
+
 @dataclasses.dataclass
 class _CallState:
     """What one call has got to, for the audit lines it writes."""
 
-    stage: Literal["authorizing", "tool running", "filtering", "committing"] = "authorizing"
+    stage: _Stage = "authorizing"
     authz: str | None = None
-    start: float | None = None
-    duration_ms: float | None = None
     withheld: int | None = None
     filter_errors: int = 0
     scope_mismatch: bool = False
-    signal: BaseException | None = None
+    continues: str | None = None
+    """The ``call_id`` of the round that asked for the approval this round
+    answers, on the second round of a round-trip approval."""
+    began: float = dataclasses.field(default_factory=time.perf_counter)
+    stage_began: float | None = None
+    spent: dict[str, float] = dataclasses.field(default_factory=dict)
 
-    def elapsed_ms(self) -> float | None:
-        if self.duration_ms is not None:
-            return self.duration_ms
-        if self.start is None:
-            return None
-        return round((time.perf_counter() - self.start) * 1000, 2)
+    def enter(self, stage: _Stage) -> None:
+        """Move to ``stage``, adding the time spent in the last one to its total.
+        A stage entered twice (authorizing, before and after an approval) adds up."""
+        now = time.perf_counter()
+        if self.stage_began is not None:
+            key = _TIMING_KEYS[self.stage]
+            self.spent[key] = self.spent.get(key, 0.0) + (now - self.stage_began)
+        self.stage, self.stage_began = stage, now
+
+    def timings_ms(self) -> dict[str, float]:
+        """Milliseconds per stage so far, the current one included, and the total."""
+        now = time.perf_counter()
+        spent = dict(self.spent)
+        if self.stage_began is not None:
+            key = _TIMING_KEYS[self.stage]
+            spent[key] = spent.get(key, 0.0) + (now - self.stage_began)
+        timings = {key: round(seconds * 1000, 2) for key, seconds in spent.items()}
+        timings["total"] = round((now - self.began) * 1000, 2)
+        return timings
 
 
 @dataclasses.dataclass(frozen=True)
@@ -227,6 +280,7 @@ class _Call:
 
     spec: _ToolSpec
     who: _Who
+    call_id: str
     arguments: dict[str, Any]
     view: Mapping[str, Any]
     safe_args: dict[str, Any]
@@ -245,17 +299,17 @@ class _Refused(Exception):
         self.outcome = outcome
 
 
-class _TimedOut(Exception):
+class _DeadlinePassed(Exception):
     """A step before the tool ran past the authorization deadline. The
     driver throws it into the steps at the yield that ran out."""
 
 
 # The reason an approver sees when a policy ran out of time and the tool
 # asks instead of denying. Stable, so the approval binds to it.
-_TIMED_OUT = "authorization timed out"
+_TIMEOUT_ASK_REASON = "authorization timed out"
 
 
-def _timed_out(tool_name: str) -> str:
+def _timed_out_message(tool_name: str) -> str:
     """What the model is told: not a refusal on the merits, and nothing ran."""
     return (
         f"'{tool_name}' couldn't be authorized in time, so nothing ran. "
@@ -292,7 +346,9 @@ class Gatehouse:
 
     Create it before registering any tool: it refuses a server that already
     has tools, and from then on the server refuses tools registered around
-    it.
+    it. Resources, prompts and completions too: they have no policy, so
+    they are refused unless registered with :meth:`open_resource` or
+    :meth:`open_prompt`, for content any verified caller may read.
 
     ``local_caller`` is who a call is for when nobody signed in: stdio, and
     in-memory clients. It never applies to an HTTP request; an HTTP call
@@ -317,8 +373,12 @@ class Gatehouse:
         self.audit = audit or NullAuditLog()
         self.local_caller = local_caller
         self.consistency = consistency
-        self._approver_limiter = anyio.CapacityLimiter(_APPROVER_THREADS)
-        self._authorize_limiter = anyio.CapacityLimiter(_AUTHORIZE_THREADS)
+        # The pool the authorization and approver threads come from never
+        # makes a step wait: the per-tool places below are the limit.
+        self._authorize_pool = anyio.CapacityLimiter(math.inf)
+        self._authorize_places: dict[str, _Places] = {}
+        self._approver_places: dict[str, _Places] = {}
+        self._transaction_threads: dict[str, anyio.CapacityLimiter] = {}
         self._registry: dict[str, _Entry] = {}
         self._lock_down()
 
@@ -344,6 +404,8 @@ class Gatehouse:
                 + ", ".join(existing)
                 + ". Create the Gatehouse first and register every tool through it."
             )
+        resources, prompts = self._other_registries()
+        self._check_extensions()
         self._manager: Any = manager
         server._mcp_gatehouse = self  # type: ignore[attr-defined]
         gate = self
@@ -362,6 +424,7 @@ class Gatehouse:
 
         server.add_tool = refuse_unless_gate(server.add_tool)  # type: ignore[method-assign]
         manager.add_tool = refuse_unless_gate(manager.add_tool)  # type: ignore[method-assign]
+        self._lock_down_others(resources, prompts)
 
         server_call = server.call_tool
         manager_call = manager.call_tool
@@ -389,6 +452,161 @@ class Gatehouse:
         server.call_tool = call_tool  # type: ignore[method-assign]
         manager.call_tool = manager_call_tool  # type: ignore[method-assign]
         server.list_tools = list_tools  # type: ignore[method-assign]
+
+    def _check_extensions(self) -> None:
+        """Refuse SDK extensions that serve around the gate.
+
+        Their tools and resources are refused with the rest of the registry.
+        Two more contributions reach data with no policy and no audit line:
+        a request method of the extension's own (``Extension.methods()``),
+        and a ``tools/call`` interceptor (an overridden
+        ``Extension.intercept_tool_call``), which runs before the gate and
+        can answer a call itself. Extensions are fixed when the server is
+        made, so checking here covers them.
+        """
+        try:
+            from mcp.server.extension import Extension
+        except ImportError:  # pragma: no cover - an SDK without extensions
+            return
+        extensions = getattr(self.server, "_extensions", None)
+        if not isinstance(extensions, list):
+            raise RuntimeError(
+                "mcp-gatehouse can't enforce its gate on this version of the mcp SDK: "
+                "the server's extensions aren't where it checks them. The gate fails closed."
+            )
+        around: list[str] = []
+        for extension in extensions:
+            name = getattr(extension, "identifier", type(extension).__name__)
+            around += [f"method {binding.method} (from {name})" for binding in extension.methods()]
+            if type(extension).intercept_tool_call is not Extension.intercept_tool_call:
+                around.append(f"intercept_tool_call (from {name})")
+        if around:
+            raise ValueError(
+                "the server has extensions that serve around the gate: "
+                + ", ".join(around)
+                + ". An extension's own request methods and a tools/call interceptor run with no "
+                "policy and no audit line; put what they serve behind a tool registered with "
+                "@gatehouse.tool(...)."
+            )
+
+    def _other_registries(self) -> tuple[Any, Any]:
+        """The server's resource and prompt registries, checked before the
+        gate touches the server: they must be there, and empty.
+
+        Resources and prompts are other ways to the same data. A resource
+        template ``orders://{id}`` reads the record a tool would, with no
+        policy and no caller check. Completions suggest argument values
+        (order ids, customer names) and never see who is asking.
+        """
+        server = self.server
+        resources = getattr(server, "_resource_manager", None)
+        prompts = getattr(server, "_prompt_manager", None)
+        lowlevel = getattr(server, "_lowlevel_server", None)
+        if (
+            not all(callable(getattr(resources, a, None)) for a in ("add_resource", "add_template", "list_resources", "list_templates"))
+            or not all(callable(getattr(prompts, a, None)) for a in ("add_prompt", "list_prompts"))
+            or not all(callable(getattr(server, a, None)) for a in ("add_resource", "add_prompt", "read_resource", "get_prompt", "completion"))
+            or not isinstance(getattr(lowlevel, "_request_handlers", None), dict)
+        ):
+            raise RuntimeError(
+                "mcp-gatehouse can't enforce its gate on this version of the mcp SDK: "
+                "the resource and prompt registries it guards aren't there. The gate fails closed."
+            )
+        existing = [str(r.uri) for r in resources.list_resources()]
+        existing += [str(t.uri_template) for t in resources.list_templates()]
+        existing += [f"prompt {p.name}" for p in prompts.list_prompts()]
+        if "completion/complete" in lowlevel._request_handlers:
+            existing.append("a completion handler")
+        if existing:
+            raise ValueError(
+                "the server already has resources, prompts or completions registered outside the gate: "
+                + ", ".join(sorted(existing))
+                + ". Create the Gatehouse first; use gatehouse.open_resource(...) and "
+                "gatehouse.open_prompt(...) for content any verified caller may read, "
+                "and a READ tool for anything per caller."
+            )
+        return resources, prompts
+
+    def _lock_down_others(self, resources: Any, prompts: Any) -> None:
+        """Refuse resources, prompts and completions added around the gate,
+        and deny reads of the open ones without a verified caller."""
+        server, gate = self.server, self
+
+        def refuse_unless_gate(original: Callable[..., Any], what: str) -> Callable[..., Any]:
+            @functools.wraps(original)
+            def add(*args: Any, **kwargs: Any) -> Any:
+                if _REGISTERING.get(None) is not gate:
+                    raise TypeError(
+                        f"this server is gated: {what} have no policy, so they can't be registered "
+                        f"directly on the MCPServer. Use gatehouse.open_{what[:-1]}(...) for content "
+                        "any verified caller may read, or a READ tool with a policy for anything "
+                        "that depends on who is asking"
+                    )
+                return original(*args, **kwargs)
+
+            return add
+
+        server.add_resource = refuse_unless_gate(server.add_resource, "resources")  # type: ignore[method-assign]
+        resources.add_resource = refuse_unless_gate(resources.add_resource, "resources")
+        resources.add_template = refuse_unless_gate(resources.add_template, "resources")
+        server.add_prompt = refuse_unless_gate(server.add_prompt, "prompts")  # type: ignore[method-assign]
+        prompts.add_prompt = refuse_unless_gate(prompts.add_prompt, "prompts")
+
+        def completion(*args: Any, **kwargs: Any) -> Any:
+            raise TypeError(
+                "this server is gated: a completion handler never sees who is asking, "
+                "so it could suggest values (ids, names) the caller may not see. "
+                "Completions can't be registered on a gated server."
+            )
+
+        server.completion = completion  # type: ignore[method-assign]
+
+        server_read = server.read_resource
+        server_prompt = server.get_prompt
+
+        @functools.wraps(server_read)
+        async def read_resource(uri: Any, context: Any = None, *args: Any, **kwargs: Any) -> Any:
+            if gate._resolve(context) is None:
+                raise MCPError(INVALID_REQUEST, f"reading {uri} needs a verified caller, and this request has none.")
+            return await server_read(uri, context, *args, **kwargs)
+
+        @functools.wraps(server_prompt)
+        async def get_prompt(name: str, arguments: Any = None, context: Any = None, *args: Any, **kwargs: Any) -> Any:
+            if gate._resolve(context) is None:
+                raise MCPError(INVALID_REQUEST, f"prompt '{name}' needs a verified caller, and this request has none.")
+            return await server_prompt(name, arguments, context, *args, **kwargs)
+
+        server.read_resource = read_resource  # type: ignore[method-assign]
+        server.get_prompt = get_prompt  # type: ignore[method-assign]
+
+    def open_resource(self, uri: str, **resource_kwargs: Any) -> Callable[[F], F]:
+        """Register a resource any verified caller may read: the same for
+        everyone, such as docs, a schema or a price list.
+
+        It has no policy and writes no audit line; a read without a verified
+        caller is refused. Takes what ``MCPServer.resource`` takes. Anything
+        that depends on who is asking (a customer's order, a user's file),
+        including a template whose parameters pick a record, belongs in a
+        READ tool with a policy instead.
+        """
+        if not isinstance(uri, str):
+            raise TypeError("use @gatehouse.open_resource(\"scheme://...\"), with the URI")
+        return self._register_open(lambda: self.server.resource(uri, **resource_kwargs))
+
+    def open_prompt(self, **prompt_kwargs: Any) -> Callable[[F], F]:
+        """Register a prompt any verified caller may get. The same terms as
+        :meth:`open_resource`; takes what ``MCPServer.prompt`` takes."""
+        return self._register_open(lambda: self.server.prompt(**prompt_kwargs))
+
+    def _register_open(self, make: Callable[[], Callable[[F], F]]) -> Callable[[F], F]:
+        def decorator(fn: F) -> F:
+            registering = _REGISTERING.set(self)
+            try:
+                return make()(fn)
+            finally:
+                _REGISTERING.reset(registering)
+
+        return decorator
 
     def _gated(self, name: str) -> bool | None:
         """``True`` if the gate's own guard is what would run for ``name``;
@@ -421,17 +639,20 @@ class Gatehouse:
             return redact_arguments(arguments if isinstance(arguments, Mapping) else {}, self.policy.redact)
 
         if gated is False:
-            self.audit.record(tool=name, tier=None, outcome="denied", reason="ungated tool", arguments=safe())
+            self.audit.record(
+                call_id=_new_call_id(), tool=name, tier=None, outcome="denied", reason="ungated tool",
+                arguments=safe(), **_correlation(context),
+            )
             raise GateDenied(f"'{name}' was not registered through the gate, so it can't run.")
         if not check_caller:
             return None
         who = self._resolve(context)
         if who is None:
             self.audit.record(
-                tool=name, tier=self._registry[name].tier.value, outcome="denied",
-                reason="no verified caller", arguments=safe(),
+                call_id=_new_call_id(), tool=name, tier=self._registry[name].tier.value, outcome="denied",
+                reason="no verified caller", arguments=safe(), **_correlation(context),
             )
-            raise GateDenied(_no_caller(name))
+            raise GateDenied(_no_caller_message(name))
         return who
 
     # --- identity ------------------------------------------------------------
@@ -516,9 +737,9 @@ class Gatehouse:
         _check_consistency(consistency)
         required_scopes = frozenset({scopes} if isinstance(scopes, str) else scopes)
         if authorization_timeout is not _INHERIT:
-            check_authorization_timeout(authorization_timeout)
+            _check_authorization_timeout(authorization_timeout)
         if on_authorization_timeout is not _INHERIT:
-            on_authorization_timeout = check_on_authorization_timeout(on_authorization_timeout)
+            on_authorization_timeout = _check_on_authorization_timeout(on_authorization_timeout)
 
         def decorator(fn: F) -> F:
             tool_name = name or fn.__name__
@@ -533,12 +754,27 @@ class Gatehouse:
                 defined_in = dict(scope.f_locals) if scope is not None else {}
             finally:
                 del frame, scope
+            # The tool's own settings, else the gate's defaults.
             spec = _build_spec(
-                fn, tool_name, tier, authorize, authorize_items,
-                consistency if consistency is not None else self.consistency,
-                required_scopes, self.policy, defined_in,
-                authorization_timeout=authorization_timeout,
-                on_authorization_timeout=on_authorization_timeout,
+                fn,
+                tool_name,
+                tier=tier,
+                authorize=authorize,
+                authorize_items=authorize_items,
+                consistency=consistency if consistency is not None else self.consistency,
+                scopes=required_scopes,
+                policy=self.policy,
+                localns=defined_in,
+                authorization_timeout=(
+                    self.policy.authorization_timeout
+                    if authorization_timeout is _INHERIT
+                    else authorization_timeout
+                ),
+                on_authorization_timeout=(
+                    self.policy.on_authorization_timeout
+                    if on_authorization_timeout is _INHERIT
+                    else on_authorization_timeout
+                ),
             )
             guarded = self._guard(spec)
             registering = _REGISTERING.set(self)
@@ -579,6 +815,14 @@ class Gatehouse:
                 leaked = sorted(spec.hidden & visible)
                 if leaked:
                     problems.append(f"parameters the gate fills are in the input schema: {', '.join(leaked)}")
+                # The other way round too: everything the model can send is
+                # a parameter the gate knows it leaves to the model.
+                expected_args = {p for p in spec.bind_signature.parameters if p != spec.ctx_param}
+                sent = {f.alias or name for name, f in model.model_fields.items()}
+                sent |= set((tool.parameters or {}).get("properties", {}))
+                unknown = sorted(sent - expected_args)
+                if unknown:
+                    problems.append(f"the input schema has parameters the gate didn't expect: {', '.join(unknown)}")
                 if getattr(tool, "resolved_params", None):
                     problems.append("the SDK resolves some of its parameters before the gate")
                 expected = spec.ctx_param or _CONTEXT_PARAM
@@ -600,17 +844,7 @@ class Gatehouse:
         gate, policy, audit = self, self.policy, self.audit
         fn = spec.fn
 
-        consistency_fields: dict[str, Any] = {}
-        if isinstance(spec.consistency, Transaction):
-            consistency_fields["consistency"] = "transaction"
-        elif isinstance(spec.consistency, ConditionalWrite):
-            consistency_fields["consistency"] = "conditional"
-        elif isinstance(spec.consistency, AcceptRace):
-            consistency_fields["consistency"] = "accept-race"
-            consistency_fields["consistency_reason"] = spec.consistency.reason
-        if spec.authorization_timeout is None:
-            # The deadline is an opt-out like any other: visible on every line.
-            consistency_fields["authorization_deadline"] = "off"
+        tool_fields = _static_audit_fields(spec)
 
         async def run(arguments: dict[str, Any], args: tuple, kwargs: dict[str, Any], context: Any) -> Any:
             safe_args = redact_arguments(arguments, policy.redact)
@@ -620,14 +854,15 @@ class Gatehouse:
             admitted = _ADMITTED.get(None)
             who = admitted[1] if admitted is not None and admitted[0] == spec.name else gate._resolve(context)
             state = _CallState()
-            fixed: dict[str, Any] = {}
+            call_id = _new_call_id()
+            fixed: dict[str, Any] = _correlation(context)
             if spec.loads:
                 fixed["resources"] = {
                     load.name: {arg: safe_args.get(arg) for arg in load.argnames} for load in spec.loads
                 }
             if spec.items_open:
                 fixed["items"] = "open"
-            fixed.update(consistency_fields)
+            fixed.update(tool_fields)
 
             def record(**event: Any) -> None:
                 """One audit line for this call."""
@@ -635,8 +870,21 @@ class Gatehouse:
                     event["caller"] = _caller_entry(who)
                 if state.authz is not None:
                     event["authz"] = state.authz
+                if state.continues is not None:
+                    event["continues"] = state.continues
                 event.update(fixed)
-                audit.record(tool=spec.name, tier=spec.tier.value, **event)
+                timings = state.timings_ms()
+                # Stages with nothing to do take ~0 and would only be noise.
+                if spec.authorize_items is None or spec.items_open:
+                    timings.pop("filter", None)
+                if not isinstance(spec.consistency, Transaction):
+                    timings.pop("commit", None)
+                event["timings_ms"] = timings
+                if "duration_ms" in event:
+                    # The same number as timings_ms.tool, from the same
+                    # clock read; None when the tool never started.
+                    event["duration_ms"] = timings.get("tool")
+                audit.record(call_id=call_id, tool=spec.name, tier=spec.tier.value, **event)
 
             def denied(reason: str, message: str, outcome: str = "denied") -> GateDenied:
                 record(outcome=outcome, reason=reason, arguments=safe_args)
@@ -645,7 +893,7 @@ class Gatehouse:
             if spec.name in policy.deny:
                 raise denied("denylist", f"'{spec.name}' is blocked by policy.")
             if who is None:
-                raise denied("no verified caller", _no_caller(spec.name))
+                raise denied("no verified caller", _no_caller_message(spec.name))
             missing = sorted(spec.scopes - set(who.caller.scopes))
             if missing:
                 raise denied(
@@ -655,21 +903,22 @@ class Gatehouse:
                 )
 
             call = _Call(
-                spec=spec, who=who, arguments=arguments, view=_read_only(arguments),
+                spec=spec, who=who, call_id=call_id, arguments=arguments, view=_read_only(arguments),
                 safe_args=safe_args, args=args, kwargs=kwargs, context=context,
             )
             approved: str | None = None
             while True:
-                state.stage = "authorizing"
+                state.enter("authorizing")
                 try:
-                    result = await gate._phase(call, approved, state)
+                    result = await gate._authorize_and_run(call, approved, state)
                 except _Refused as refusal:
                     raise denied(
-                        refusal.reason, refusal.message or _not_permitted(spec.name), refusal.outcome
+                        refusal.reason, refusal.message or _not_permitted_message(spec.name), refusal.outcome
                     ) from None
                 except _NeedsApproval as need:
                     if approved is not None:  # pragma: no cover - the phase compares bindings
-                        raise denied("approval did not apply", _not_permitted(spec.name)) from None
+                        raise denied("approval did not apply", _not_permitted_message(spec.name)) from None
+                    state.enter("awaiting approval")
                     question = await gate._obtain_approval(need, call, record, denied)
                     if question is not None:
                         return question
@@ -678,7 +927,7 @@ class Gatehouse:
                 except Conflict:
                     record(
                         outcome="conflict", reason="the record changed before the write",
-                        arguments=safe_args, duration_ms=state.elapsed_ms(),
+                        arguments=safe_args, duration_ms=None,
                     )
                     raise
                 except Exception as exc:
@@ -690,11 +939,15 @@ class Gatehouse:
                     if state.stage == "tool running":
                         record(
                             outcome="error", reason=type(exc).__name__, arguments=safe_args,
-                            duration_ms=state.elapsed_ms(),
+                            duration_ms=None,
                         )
                     else:
+                        # Outside the tool, only the transaction's own code
+                        # (factory, enter, commit) raises past the gate's
+                        # steps, which turn their errors into refusals.
+                        where = "transaction" if isinstance(spec.consistency, Transaction) else "gate"
                         record(
-                            outcome="error", reason=f"transaction error: {type(exc).__name__}",
+                            outcome="error", reason=f"{where} error: {type(exc).__name__}",
                             arguments=safe_args,
                         )
                     raise
@@ -708,12 +961,12 @@ class Gatehouse:
                     if state.stage != "authorizing":
                         record(
                             outcome="cancelled", reason="tool running", arguments=safe_args,
-                            duration_ms=state.elapsed_ms(),
+                            duration_ms=None,
                         )
                     else:
                         record(outcome="cancelled", reason="authorizing", arguments=safe_args)
                     raise
-                event: dict[str, Any] = {"outcome": "ok", "arguments": safe_args, "duration_ms": state.elapsed_ms()}
+                event: dict[str, Any] = {"outcome": "ok", "arguments": safe_args, "duration_ms": None}
                 if state.withheld is not None:
                     event["withheld"] = state.withheld
                     if state.filter_errors:
@@ -745,20 +998,39 @@ class Gatehouse:
         guarded.__annotations__ = dict(spec.exposed_annotations)
         return guarded
 
-    async def _phase(self, call: _Call, approved: str | None, state: _CallState) -> Any:
+    async def _authorize_and_run(self, call: _Call, approved: str | None, state: _CallState) -> Any:
         """Load, authorize and run, inside the tool's transaction if it has one."""
         steps = self._steps(call, approved, state)
         transaction = call.spec.consistency if isinstance(call.spec.consistency, Transaction) else None
-        timeout, limiter = call.spec.authorization_timeout, self._authorize_limiter
+        timeout, limiter = call.spec.authorization_timeout, self._places(call.spec.name)
         if transaction is None:
             return await _drive_async(steps, timeout, limiter)
         if transaction.asynchronous:
-            return await _run_async_transaction(transaction, call.who.caller, steps, state, timeout, limiter)
+            return await _run_async_transaction(transaction, call.who.caller, steps, timeout, limiter)
         # One worker thread for the whole transaction: sync database drivers
         # are often tied to the thread that opened the connection.
+        threads = self._transaction_threads.get(call.spec.name)
+        if threads is None:
+            threads = self._transaction_threads[call.spec.name] = anyio.CapacityLimiter(_TRANSACTION_THREADS)
         return await anyio.to_thread.run_sync(
-            functools.partial(_run_sync_transaction, transaction, call.who.caller, steps, state, timeout)
+            functools.partial(_run_sync_transaction, transaction, call.who.caller, steps, timeout),
+            limiter=threads,
         )
+
+    def _places(self, tool: str) -> _Places:
+        places = self._authorize_places.get(tool)
+        if places is None:
+            places = self._authorize_places[tool] = _Places(tool, _AUTHORIZE_THREADS, self._authorize_pool)
+        return places
+
+    def _approver_places_for(self, tool: str) -> _Places:
+        places = self._approver_places.get(tool)
+        if places is None:
+            places = self._approver_places[tool] = _Places(
+                tool, _APPROVER_THREADS, self._authorize_pool,
+                what="sync approver", deadline="approval timeout",
+            )
+        return places
 
     def _steps(self, call: _Call, approved: str | None, state: _CallState) -> Generator[Callable[[], Any], Any, Any]:
         """The call, step by step. Each ``yield`` hands the driver a callable
@@ -767,105 +1039,132 @@ class Gatehouse:
         Written once, driven two ways: on the event loop, or all in one
         worker thread inside a sync transaction. Raises ``_Refused`` or
         ``_NeedsApproval`` to stop; inside a transaction, both roll it back.
+        Each stage below is a generator of its own, joined with
+        ``yield from``, which passes the driver's ``_DeadlinePassed`` through to
+        the step that ran out.
         """
-        spec, who = call.spec, call.who
+        spec = call.spec
+        loaded = yield from self._load_records(call)
+        request = AuthorizationRequest(
+            caller=call.who.caller, tool=spec.name, tier=spec.tier, action="call",
+            arguments=call.view, resources=MappingProxyType(dict(loaded)), claims=call.who.claims,
+        )
+        decision = yield from self._decide(call, request)
+        state.authz = _authz_label(spec, decision)
+        if isinstance(decision, Deny):
+            prefix = "policy after approval: " if approved is not None else "policy: "
+            raise _Refused(prefix + decision.reason, decision.message)
 
+        # Every Ask goes to the gate, whatever the tier: an Ask that ran
+        # without asking anyone would be an Allow by another name.
+        if isinstance(decision, Ask) or self.policy.needs_approval(spec.tier):
+            reason = decision.reason if isinstance(decision, Ask) else None
+            self._settle_approval(call, reason, loaded, approved, state)
+
+        scoped = yield from self._compute_scopes(call, request)
+
+        yield _BEFORE_TOOL
+        state.enter("tool running")
+        result = yield functools.partial(spec.fn, *call.args, **call.kwargs, **loaded, **scoped)
+        state.enter("filtering")
+        result = yield from self._filter_result(call, request, result, state)
+        state.enter("committing")
+        return result
+
+    def _load_records(self, call: _Call) -> Generator[Callable[[], Any], Any, dict[str, Any]]:
+        """Each ``Load`` parameter's record, from the model's arguments."""
+        spec = call.spec
         loaded: dict[str, Any] = {}
         for load in spec.loads:
             step = functools.partial(load.marker.loader, **{arg: call.arguments[arg] for arg in load.argnames})
             try:
                 found = yield step
-            except _TimedOut:
-                raise _Refused(f"authorization timed out: loading {load.name}", _timed_out(spec.name)) from None
+            except _DeadlinePassed:
+                raise _Refused(f"{_TIMEOUT_ASK_REASON}: loading {load.name}", _timed_out_message(spec.name)) from None
             except Exception as exc:
                 raise _Refused(f"loader error: {type(exc).__name__}") from exc
             if found is None:
                 raise _Refused(f"not found: {load.name}")
             loaded[load.name] = found
+        return loaded
 
-        request = AuthorizationRequest(
-            caller=who.caller, tool=spec.name, tier=spec.tier, action="call",
-            arguments=call.view, resources=MappingProxyType(dict(loaded)), claims=who.claims,
-        )
+    def _decide(self, call: _Call, request: AuthorizationRequest) -> Generator[Callable[[], Any], Any, Decision]:
+        """The policy's decision. Anything but an ``Allow``, ``Deny`` or
+        ``Ask`` is a refusal; so is running out of time, unless the tool
+        says to ask a person instead."""
+        spec = call.spec
         if spec.open:
-            decision: Any = Allow()
-        else:
-            try:
-                decision = yield functools.partial(spec.authorize, request)
-            except _TimedOut:
-                if spec.on_authorization_timeout is not Ask:
-                    raise _Refused("authorization timed out: policy", _timed_out(spec.name)) from None
-                decision = Ask(_TIMED_OUT)
-            except Exception as exc:
-                raise _Refused(f"policy error: {type(exc).__name__}") from exc
-            if not isinstance(decision, (Allow, Deny, Ask)):
-                raise _Refused(f"policy returned {type(decision).__name__}")
-        state.authz = (
-            "open" if spec.open else "allow" if isinstance(decision, Allow) else "ask" if isinstance(decision, Ask) else "deny"
-        )
-        if isinstance(decision, Deny):
-            prefix = "policy after approval: " if approved is not None else "policy: "
-            raise _Refused(prefix + decision.reason, decision.message)
+            return Allow()
+        try:
+            decision = yield functools.partial(spec.authorize, request)
+        except _DeadlinePassed:
+            if spec.on_authorization_timeout is not Ask:
+                raise _Refused(f"{_TIMEOUT_ASK_REASON}: policy", _timed_out_message(spec.name)) from None
+            return Ask(_TIMEOUT_ASK_REASON)
+        except Exception as exc:
+            raise _Refused(f"policy error: {type(exc).__name__}") from exc
+        if not isinstance(decision, (Allow, Deny, Ask)):
+            raise _Refused(f"policy returned {type(decision).__name__}")
+        return decision
 
-        reason = decision.reason if isinstance(decision, Ask) else None
-        if reason is not None or self.policy.needs_approval(spec.tier):
-            self._approval_gate(call, reason, loaded, approved)
-
+    def _compute_scopes(
+        self, call: _Call, request: AuthorizationRequest
+    ) -> Generator[Callable[[], Any], Any, dict[str, Any]]:
+        """Each ``Scope`` parameter's value, computed from the request."""
+        spec = call.spec
         scoped: dict[str, Any] = {}
         for scope in spec.scope_params:
             try:
                 scoped[scope.name] = yield functools.partial(scope.marker.fn, request)
-            except _TimedOut:
-                raise _Refused(f"authorization timed out: scope {scope.name}", _timed_out(spec.name)) from None
+            except _DeadlinePassed:
+                raise _Refused(f"{_TIMEOUT_ASK_REASON}: scope {scope.name}", _timed_out_message(spec.name)) from None
             except Exception as exc:
                 raise _Refused(f"scope error: {type(exc).__name__}") from exc
+        return scoped
 
-        yield _BEFORE_TOOL
-        state.stage = "tool running"
-        state.start = time.perf_counter()
-        result = yield functools.partial(spec.fn, *call.args, **call.kwargs, **loaded, **scoped)
-        state.duration_ms = round((time.perf_counter() - state.start) * 1000, 2)
-        state.stage = "filtering"
-
+    def _filter_result(
+        self, call: _Call, request: AuthorizationRequest, result: Any, state: _CallState
+    ) -> Generator[Callable[[], Any], Any, Any]:
+        """The tool's result with the items the caller may not see taken
+        out, when the tool has an item policy."""
+        spec = call.spec
         if (
-            spec.authorize_items is not None
-            and not spec.items_open
-            and result is not None
-            and not isinstance(result, InputRequiredResult)
+            spec.authorize_items is None
+            or spec.items_open
+            or result is None
+            or isinstance(result, InputRequiredResult)
         ):
-            if not isinstance(result, (list, tuple)):
-                raise _Refused(
-                    f"unfilterable result: {type(result).__name__}",
-                    f"'{spec.name}' returned something the gate can't filter item by item, "
-                    "so it isn't returned.",
-                    outcome="error",
-                )
+            return result
+        if not isinstance(result, collections.abc.Sequence) or isinstance(result, (str, bytes, bytearray)):
+            raise _Refused(
+                f"unfilterable result: {type(result).__name__}",
+                f"'{spec.name}' returned something the gate can't filter item by item, "
+                "so it isn't returned.",
+                outcome="error",
+            )
 
-            def item_request(item: Any) -> AuthorizationRequest:
-                return dataclasses.replace(request, action="read", resource=item)
+        def item_request(item: Any) -> AuthorizationRequest:
+            return dataclasses.replace(request, action="read", resource=item)
 
-            if _is_async_callable(spec.authorize_items):
-                kept: list[Any] = []
-                errors = 0
-                for item in result:
-                    try:
-                        verdict = yield functools.partial(spec.authorize_items, item_request(item))
-                    except Exception:
-                        errors += 1
-                        continue
-                    if isinstance(verdict, Allow):
-                        kept.append(item)
-            else:
+        if _is_async_callable(spec.authorize_items):
+            kept, errors = yield from _filter_each(spec.authorize_items, result, item_request)
+        else:
+            try:
+                # A sync item policy: the whole list in one step, one
+                # thread hop rather than one per item.
                 kept, errors = yield functools.partial(_filter_items, spec.authorize_items, result, item_request)
-            state.withheld = len(result) - len(kept)
-            state.filter_errors = errors
-            state.scope_mismatch = bool(spec.scope_params) and state.withheld > 0
-            result = kept if isinstance(result, list) else tuple(kept)
+            except _AwaitableVerdict:
+                # Sync on the outside, async inside (a decorator that
+                # hides the coroutine): each verdict gets awaited.
+                kept, errors = yield from _filter_each(spec.authorize_items, result, item_request)
+        state.withheld = len(result) - len(kept)
+        state.filter_errors = errors
+        state.scope_mismatch = bool(spec.scope_params) and state.withheld > 0
+        return tuple(kept) if isinstance(result, tuple) else kept
 
-        state.stage = "committing"
-        return result
-
-    def _approval_gate(self, call: _Call, reason: str | None, loaded: dict[str, Any], approved: str | None) -> None:
+    def _settle_approval(
+        self, call: _Call, reason: str | None, loaded: dict[str, Any], approved: str | None, state: _CallState
+    ) -> None:
         """Settle what can be settled now; raise ``_NeedsApproval`` for the rest.
 
         Returns when the call may go on: no approver needed after all, an
@@ -894,12 +1193,20 @@ class Gatehouse:
         if isinstance(approver, ElicitationApprover):
             transport = approver.transport(call.context, round_trip=spec.round_trip)
             if transport == "round-trip":
-                verdict = approver.answer(request, call.context)
+                try:
+                    # A custom message= runs in here, and can raise.
+                    verdict = approver.answer(request, call.context)
+                except Exception as exc:
+                    why = f"approver error: {type(exc).__name__}"
+                    raise _Refused(why, _approval_refused_message(spec.name, why)) from exc
                 if verdict is None:
                     raise _NeedsApproval(request, "round-trip")
+                # An answer to a question this gate asked: the line says
+                # which call asked it, so the two rounds read as one.
+                state.continues = asking_call(call.context)
                 allowed, why = verdict
                 if not allowed:
-                    raise _Refused(why, _refusal(spec.name, why))
+                    raise _Refused(why, _approval_refused_message(spec.name, why))
                 return
             if transport == "back-channel":
                 raise _NeedsApproval(request, "back-channel")
@@ -923,7 +1230,7 @@ class Gatehouse:
             found = loaded[load.name]
             # The record as the audit log would show it: fields, secrets masked.
             snapshot = redact_arguments({"r": found}, policy.redact)["r"]
-            opaque = isinstance(snapshot, str) and snapshot.startswith("«opaque:")
+            opaque = isinstance(snapshot, str) and snapshot.startswith(_OPAQUE_PREFIX)
             if load.marker.describe is not None:
                 try:
                     lines.append(str(load.marker.describe(found)))
@@ -937,7 +1244,10 @@ class Gatehouse:
                 except Exception as exc:
                     raise _Refused(f"fingerprint error: {type(exc).__name__}") from exc
             else:
-                if opaque:
+                # Opaque anywhere, not just at the top: a field the gate
+                # sees only by its type could change unnoticed while a
+                # person decides.
+                if _holds_opaque(snapshot):
                     raise _Refused(
                         f"record can't be fingerprinted for approval: {load.name}",
                         f"'{spec.name}' needs approval, but the gate can't tell whether "
@@ -966,6 +1276,7 @@ class Gatehouse:
             reason=reason,
             resources=tuple(lines),
             binding=binding,
+            call_id=call.call_id,
         )
 
     async def _obtain_approval(
@@ -982,11 +1293,16 @@ class Gatehouse:
         timeout = self.policy.approval_timeout
         if need.via == "round-trip":
             assert isinstance(approver, ElicitationApprover)
+            try:
+                question = approver.question(request, timeout)
+            except Exception as exc:
+                why = f"approver error: {type(exc).__name__}"
+                raise denied(why, _approval_refused_message(spec.name, why)) from exc
             # The call ends here for now, and the client calls again with the
             # answer. If it never does, this line is the record that it was
             # asked.
             record(outcome="pending", reason="approval asked in client", arguments=call.safe_args)
-            return approver.question(request, timeout)
+            return question
         if need.via == "back-channel":
             assert isinstance(approver, ElicitationApprover)
             ask: Callable[[], Any] = functools.partial(approver.ask, request, call.context)
@@ -1001,16 +1317,17 @@ class Gatehouse:
             # TimeoutError itself (a Slack call timing out) is an approver
             # error, not the gate's deadline.
             with anyio.move_on_after(timeout) as waiting:
-                approved = await _call(ask, limiter=self._approver_limiter, abandon_on_cancel=True)
+                if _is_async_callable(ask):
+                    approved = await _invoke(ask)
+                else:
+                    places = self._approver_places_for(spec.name)
+                    approved = await places.run(ask, abandon_on_cancel=True)
         except Exception as exc:
             # An approver that can't answer (Slack down, ticket API timing
             # out) is a refusal, not a crash — and it belongs in the trail.
             # Type only, as with tool errors.
-            raise denied(
-                f"approver error: {type(exc).__name__}",
-                f"'{spec.name}' could not be approved: the approver "
-                "failed. The gate fails closed.",
-            ) from exc
+            why = f"approver error: {type(exc).__name__}"
+            raise denied(why, _approval_refused_message(spec.name, why)) from exc
         except anyio.get_cancelled_exc_class():
             # Cancellation is a BaseException, so the clause above never sees
             # it, and the gate's own timeout never gets this far:
@@ -1023,9 +1340,14 @@ class Gatehouse:
                 f"'{spec.name}' was not approved within {timeout:g}s. "
                 "The gate fails closed.",
             )
-        if not approved:
-            raise denied("approver refused", _refusal(spec.name, "approver refused"))
-        return None
+        if approved is True:
+            return None
+        if approved is False or approved is None:
+            raise denied("approver refused", _approval_refused_message(spec.name, "approver refused"))
+        # Only True approves. A Slack helper that returns its response
+        # object, or a "no", would otherwise wave every call through.
+        reason = f"approver error: returned {type(approved).__name__}"
+        raise denied(reason, _approval_refused_message(spec.name, reason))
 
 
 # --- driving the steps --------------------------------------------------------
@@ -1043,14 +1365,14 @@ _BEFORE_TOOL: Callable[[], Any] = _before_tool
 
 async def _drive_async(
     steps: Generator[Callable[[], Any], Any, Any],
-    timeout: float | None = None,
-    limiter: anyio.CapacityLimiter | None = None,
+    timeout: float | None,
+    limiter: _Places,
 ) -> Any:
     """Run each step on the event loop, sync ones in a worker thread.
 
     The steps before the tool (loaders, policy, scopes) share ``timeout``
-    seconds and run sync ones on ``limiter``'s threads. A step still running
-    at the deadline is abandoned: the generator gets ``_TimedOut`` at the
+    seconds and run sync ones in the tool's places (``limiter``). A step still running
+    at the deadline is abandoned: the generator gets ``_DeadlinePassed`` at the
     step that ran out, and a sync step's thread finishes in the background
     with its result dropped.
     """
@@ -1077,31 +1399,163 @@ async def _drive_async(
             if authorizing:
                 value = await _authorizing_step(step, deadline, limiter)
             else:
-                value = await _call(step)
+                value = await _invoke(step)
         except Exception as exc:
             error = exc
 
 
-async def _authorizing_step(
-    step: Callable[[], Any], deadline: float | None, limiter: anyio.CapacityLimiter | None
-) -> Any:
-    """One step before the tool, within what is left of the deadline."""
+async def _authorizing_step(step: Callable[[], Any], deadline: float | None, places: _Places) -> Any:
+    """One step before the tool, within what is left of the deadline. A
+    sync step waits for a place among the tool's threads within it too."""
+    async def run(abandon_on_cancel: bool) -> Any:
+        if _is_async_callable(step):
+            return await _invoke(step)
+        return await places.run(step, abandon_on_cancel=abandon_on_cancel)
+
     if deadline is None:
-        return await _call(step, limiter=limiter)
+        return await run(abandon_on_cancel=False)
     left = deadline - time.monotonic()
     if left <= 0:
-        raise _TimedOut()
+        raise _DeadlinePassed()
     with anyio.move_on_after(left):
-        return await _call(step, limiter=limiter, abandon_on_cancel=True)
-    raise _TimedOut()
+        return await run(abandon_on_cancel=True)
+    raise _DeadlinePassed()
 
 
-def _drive_sync(steps: Generator[Callable[[], Any], Any, Any], timeout: float | None = None) -> Any:
+class _Places:
+    """One tool's worker threads for its sync loaders, policies and scopes,
+    or for its sync approvers.
+
+    A step takes a place before its thread starts and gives it back when
+    the thread returns. A step abandoned at the deadline keeps its place
+    until its thread really returns, however long that is: Python can't
+    stop the thread, and counting it as gone would let a policy that never
+    returns start a new thread on every call. So a tool whose places are
+    all held by hung steps denies its own calls at the deadline, and
+    starts no more threads, while every other tool keeps its own places.
+
+    An abandoned thread that returns never calls into the event loop and
+    never waits on it: it puts its place on ``_returned`` and, if it can,
+    wakes the loop without waiting. The loop gives the place back then, or
+    at the latest when the tool's next step starts, on whatever loop that
+    is. So a loop that has stopped or closed meanwhile neither loses the
+    place nor leaves the thread blocked at interpreter exit.
+    """
+
+    def __init__(
+        self,
+        tool: str,
+        total: int,
+        pool: anyio.CapacityLimiter,
+        *,
+        what: str = "sync loader, policy or scope",
+        deadline: str = "authorization deadline",
+    ) -> None:
+        self.tool = tool
+        self.total = total
+        self.what = what
+        self.deadline = deadline
+        self._places = anyio.CapacityLimiter(total)
+        self._pool = pool
+        self._returned: list[object] = []  # holders whose abandoned thread has returned
+        self._returned_lock = threading.Lock()
+
+    def _reclaim(self) -> None:
+        """Give back the places of abandoned threads that have returned.
+        On the event loop only."""
+        with self._returned_lock:
+            holders, self._returned = self._returned, []
+        for holder in holders:
+            self._places.release_on_behalf_of(holder)
+
+    async def run(self, step: Callable[[], Any], *, abandon_on_cancel: bool) -> Any:
+        self._reclaim()
+        holder = object()
+        await self._places.acquire_on_behalf_of(holder)
+        wake = _loop_waker()
+        guard = threading.Lock()
+        phase = ["waiting"]  # → running → done, or → abandoned → done, or → dropped
+
+        def give_back() -> None:
+            self._places.release_on_behalf_of(holder)
+
+        def in_thread() -> Any:
+            with guard:
+                if phase[0] == "dropped":
+                    return None
+                phase[0] = "running"
+            try:
+                return step()
+            finally:
+                with guard:
+                    abandoned = phase[0] == "abandoned"
+                    phase[0] = "done"
+                if abandoned:
+                    with self._returned_lock:
+                        self._returned.append(holder)
+                    if wake is not None:
+                        try:
+                            wake(self._reclaim)
+                        except Exception:
+                            pass  # the loop is gone: the next step's _reclaim gives it back
+
+        try:
+            result = await anyio.to_thread.run_sync(in_thread, limiter=self._pool, abandon_on_cancel=abandon_on_cancel)
+        except BaseException:
+            with guard:
+                was = phase[0]
+                if was == "running":
+                    phase[0] = "abandoned"
+                elif was == "waiting":
+                    phase[0] = "dropped"
+            if was == "running":
+                _warn_abandoned(self)
+            else:
+                give_back()
+            raise
+        give_back()
+        if inspect.isawaitable(result):
+            result = await result
+        return result
+
+
+def _loop_waker() -> Callable[[Callable[[], None]], object] | None:
+    """A way for a worker thread to have the running event loop call a
+    function soon, without waiting for it, or ``None``."""
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = None
+    if loop is not None:
+        return loop.call_soon_threadsafe
+    try:
+        import trio
+
+        return trio.lowlevel.current_trio_token().run_sync_soon
+    except Exception:
+        return None
+
+
+def _warn_abandoned(places: _Places) -> None:
+    held = places._places.borrowed_tokens
+    try:
+        sys.stderr.write(
+            f"mcp-gatehouse: a {places.what} for {places.tool!r} was abandoned and is still "
+            f"running (its {places.deadline} passed, or the call was cancelled); its thread "
+            f"keeps one of the tool's "
+            f"{places.total} places until it returns ({held} in use)\n"
+        )
+        sys.stderr.flush()
+    except Exception:
+        pass
+
+
+def _drive_sync(steps: Generator[Callable[[], Any], Any, Any], timeout: float | None) -> Any:
     """Run every step right here, in this thread.
 
     A thread can't be interrupted, so the deadline is checked between steps:
     a step that started in time runs to the end, and if the deadline passed
-    meanwhile the generator gets ``_TimedOut`` as if it had been cut off.
+    meanwhile the generator gets ``_DeadlinePassed`` as if it had been cut off.
     Inside a sync transaction, the database's own statement timeout is what
     stops a query that hangs.
     """
@@ -1125,15 +1579,18 @@ def _drive_sync(steps: Generator[Callable[[], Any], Any, Any], timeout: float | 
             continue
         try:
             if authorizing and deadline is not None and time.monotonic() >= deadline:
-                raise _TimedOut()
+                raise _DeadlinePassed()
             value = step()
             if inspect.isawaitable(value):
                 close = getattr(value, "close", None)
                 if callable(close):
                     close()
                 raise TypeError("an async callable can't run inside a sync transaction")
-            if authorizing and deadline is not None and time.monotonic() > deadline:
-                raise _TimedOut()  # it answered, but too late to count
+            if authorizing and deadline is not None and time.monotonic() > deadline and not isinstance(value, Deny):
+                # It answered, but too late to count. A late Deny still
+                # counts: turning a no into a timeout could, with
+                # on_authorization_timeout=Ask, put it to a person.
+                raise _DeadlinePassed()
         except Exception as exc:
             error = exc
 
@@ -1142,14 +1599,14 @@ def _run_sync_transaction(
     transaction: Transaction,
     caller: Caller,
     steps: Generator[Callable[[], Any], Any, Any],
-    state: _CallState,
-    timeout: float | None = None,
+    timeout: float | None,
 ) -> Any:
     """The whole transaction, in the one worker thread this runs in."""
     manager = transaction.factory(caller)
     if not hasattr(manager, "__enter__"):
         raise TypeError("the transaction factory didn't return a context manager")
     result: Any = _UNSET
+    raised: BaseException | None = None
     with manager as handle:
         # This thread runs in a copy of the caller's context, so the value
         # set here is seen by every step and nowhere else.
@@ -1157,37 +1614,41 @@ def _run_sync_transaction(
         try:
             result = _drive_sync(steps, timeout)
         except BaseException as exc:
-            state.signal = exc
+            raised = exc
             raise
-    if result is _UNSET:
-        # The context manager swallowed the exception. The call still failed.
-        raise state.signal if state.signal is not None else RuntimeError("transaction swallowed the call")
-    return result
+    return _unless_swallowed(result, raised)
 
 
 async def _run_async_transaction(
     transaction: Transaction,
     caller: Caller,
     steps: Generator[Callable[[], Any], Any, Any],
-    state: _CallState,
-    timeout: float | None = None,
-    limiter: anyio.CapacityLimiter | None = None,
+    timeout: float | None,
+    limiter: _Places,
 ) -> Any:
+    """The whole transaction on the event loop: load, policy, tool, commit."""
     manager = transaction.factory(caller)
     if not hasattr(manager, "__aenter__"):
         raise TypeError("the transaction factory didn't return an async context manager")
     result: Any = _UNSET
+    raised: BaseException | None = None
     async with manager as handle:
         token = _TRANSACTION.set(handle)
         try:
             result = await _drive_async(steps, timeout, limiter)
         except BaseException as exc:
-            state.signal = exc
+            raised = exc
             raise
         finally:
             _TRANSACTION.reset(token)
+    return _unless_swallowed(result, raised)
+
+
+def _unless_swallowed(result: Any, raised: BaseException | None) -> Any:
+    """The transaction's result, or, when its context manager swallowed the
+    exception that ended it, that exception: the call still failed."""
     if result is _UNSET:
-        raise state.signal if state.signal is not None else RuntimeError("transaction swallowed the call")
+        raise raised if raised is not None else RuntimeError("transaction swallowed the call")
     return result
 
 
@@ -1204,6 +1665,33 @@ def _filter_items(
         except Exception:
             errors += 1
             continue
+        if inspect.isawaitable(verdict):
+            close = getattr(verdict, "close", None)
+            if callable(close):
+                close()
+            raise _AwaitableVerdict()
+        if isinstance(verdict, Allow):
+            kept.append(item)
+    return kept, errors
+
+
+class _AwaitableVerdict(Exception):
+    """A sync-looking item policy returned something to await."""
+
+
+def _filter_each(
+    authorize_items: Authorizer, items: Any, item_request: Callable[[Any], AuthorizationRequest]
+) -> Generator[Callable[[], Any], Any, tuple[list[Any], int]]:
+    """An item policy one step per item, so the driver can await each
+    verdict. Only ``Allow`` keeps an item."""
+    kept: list[Any] = []
+    errors = 0
+    for item in items:
+        try:
+            verdict = yield functools.partial(authorize_items, item_request(item))
+        except Exception:
+            errors += 1
+            continue
         if isinstance(verdict, Allow):
             kept.append(item)
     return kept, errors
@@ -1215,16 +1703,16 @@ def _filter_items(
 def _build_spec(
     fn: Callable[..., Any],
     tool_name: str,
+    *,
     tier: AccessTier,
     authorize: Authorizer,
     authorize_items: Authorizer | None,
     consistency: Consistency | None,
     scopes: frozenset[str],
     policy: Policy,
-    localns: Mapping[str, Any] | None = None,
-    *,
-    authorization_timeout: float | None = _INHERIT,
-    on_authorization_timeout: Any = _INHERIT,
+    localns: Mapping[str, Any] | None,
+    authorization_timeout: float | None,
+    on_authorization_timeout: Any,
 ) -> _ToolSpec:
     """Work out, once, everything the guard needs, and refuse a tool the gate
     can't enforce on.
@@ -1244,7 +1732,7 @@ def _build_spec(
     ctx_param: str | None = None
     loads: list[tuple[inspect.Parameter, Load]] = []
     scope_params: list[tuple[inspect.Parameter, Scope]] = []
-    plain: list[str] = []
+    plain: set[str] = set()
     for param in signature.parameters.values():
         annotation = param.annotation
         markers = _check_markers(tool_name, param.name, annotation)
@@ -1255,7 +1743,7 @@ def _build_spec(
                 ctx_param = param.name
             continue
         if not markers:
-            plain.append(param.name)
+            plain.add(param.name)
             continue
         if len(markers) > 1:
             raise TypeError(f"{tool_name}: parameter {param.name!r} has more than one Load/Scope marker")
@@ -1323,7 +1811,18 @@ def _build_spec(
             "or AcceptRace('why') on purpose (here or as the Gatehouse default)."
         )
 
-    item_type = _record_item_type(signature.return_annotation)
+    # get_type_hints also evaluates names nested in the return type
+    # (list["Order"]), which the signature leaves as strings.
+    try:
+        returns = typing.get_type_hints(fn, localns=dict(localns or {}), include_extras=True).get(
+            "return", signature.return_annotation
+        )
+    except Exception:
+        returns = signature.return_annotation
+    try:
+        item_type = _record_item_type(returns)
+    except TypeError as exc:
+        raise TypeError(f"{tool_name}: {exc}. Define it before the tool.") from None
     if item_type is not None and authorize_items is None:
         raise TypeError(
             f"{tool_name}: it returns a list of records, so say who may see each one: "
@@ -1339,31 +1838,9 @@ def _build_spec(
     if isinstance(consistency, Transaction):
         _check_transaction_fit(tool_name, consistency, fn, authorize, authorize_items, load_specs, scope_params)
 
-    exposed_params = [
-        p for p in signature.parameters.values() if p.name not in load_names and p.name not in scope_names
-    ]
-    bind_signature = signature.replace(parameters=exposed_params)
-    if ctx_param is None:
-        # The tool takes no Context, so the guard asks for one under a name
-        # of its own. Its Context annotation keeps it out of the schema.
-        hidden = inspect.Parameter(
-            _CONTEXT_PARAM, inspect.Parameter.KEYWORD_ONLY, default=None, annotation=Context
-        )
-        at = len(exposed_params) - (
-            bool(exposed_params) and exposed_params[-1].kind is inspect.Parameter.VAR_KEYWORD
-        )
-        exposed_params = [*exposed_params[:at], hidden, *exposed_params[at:]]
-    exposed_signature = signature.replace(parameters=exposed_params)
-    exposed_annotations = {
-        p.name: p.annotation for p in exposed_params if p.annotation is not inspect.Parameter.empty
-    }
-    if signature.return_annotation is not inspect.Signature.empty:
-        exposed_annotations["return"] = signature.return_annotation
-
-    if authorization_timeout is _INHERIT:
-        authorization_timeout = policy.authorization_timeout
-    if on_authorization_timeout is _INHERIT:
-        on_authorization_timeout = policy.on_authorization_timeout
+    bind_signature, exposed_signature, exposed_annotations = _exposed_signature(
+        signature, load_names | scope_names, ctx_param
+    )
     return _ToolSpec(
         authorization_timeout=authorization_timeout,
         on_authorization_timeout=on_authorization_timeout,
@@ -1384,6 +1861,32 @@ def _build_spec(
         # the call's one multi-round channel, so the gate can't ask over it.
         round_trip=not _runs_own_rounds(fn),
     )
+
+
+def _exposed_signature(
+    signature: inspect.Signature, filled: set[str], ctx_param: str | None
+) -> tuple[inspect.Signature, inspect.Signature, dict[str, Any]]:
+    """What the SDK sees of the tool, and what the guard binds calls to.
+
+    Both leave out the parameters the gate fills. The exposed signature,
+    which the SDK builds the schema from, adds a hidden Context when the
+    tool takes none, so the guard still gets one.
+    """
+    params = [p for p in signature.parameters.values() if p.name not in filled]
+    bind_signature = signature.replace(parameters=params)
+    if ctx_param is None:
+        # The tool takes no Context, so the guard asks for one under a name
+        # of its own. Its Context annotation keeps it out of the schema.
+        hidden = inspect.Parameter(
+            _CONTEXT_PARAM, inspect.Parameter.KEYWORD_ONLY, default=None, annotation=Context
+        )
+        at = len(params) - (bool(params) and params[-1].kind is inspect.Parameter.VAR_KEYWORD)
+        params = [*params[:at], hidden, *params[at:]]
+    exposed_signature = signature.replace(parameters=params)
+    annotations = {p.name: p.annotation for p in params if p.annotation is not inspect.Parameter.empty}
+    if signature.return_annotation is not inspect.Signature.empty:
+        annotations["return"] = signature.return_annotation
+    return bind_signature, exposed_signature, annotations
 
 
 def _check_transaction_fit(
@@ -1434,6 +1937,11 @@ def _check_markers(tool_name: str, param: str, annotation: Any) -> list[Load | S
                 f"{tool_name}: parameter {param!r} uses Resolve(...), which the SDK runs before "
                 "the gate checks the call. On a gated server, load records with Load(...)."
             )
+        if isinstance(item, type) and issubclass(item, (Load, Scope)):
+            raise TypeError(
+                f"{tool_name}: parameter {param!r} names the {item.__name__} class; "
+                f"give it an instance: {item.__name__}(...)"
+            )
         if isinstance(item, (Load, Scope)):
             if not is_top:
                 raise TypeError(
@@ -1447,6 +1955,7 @@ def _check_markers(tool_name: str, param: str, annotation: Any) -> list[Load | S
 def _metadata(annotation: Any, top: bool = True) -> Generator[tuple[Any, bool], None, None]:
     """Every Annotated metadata item in ``annotation``, at any depth, and
     whether it is the parameter's own (top-level) marker."""
+    annotation = _resolve_alias(annotation)
     if get_origin(annotation) is Annotated:
         for item in annotation.__metadata__:
             yield item, top
@@ -1460,8 +1969,38 @@ def _metadata(annotation: Any, top: bool = True) -> Generator[tuple[Any, bool], 
             yield from _metadata(arg, False)
 
 
+def _alias_types() -> tuple[type, ...]:
+    """``typing.TypeAliasType`` (3.12+) and its backport, where present."""
+    found = [getattr(typing, "TypeAliasType", None)]
+    try:
+        import typing_extensions  # pydantic's dependency; not one of ours
+
+        found.append(getattr(typing_extensions, "TypeAliasType", None))
+    except ImportError:  # pragma: no cover
+        pass
+    return tuple(t for t in found if isinstance(t, type))
+
+
+_ALIAS_TYPES = _alias_types()
+
+
+def _resolve_alias(annotation: Any) -> Any:
+    """What a ``type X = ...`` alias stands for (``X[int]`` too). The gate
+    must see a marker behind an alias, or the model could fill it."""
+    while True:
+        if isinstance(annotation, _ALIAS_TYPES):
+            annotation = getattr(annotation, "__value__")
+        elif isinstance(origin := get_origin(annotation), _ALIAS_TYPES):
+            annotation = getattr(origin, "__value__")
+        else:
+            return annotation
+
+
 def _unannotated(annotation: Any) -> Any:
-    return get_args(annotation)[0] if get_origin(annotation) is Annotated else annotation
+    annotation = _resolve_alias(annotation)
+    if get_origin(annotation) is Annotated:
+        annotation = _resolve_alias(get_args(annotation)[0])
+    return annotation
 
 
 def _is_context(annotation: Any) -> bool:
@@ -1493,31 +2032,47 @@ def _is_record_type(annotation: Any) -> bool:
 
 
 def _record_item_type(annotation: Any) -> Any | None:
-    """The item type when ``annotation`` is a list of records, else ``None``."""
+    """The item type when ``annotation`` is, or may be, a list of records,
+    else ``None``. Any arm of a union counts (``list[Order] | None``,
+    ``list[Order] | tuple[Order, ...]``), and so does an item that may be a
+    record (``list[Order | None]``): what may reach the model unfiltered
+    needs an item policy."""
     if annotation is inspect.Signature.empty:
         return None
     base = _unannotated(annotation)
-    if _is_union(base):
-        arms = [arm for arm in get_args(base) if arm is not InputRequiredResult and arm is not type(None)]
-        if len(arms) != 1:
-            return None
-        base = _unannotated(arms[0])
-    origin = get_origin(base)
-    args = get_args(base)
+    arms = [_unannotated(arm) for arm in get_args(base)] if _is_union(base) else [base]
+    for arm in arms:
+        if arm is InputRequiredResult or arm is type(None):
+            continue
+        item = _sequence_item(arm)
+        if item is not None and _may_be_record(item):
+            return item
+    return None
+
+
+def _sequence_item(annotation: Any) -> Any | None:
+    """T for ``list[T]``, ``Sequence[T]`` or ``tuple[T, ...]``."""
+    origin, args = get_origin(annotation), get_args(annotation)
     if origin in (list, collections.abc.Sequence) and len(args) == 1:
-        item = args[0]
-    elif origin is tuple and len(args) == 2 and args[1] is Ellipsis:
-        item = args[0]
-    else:
-        return None
-    return item if _is_record_type(item) else None
+        return args[0]
+    if origin is tuple and len(args) == 2 and args[1] is Ellipsis:
+        return args[0]
+    return None
+
+
+def _may_be_record(item: Any) -> bool:
+    item = _unannotated(item)
+    if isinstance(item, (str, typing.ForwardRef)):
+        name = item if isinstance(item, str) else item.__forward_arg__
+        raise TypeError(f"the return type names {name!r}, which doesn't evaluate here")
+    if _is_union(item):
+        return any(_may_be_record(arm) for arm in get_args(item) if arm is not type(None))
+    return _is_record_type(item)
 
 
 def _is_union(annotation: Any) -> bool:
-    import types
-
     origin = get_origin(annotation)
-    return origin is typing.Union or origin is getattr(types, "UnionType", None)
+    return origin is typing.Union or origin is types.UnionType
 
 
 def _check_consistency(consistency: Any) -> None:
@@ -1528,8 +2083,35 @@ def _check_consistency(consistency: Any) -> None:
 # --- small helpers ------------------------------------------------------------
 
 
+def _static_audit_fields(spec: _ToolSpec) -> dict[str, Any]:
+    """The fields every audit line for this tool carries, whatever the call
+    does: how its check and write are kept together, and a deadline turned
+    off. Both are opt-outs the trail should show."""
+    fields: dict[str, Any] = {}
+    if isinstance(spec.consistency, Transaction):
+        fields["consistency"] = "transaction"
+    elif isinstance(spec.consistency, ConditionalWrite):
+        fields["consistency"] = "conditional"
+    elif isinstance(spec.consistency, AcceptRace):
+        fields["consistency"] = "accept-race"
+        fields["consistency_reason"] = spec.consistency.reason
+    if spec.authorization_timeout is None:
+        fields["authorization_deadline"] = "off"
+    return fields
+
+
+def _authz_label(spec: _ToolSpec, decision: Decision) -> str:
+    """The audit line's ``authz``: what the policy decided."""
+    if spec.open:
+        return "open"
+    if isinstance(decision, Allow):
+        return "allow"
+    return "ask" if isinstance(decision, Ask) else "deny"
+
+
 def _read_only(mapping: Mapping[str, Any]) -> Mapping[str, Any]:
-    """A read-only copy for a policy: nothing it does reaches the tool."""
+    """A read-only copy for a policy, so nothing it does reaches the tool.
+    An argument that can't be deep-copied is shared with the tool as is."""
     try:
         return MappingProxyType(copy.deepcopy(dict(mapping)))
     except Exception:
@@ -1553,6 +2135,39 @@ def _describe_record(name: str, snapshot: Any, opaque: bool) -> str:
     return f"{name}: {json.dumps(snapshot, ensure_ascii=False, default=str)}"
 
 
+def _new_call_id() -> str:
+    """The audit trail's id for one call: every line the call writes carries it."""
+    return uuid.uuid4().hex
+
+
+# A JSON-RPC id is the client's choice: kept in the trail, but never long.
+_MAX_REQUEST_ID = 128
+
+
+def _correlation(context: Any) -> dict[str, Any]:
+    """What ties a call's lines to the rest of the system: the MCP request's
+    JSON-RPC id, and the OpenTelemetry trace the call runs in.
+
+    The trace is the MCP SDK's own: it opens a span for every request,
+    parented on the ``traceparent`` the client sent in ``_meta``. With an
+    OpenTelemetry SDK configured, ``span_id`` is that server span; without
+    one, the client's trace still comes through, and ``span_id`` is the
+    client's span. No trace in the request and none configured: no fields.
+    """
+    fields: dict[str, Any] = {}
+    try:
+        request_id = context.request_context.request_id
+    except Exception:
+        request_id = None  # no live request (a direct call_tool from code)
+    if request_id is not None:
+        fields["request_id"] = str(request_id)[:_MAX_REQUEST_ID]
+    span = _otel_trace.get_current_span().get_span_context()
+    if span.is_valid:
+        fields["trace_id"] = _otel_trace.format_trace_id(span.trace_id)
+        fields["span_id"] = _otel_trace.format_span_id(span.span_id)
+    return fields
+
+
 def _caller_entry(who: _Who) -> dict[str, Any]:
     entry = dataclasses.asdict(who.caller)
     if who.local:
@@ -1560,20 +2175,20 @@ def _caller_entry(who: _Who) -> dict[str, Any]:
     return entry
 
 
-def _not_permitted(tool_name: str) -> str:
+def _not_permitted_message(tool_name: str) -> str:
     """What the model is told for every refusal on authorization, so it can't
     tell a record it may not touch from one that doesn't exist."""
     return f"'{tool_name}' is not permitted for this caller."
 
 
-def _no_caller(tool_name: str) -> str:
+def _no_caller_message(tool_name: str) -> str:
     return (
         f"'{tool_name}' needs a verified caller, and this request has none. "
         "The gate fails closed."
     )
 
 
-def _refusal(tool_name: str, reason: str) -> str:
+def _approval_refused_message(tool_name: str, reason: str) -> str:
     """What the model is told when an approval comes back no."""
     if reason == "approval timed out":
         return f"'{tool_name}' was not approved in time. The gate fails closed."
@@ -1596,7 +2211,7 @@ def _runs_own_rounds(fn: Callable[..., Any]) -> bool:
         return True  # can't tell, so stay off the channel: the fallback decides
 
 
-async def _call(
+async def _invoke(
     fn: Callable[[], Any],
     *,
     limiter: anyio.CapacityLimiter | None = None,

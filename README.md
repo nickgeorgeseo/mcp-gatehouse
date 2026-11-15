@@ -22,12 +22,19 @@ Most MCP servers hand the model every tool at full strength and keep no
 record of what it did. That's fine for a demo. It's not fine the day an
 agent has write access to your CRM, your books, or your order system.
 `mcp-gatehouse` is the missing gate, enforced **inside** the server — no
-proxy, no external policy service, no dependencies beyond the official
-[`mcp` SDK](https://github.com/modelcontextprotocol/python-sdk).
+proxy, no external policy service. It depends only on the official
+[`mcp` SDK](https://github.com/modelcontextprotocol/python-sdk) and
+`opentelemetry-api`, which the SDK already requires.
 
 ```
 pip install mcp-gatehouse
 ```
+
+> **Upgrading from 0.5?** 0.6.0 fails closed. A tool without `authorize=`
+> doesn't register, and over stdio a server without `local_caller=` denies
+> every call. Pin `mcp-gatehouse<0.6` until you've migrated; the
+> [migration steps](https://github.com/nickgeorgeseo/mcp-gatehouse/blob/main/CHANGELOG.md#breaking-authorization-is-a-runtime-invariant)
+> are one short list.
 
 ![Claude Code is asked to cancel order 4418; the server's approval form appears in Claude Code, naming who the call is for, the arguments, and the order as the server loaded it; ticking Approve lets it run; the audit log shows the call pending, then ok](https://raw.githubusercontent.com/nickgeorgeseo/mcp-gatehouse/main/docs/claude-code-approval.gif)
 
@@ -46,7 +53,7 @@ refused and one approved, and the audit log they left. No sound.
 | | |
 |---|---|
 | **Authorization on the record** | Every tool names a policy. The gate loads the record the call is about from the model's arguments, your policy decides on it, and the tool gets that same object. The model can't describe a record into existence or reach one that isn't the caller's. |
-| **No way around the gate** | A tool without a policy doesn't register, the server refuses tools registered around the gate, and a call with no verified caller is denied. Each opt-out is explicit and marked in the audit log. |
+| **No way around the gate** | A tool without a policy doesn't register, the server refuses tools, resources, prompts, completions and SDK extension methods or interceptors registered around the gate, and a call with no verified caller is denied. Each opt-out is explicit and marked in the audit log. |
 | **Check and write together** | The policy's decision and the tool's write share one transaction you supply, or the write carries the checked state in its own condition. A record that changes after the check is never acted on. |
 | **Lists filtered per item** | A tool that returns records gets each one checked: what the caller may not see never reaches the model. |
 | **Permission tiers** | Every tool is declared `READ`, `WRITE`, or `DESTRUCTIVE` — and the tier also emits honest spec `ToolAnnotations` (`readOnlyHint` / `destructiveHint`), which the wrapper won't let you override to lie. |
@@ -65,7 +72,7 @@ from pydantic import BaseModel
 
 from mcp_gatehouse import (
     AccessTier, Allow, AuditLog, AuthorizationRequest, Caller, ConditionalWrite, Deny,
-    ElicitationApprover, Gatehouse, Load, Policy, any_caller, terminal_approver,
+    ElicitationApprover, Gatehouse, Load, Policy, terminal_approver,
 )
 
 class Order(BaseModel):
@@ -143,6 +150,26 @@ place, and that nothing gets around them:
   `MCPServer(tools=...)`, extension tools, and a tool slipped into the
   registry. A refused tool is hidden from `tools/list` and denied when
   called.
+- Resources, prompts and completions are other ways to the same data, and
+  they have no policy: a template `orders://{order_id}` would read the
+  record a tool checks, for anyone. So the server refuses them too, before
+  or after the gate is created. Content that is the same for every caller
+  (docs, a schema, a price list) goes through `@gatehouse.open_resource(uri)`
+  or `@gatehouse.open_prompt()`, and a read without a verified caller is
+  refused. These write no audit line. Anything that depends on who is
+  asking belongs in a READ tool with a policy. Completions are refused
+  outright: the SDK never tells the handler who is asking.
+- An SDK `Extension` gets the same treatment. Its tools and resources are
+  refused with the rest, and so is a server whose extension serves request
+  methods of its own (`Extension.methods()`) or overrides
+  `intercept_tool_call`: both answer with no policy and no audit line.
+  What the gate guards is the SDK's public registration surface. Code
+  that writes into the SDK's private registries (a template put straight
+  into `_resource_manager._templates`), adds a low-level request handler
+  after the gate, or adds request middleware to the low-level server
+  (`server.middleware`, provisional in the SDK, which wraps every request,
+  `tools/call` included, and can answer before the gate does), runs with
+  your server's trust, like any other code you install in it.
 - Nothing the gate fills can come from the model. A `Load` parameter never
   appears in the input schema, and registration fails if the SDK would put
   it there.
@@ -192,6 +219,21 @@ By design, `mcp-gatehouse` is none of the other layers. It is not a
 proxy or a gateway, has no control plane, mints or exchanges no tokens,
 and has no policy language: policies are Python, or a call to the engine
 you already run.
+
+It guards calls through this server, and only those. A script, a service
+or another agent that reaches the database or API behind the tools
+directly never meets the gate, and nothing the gate does can stop it. To
+make the checks hold on every path, enforce them in the backend too. Give
+the server the narrowest credential that does its work, not a shared
+admin account. Have the backend check the caller itself, as
+[`examples/orders_postgres.py`](examples/orders_postgres.py) does: the
+`Transaction` factory sets `app.subject` from the verified caller, and
+Postgres row-level security limits every query to that user's rows,
+whoever connects. Don't hand other clients a credential that skips those
+checks. Short-lived, narrowly scoped tokens for the services behind the
+tools come from your identity provider. The gate checks the ones it
+receives (`scopes=`, `request.claims`) and passes the caller on, but
+doesn't issue them.
 
 It is also not a workflow layer. The gate checks one call at a time and
 keeps no workflow state, so a job that another agent picks up after a
@@ -258,7 +300,9 @@ more, when that's safe to say.
 - An approval binds to the record's state, by default a redacted snapshot
   of it, or what `fingerprint` returns. If the record changes while a
   person decides, the call is refused rather than run on something they
-  never saw. On a tier that requires approval, a record must be a Pydantic
+  never saw. The snapshot holds masked fields as `«redacted»`, so a change
+  to only a masked field (a rotated `api_key`, say) goes unseen; return
+  it from `fingerprint` if it matters. On a tier that requires approval, a record must be a Pydantic
   model, a dataclass or a mapping, or have a `fingerprint`.
 
 #### Deadlines
@@ -271,8 +315,8 @@ refusal and the call can be retried, so "not now" doesn't read like "no".
 
 ```python
 Policy(authorization_timeout=2.0)            # every tool
-@gk.tool(authorize=report_policy, authorization_timeout=30)  # one tool
-@gk.tool(authorize=refund_policy, on_authorization_timeout=Ask)
+@gatehouse.tool(authorize=report_policy, authorization_timeout=30)  # one tool
+@gatehouse.tool(authorize=refund_policy, on_authorization_timeout=Ask)
 ```
 
 `on_authorization_timeout=Ask` puts a call whose policy ran out of time
@@ -285,10 +329,20 @@ audit line for that tool says `"authorization_deadline": "off"`.
 Python can't stop a thread. A sync loader or policy past the deadline is
 abandoned: the call ends, and the thread finishes in the background with
 its result dropped. Those threads are the gate's own, not the pool sync
-tools draw on, so a hung policy can't leave a tool elsewhere waiting.
+tools draw on, so a hung policy never leaves a sync tool without a thread.
+Each tool has its own 40 of them, so a policy that hangs on one tool
+doesn't make another tool's authorization wait. An abandoned thread keeps
+its place until it really returns, and the gate says so on stderr: a
+policy that never returns can tie up at most its own tool's 40 threads,
+after which that tool's calls are denied at the deadline without starting
+another. Give every blocking call in a sync policy its own timeout,
+shorter than the deadline.
 Inside a sync `Transaction` every step runs in one thread, so the
 deadline is checked between steps: a slow policy runs to the end, then
-counts as late, and the transaction rolls back. Set the database's
+counts as late, and the transaction rolls back. That thread is the tool's
+own too, one of 40 per tool, so a policy hung inside a transaction never
+takes a thread from sync tools elsewhere. But it isn't abandoned: it holds
+its thread, and its call, until it returns. Set the database's
 statement timeout for a query that hangs there. An `async` policy that
 blocks without awaiting, such as a sync HTTP call inside `async def`,
 stalls the whole server, and no deadline can reach it.
@@ -408,8 +462,10 @@ Anything but a ticked box (decline, cancel, closing the form, an unticked
 box, a malformed answer) is a refusal. When the client can't be asked, the
 `fallback` decides; with no fallback, the call is denied. A tool that runs
 its own multi-round input flow, through `Resolve(...)` parameters or by
-returning `InputRequiredResult`, gets the fallback too, since one call has
-one such channel.
+returning `InputRequiredResult`, gets the fallback too from 2026-07-28,
+since one call has one such channel. Up to 2025-11-25 the form goes over
+its own request, separate from the tool's rounds, so the client is asked
+as usual.
 
 Used approvals are remembered in an `ApprovalStore`, so each runs its call
 once. The default, `MemoryApprovalStore`, remembers per process. That is
@@ -472,21 +528,25 @@ Policy(approver=terminal_approver, approval_timeout=120)
 Past it, the call is denied and logged as `approval timed out`. Approvers
 see the deadline as `request.deadline` (a `time.monotonic()` value), and
 `terminal_approver` withdraws its prompt when it passes. A sync approver
-that ignores it finishes in the background and its answer is dropped. With
-no timeout set, the gate waits as long as the approver takes.
+should return by then too. One that doesn't finishes in the background, its
+answer dropped, with a warning on stderr. Its thread keeps one of the tool's
+40 approver threads until it returns. So an approver that never returns can
+tie up at most its own tool's 40, and once they are all taken, that tool's
+later approvals time out without starting more. Other tools keep their own
+40. With no timeout set, the gate waits as long as the approver takes.
 
 Under the default policy, `DESTRUCTIVE` requires approval and everything
 is audited. Gate writes too with one line:
 
 ```python
-Policy(require_approval=frozenset({AccessTier.WRITE, AccessTier.DESTRUCTIVE}), ...)
+policy = Policy(require_approval=frozenset({AccessTier.WRITE, AccessTier.DESTRUCTIVE}), approver=terminal_approver)
 ```
 
 Add your own secret-bearing keys without losing the defaults:
 
 ```python
 from mcp_gatehouse import DEFAULT_REDACT
-Policy(redact=DEFAULT_REDACT | {"card_pin"}, ...)
+policy = Policy(redact=DEFAULT_REDACT | {"card_pin"}, approver=terminal_approver)
 ```
 
 ### The audit log
@@ -494,8 +554,8 @@ Policy(redact=DEFAULT_REDACT | {"card_pin"}, ...)
 One record per call, whatever happened to it:
 
 ```json
-{"ts": "2026-11-06T14:02:11+00:00", "tool": "list_orders", "tier": "read", "outcome": "ok", "arguments": {}, "duration_ms": 0.31, "withheld": 1, "caller": {"client_id": "local", "subject": "alice", "issuer": null, "scopes": [], "source": "local"}, "authz": "open"}
-{"ts": "2026-11-06T14:02:38+00:00", "tool": "add_note", "tier": "write", "outcome": "ok", "arguments": {"order_id": "4417", "note": "call back", "api_key": "«redacted»"}, "duration_ms": 1.08, "caller": {…}, "authz": "allow", "resources": {"order": {"order_id": "4417"}}, "consistency": "conditional"}
+{"ts": "2026-11-06T14:02:11+00:00", "call_id": "4b1e0c9a6f2d47f1a3c85e0d2b7f9a61", "request_id": "7", "trace_id": "0af7651916cd43dd8448eb211c80319c", "span_id": "b7ad6b7169203331", "tool": "list_orders", "tier": "read", "outcome": "ok", "arguments": {}, "duration_ms": 0.31, "timings_ms": {"authorize": 0.05, "tool": 0.31, "filter": 0.04, "total": 0.42}, "withheld": 1, "caller": {"client_id": "local", "subject": "alice", "issuer": null, "scopes": [], "source": "local"}, "authz": "open"}
+{"ts": "2026-11-06T14:02:38+00:00", "call_id": "…", "request_id": "8", "tool": "add_note", "tier": "write", "outcome": "ok", "arguments": {"order_id": "4417", "note": "call back", "api_key": "«redacted»"}, "duration_ms": 1.08, "caller": {…}, "authz": "allow", "resources": {"order": {"order_id": "4417"}}, "consistency": "conditional"}
 {"ts": "2026-11-06T14:03:05+00:00", "tool": "cancel_order", "tier": "destructive", "outcome": "denied", "reason": "policy: someone else's order", "arguments": {"order_id": "4420"}, "caller": {…}, "authz": "deny", "resources": {"order": {"order_id": "4420"}}, "consistency": "conditional"}
 {"ts": "2026-11-06T14:05:40+00:00", "tool": "cancel_order", "tier": "destructive", "outcome": "denied", "reason": "approver refused", "arguments": {"order_id": "4417"}, "caller": {…}, "authz": "ask", "resources": {"order": {"order_id": "4417"}}, "consistency": "conditional"}
 ```
@@ -508,12 +568,17 @@ field is ever written.
 | Field | Type | When |
 |---|---|---|
 | `ts` | string, ISO-8601 UTC | always |
+| `call_id` | string, 32 hex | always: the gate's id for the call, the same on every line it writes. `ApprovalRequest.call_id` carries it to the approver |
+| `request_id` | string | when a live request is behind the call: its JSON-RPC id, cut to 128 characters. The client's choice, unique only per session |
+| `trace_id`, `span_id` | string, 32 and 16 hex | when the call runs in an OpenTelemetry trace: the client's `traceparent`, or a trace a configured OpenTelemetry SDK started |
+| `continues` | string, 32 hex | on the round that answers a round-trip approval: the `call_id` of the `pending` line that asked, whatever the verdict |
 | `tool` | string | always |
 | `tier` | `"read"`, `"write"`, `"destructive"` or `null` | always; `null` only for an ungated tool |
 | `outcome` | `"ok"`, `"denied"`, `"error"`, `"conflict"`, `"pending"`, `"cancelled"` | always |
 | `reason` | string | every outcome but `ok`. Denials carry the gate's real reason; errors carry the exception type only, never its message; cancellations say the stage |
 | `arguments` | object | always: the model's arguments after redaction. Never what the gate filled |
 | `duration_ms` | number | `ok`, `conflict`, and `error` or `cancelled` lines whose reason says the tool was running |
+| `timings_ms` | object: `authorize`, `approval`, `tool`, `filter`, `commit`, `total` | every line written by the tool's gate (all but the `ungated tool` and `no verified caller` denials from `call_tool`): milliseconds for each stage the call reached, and the total. `filter` only with an item policy, `commit` only with a `Transaction` |
 | `caller` | object: `client_id`, `subject`, `issuer`, `scopes`, and `source: "local"` for a declared local caller | once a caller is known: every line but the `ungated tool` and `no verified caller` denials |
 | `authz` | `"allow"`, `"ask"`, `"deny"`, `"open"` | once the policy decided (`open` for `any_caller`). Absent on lines written before it ran: denylist, no caller, missing scope, loader error, not found |
 | `resources` | object: each `Load` parameter's name mapped to the redacted arguments it was loaded from | every line of a tool that loads records. Never the record itself |
@@ -524,7 +589,7 @@ field is ever written.
 | `withheld` | integer | `ok` lines of a tool with an item policy: items the caller may not see, removed |
 | `filter_errors` | integer | with `withheld`, when the item policy raised on some items |
 | `scope_mismatch` | `true` | with `withheld`, when a `Scope` was in force: the query and the policy disagree |
-| `sink_error` | string | only on the stderr copy of a line that didn't reach the sink: the exception type when the sink raised, `"queue full"` or `"sink closed"` from a `BufferedSink` |
+| `sink_error` | string | only on the stderr copy of a line that didn't reach the sink: the exception type when the sink raised, `"queue full"`, `"sink closed"` or `"terminated"` from a `BufferedSink` |
 
 The outcomes: `ok`, the tool ran. `denied`, the gate refused, and `reason`
 says why. `error`, the tool raised, or the transaction or item filtering
@@ -541,6 +606,28 @@ partway: its worker thread runs to the end, and the line says `ok` or
 the gate takes the cancellation as soon as it returns, before the tool
 starts. Inside a `Transaction` that rolls the transaction back. The gate
 only writes the line; the cancellation goes on as it would without it.
+
+#### Tracing a call
+
+`call_id` groups one call's lines; `continues` joins the two rounds of a
+round-trip approval. To go further, out to the agent and the model, use
+the trace. The MCP SDK opens an OpenTelemetry span for every request,
+parented on the `traceparent` the client sends in the request's `_meta`,
+and the gate writes that trace's `trace_id` and `span_id` on the line.
+Find the line from a slow or failed span in your tracing backend, or the
+span from a line. Nothing to configure: `opentelemetry-api` comes with
+the SDK, and with no OpenTelemetry SDK set up the client's trace still
+comes through.
+
+The gate doesn't record model token usage, and has no field a client can
+fill with it. It never sees the model, a number the client reports is
+unverified, and the trace already joins the two: put token counts on the
+client's LLM spans, as the OpenTelemetry GenAI conventions do
+(`gen_ai.usage.input_tokens`), and they sit in the same trace as the
+gate's line.
+
+A retry by the model is a new call with a new `call_id`. The gate can't
+tell it is a retry; the trace can, when the agent keeps the turn in one.
 
 #### Sinks
 
@@ -562,6 +649,12 @@ and `stream=` use, `CallableSink(fn)`, and `BufferedSink`, below. For OpenTeleme
 audit record, the record as the body and the fields worth filtering on as
 attributes. An HTTP collector or a logging pipeline is a `CallableSink`
 away.
+
+`JsonlSink(path=...)` appends each record with one unbuffered write of
+the whole line, so the file only ever holds whole lines: a write that
+fails part way (a full disk) is cut back off, and that record goes to
+stderr as below and never turns up in the file later as well. A stream
+you pass in is written and flushed per record, and is yours to manage.
 
 Records reach the sink one at a time, so it needn't be thread-safe. A sink
 that raises doesn't lose the record and doesn't fail the call: the gate
@@ -586,6 +679,30 @@ only copy. Size `maxsize` for your bursts and alarm on `sink_error`.
 `close()` writes everything already queued, then closes the inner sink;
 it also runs at exit for a buffer nobody closed. A record written after
 `close()` goes to stderr with `sink_error: "sink closed"`.
+
+A signal's default action skips exit hooks, so on SIGTERM (`docker stop`,
+systemd, or the MCP Python SDK's stdio client, which sends it 2 s after
+closing stdin) the queue would go nowhere. A `BufferedSink` created on the
+main thread therefore installs a SIGTERM handler, unless SIGTERM is
+already handled: yours, or a web server's, is never replaced. It writes
+every record still queued to stderr with `sink_error: "terminated"`, then
+lets the default SIGTERM end the process. The record being written at
+that moment goes to stderr too, so it may also be in the inner sink. To
+drain into the inner sink instead, handle SIGTERM yourself and close the
+log there:
+
+```python
+import signal
+import sys
+
+audit = AuditLog(sink=BufferedSink(CallableSink(post_to_collector), maxsize=10_000))
+
+def on_sigterm(signum, frame):
+    audit.close()  # drains the queue, then closes the inner sink
+    sys.exit(0)
+
+signal.signal(signal.SIGTERM, on_sigterm)
+```
 
 ### Who the call was for
 
@@ -682,6 +799,11 @@ For Claude Desktop, in `claude_desktop_config.json`:
 }
 ```
 
+Claude Desktop doesn't show approval forms yet, and it starts servers
+with no terminal, so there `cancel_order` is always denied (fail closed)
+and stderr says why. Reads and notes work as anywhere else. To approve a
+cancel, use a client with forms, such as Claude Code.
+
 Or run `mcp-gatehouse-demo` yourself after `pip install mcp-gatehouse`.
 Ask the model to list the orders, look up 4420, and cancel one, then watch
 each verdict land in the audit log, with the policy's reason when it says
@@ -714,8 +836,9 @@ starts it:
 
 Every denial is the gate failing closed, as designed. Where the prompt
 can't reach you, approve out-of-band instead: an approver is any callable,
-so it can post to Slack, open a ticket or wait on a queue. `examples/orders_server.py` is the same server as a copyable
-template.
+so it can post to Slack, open a ticket or wait on a queue.
+`examples/orders_server.py` is a trimmed copy of the demo server, as a
+copyable template.
 
 ## Design notes
 
@@ -746,7 +869,8 @@ template.
   or a judge of intent. It enforces *your* policy on the record, for the
   caller the SDK authenticated, but it can't tell an action the user
   wanted from one a manipulated agent chose within their rights. Resources
-  and prompts aren't gated, only tools. It's a gate inside your server,
+  and prompts are refused unless you open them; anything per caller
+  belongs in a READ tool. It's a gate inside your server,
   not a perimeter around it. See [SECURITY.md](SECURITY.md).
 
 ## Compatibility
@@ -769,8 +893,9 @@ they aren't there, creating a `Gatehouse` raises rather than run unguarded. Ship
 The public API (`Gatehouse`, `Policy`, `AuditLog`, `AccessTier`) is
 unchanged across that line, as promised, with one deliberate exception:
 0.6.0's authorization invariant. Every tool now needs `authorize=`, a
-server needs a verified or declared caller, and a WRITE or DESTRUCTIVE
-tool that loads a record needs `consistency=`. See
+server needs a verified or declared caller, a WRITE or DESTRUCTIVE
+tool that loads a record needs `consistency=`, and authorization that
+takes longer than five seconds is denied. See
 [CHANGELOG.md](CHANGELOG.md) for the migration. Porting a v1 server is two
 import edits — `FastMCP` became `MCPServer` and moved to
 `mcp.server.mcpserver`; see the SDK's

@@ -321,3 +321,21 @@ def test_called_directly_it_defers_to_the_fallback():
     request = ApprovalRequest(tool="t", tier=AccessTier.DESTRUCTIVE, arguments={})
     assert ElicitationApprover()(request) is False
     assert ElicitationApprover(fallback=lambda r: True)(request) is True
+
+
+async def test_a_message_function_that_raises_is_an_approver_error():
+    """A custom message= runs when the gate asks and when it reads the
+    answer. Raising in either is the approver failing: denied, logged as
+    such, and never a "pending" line for a question that wasn't asked."""
+    calls = []
+
+    def message(request):
+        calls.append(1)
+        raise ValueError("template broke")
+
+    stream, ran = io.StringIO(), []
+    mcp = build(Policy(approver=ElicitationApprover(message=message)), stream, ran)
+    async with Client(mcp, elicitation_callback=answering(*APPROVE)) as client:
+        result = await client.session.call_tool("cancel_order", ARGUMENTS, allow_input_required=True)
+    assert not isinstance(result, InputRequiredResult) and result.is_error and ran == []
+    assert outcomes(stream) == [("denied", "approver error: ValueError")]

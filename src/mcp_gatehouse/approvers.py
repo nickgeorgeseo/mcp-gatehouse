@@ -10,6 +10,7 @@ import hashlib
 import io
 import json
 import os
+import re
 import secrets
 import select
 import sys
@@ -63,7 +64,7 @@ def terminal_approver(request: ApprovalRequest) -> bool:
                 return False
             tty.write(
                 f"\n⚠ approval needed → {request.tool} ({request.tier.value}) "
-                f"{request.arguments}{_on_what(request)}{_for_whom(request.caller)}\nallow? [y/N] "
+                f"{_arguments(request)}{_on_what(request)}{_for_whom(request.caller)}\nallow? [y/N] "
             )
             tty.flush()
             left = _seconds_left(request)
@@ -95,6 +96,14 @@ def _on_what(request: ApprovalRequest) -> str:
     return lines
 
 
+def _arguments(request: ApprovalRequest) -> str:
+    """The model's arguments as the prompt and the form show them: JSON on
+    one line, escaped like the record lines, so a value can't add a line
+    that passes for the record, and cut so a long one can't push the tool
+    and the record out of view."""
+    return _one_line(json.dumps(request.arguments, ensure_ascii=False, default=str), 400)
+
+
 def _one_line(text: str, limit: int = 200) -> str:
     """``text`` on one line: line breaks, control and format characters
     (bidi overrides among them) escaped, cut at ``limit``."""
@@ -102,12 +111,17 @@ def _one_line(text: str, limit: int = 200) -> str:
     return shown[:limit] + "…" if len(shown) > limit else shown
 
 
-def _for_whom(caller: Caller | None) -> str:
-    """The prompt's "for whom" line, or nothing when no one signed in (stdio)."""
-    if caller is None:
-        return ""
+def _caller_label(caller: Caller) -> str:
+    """Who the call is for, as an approver is shown it: "alice" via client
+    "claude-code", quoted and escaped so a crafted name can't pass for
+    someone else."""
     user = "a user the token doesn't name" if caller.subject is None else _shown(caller.subject)
-    return f"\n  for {user} via client {_shown(caller.client_id)}"
+    return f"for {user} via client {_shown(caller.client_id)}"
+
+
+def _for_whom(caller: Caller | None) -> str:
+    """The terminal prompt's "for whom" line, or nothing when no one signed in."""
+    return "" if caller is None else f"\n  {_caller_label(caller)}"
 
 
 # Long enough for an email address or a URL-shaped client ID; a name past
@@ -211,6 +225,10 @@ class ApprovalStore(Protocol):
     def spend(self, nonce: str, expires: float) -> bool: ...
 
 
+# How long a spent approval is remembered past its expiry, for clock steps.
+_SWEEP_GRACE = 300.0
+
+
 class MemoryApprovalStore:
     """Used approvals, remembered in this process. The default."""
 
@@ -222,8 +240,10 @@ class MemoryApprovalStore:
         now = time.time()
         with self._lock:
             # Past its expiry a nonce is refused before it gets here, so the
-            # record of it can go.
-            for old in [n for n, exp in self._used.items() if exp <= now]:
+            # record of it can go, but not at once: if the clock steps back
+            # (an NTP correction), an approval swept too early could pass
+            # the expiry check and be spent again.
+            for old in [n for n, exp in self._used.items() if exp + _SWEEP_GRACE <= now]:
                 del self._used[old]
             if nonce in self._used:
                 return False
@@ -237,7 +257,8 @@ class MemoryApprovalStore:
 class _ApprovalForm(BaseModel):
     """Tick Approve to let this call run. Leave it, decline or cancel to refuse."""
 
-    model_config = ConfigDict(title="Approval")
+    # Strict: "yes", "true", "on" or 1 is a malformed answer, not a tick.
+    model_config = ConfigDict(title="Approval", strict=True)
 
     approve: bool = Field(
         title="Approve",
@@ -251,7 +272,7 @@ def _default_message(request: ApprovalRequest) -> str:
     # long message (Claude Code folds it after three lines), so what is
     # being approved comes first: the first three lines carry the tool, the
     # arguments and the first record.
-    arguments = json.dumps(request.arguments, ensure_ascii=False, default=str)
+    arguments = _arguments(request)
     head = f"The AI wants to run {request.tool} ({request.tier.value}){_who(request.caller)} with:"
     if request.reason:
         head = f"Approval needed ({_one_line(request.reason, 120)}). {head}"
@@ -261,11 +282,8 @@ def _default_message(request: ApprovalRequest) -> str:
 
 
 def _who(caller: Caller | None) -> str:
-    """" for whom" in the form's first line, or nothing when no one signed in."""
-    if caller is None:
-        return ""
-    user = "a user the token doesn't name" if caller.subject is None else _shown(caller.subject)
-    return f" for {user} via client {_shown(caller.client_id)}"
+    """The form's first line names who the call is for, unless no one signed in."""
+    return "" if caller is None else f" {_caller_label(caller)}"
 
 
 class ElicitationApprover:
@@ -349,7 +367,7 @@ class ElicitationApprover:
     async def ask(self, request: ApprovalRequest, context: Any) -> bool:
         """Back-channel: send the form mid-call and wait for the answer."""
         result = await context.elicit(self._message(request), _ApprovalForm)
-        return result.action == "accept" and result.data.approve
+        return result.action == "accept" and result.data.approve is True
 
     def question(self, request: ApprovalRequest, timeout: float | None) -> InputRequiredResult:
         """Round trip, first round: hand the question back to the client."""
@@ -361,6 +379,10 @@ class ElicitationApprover:
             "nonce": secrets.token_urlsafe(16),
             "exp": time.time() + age,
         }
+        if request.call_id is not None:
+            # Which call asked, so the round that answers can say so in the
+            # audit trail. Not part of the digest: each round is its own call.
+            state["call"] = request.call_id
         form = ElicitRequest(
             params=ElicitRequestFormParams(
                 message=message,
@@ -407,7 +429,23 @@ class ElicitationApprover:
             form = _ApprovalForm.model_validate(reply.content or {})
         except ValidationError:
             return False, "approver error: invalid approval form"
-        return (True, "") if form.approve else (False, "approver refused")
+        return (True, "") if form.approve is True else (False, "approver refused")
+
+
+_CALL_ID = re.compile(r"[0-9a-f]{32}")
+
+
+def asking_call(context: Any) -> str | None:
+    """The ``call_id`` of the round that asked the question this round
+    answers, from the request state the client sent back; ``None`` when
+    there is none to read. Only for linking audit lines: the state is
+    sealed by the SDK, and a value that isn't a call id is ignored."""
+    try:
+        state = json.loads(context.request_state or "")
+        call = state.get("call") if isinstance(state, dict) else None
+    except (ValueError, TypeError, AttributeError):
+        return None
+    return call if isinstance(call, str) and _CALL_ID.fullmatch(call) else None
 
 
 def _digest(message: str, binding: str | None) -> str:

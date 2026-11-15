@@ -25,7 +25,14 @@ LOGGED_ARGUMENTS = {"order_id": "4417", "api_key": "«redacted»"}
 
 
 def events(stream: io.StringIO) -> list[dict]:
-    return [json.loads(line) for line in stream.getvalue().split("\n") if line]
+    """The lines, less what differs every run: the call's id, the request's,
+    and its timings. Each is checked here before it goes."""
+    lines = [json.loads(line) for line in stream.getvalue().split("\n") if line]
+    for line in lines:
+        assert len(line.pop("call_id")) == 32
+        line.pop("request_id", None)
+        assert line.pop("timings_ms")["total"] >= 0
+    return lines
 
 
 async def until(started: threading.Event) -> None:

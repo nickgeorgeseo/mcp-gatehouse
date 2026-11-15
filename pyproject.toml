@@ -34,7 +34,7 @@ classifiers = [
     "Topic :: Software Development :: Libraries",
     "Topic :: Security",
 ]
-dependencies = ["mcp>=2.3,<3"]
+dependencies = ["mcp>=2.3,<3", "opentelemetry-api>=1.28"]
 
 [project.scripts]
 mcp-gatehouse-demo = "mcp_gatehouse.demo:main"
@@ -44,6 +44,8 @@ mcp-gatehouse = "mcp_gatehouse.demo:main"
 [project.urls]
 Homepage = "https://nickgeorgeai.com/open-source/mcp-gatehouse"
 Repository = "https://github.com/nickgeorgeseo/mcp-gatehouse"
+Changelog = "https://github.com/nickgeorgeseo/mcp-gatehouse/blob/main/CHANGELOG.md"
+Issues = "https://github.com/nickgeorgeseo/mcp-gatehouse/issues"
 
 [project.optional-dependencies]
 dev = [
@@ -66,7 +68,10 @@ packages = ["src/mcp_gatehouse"]
 [tool.hatch.build.targets.sdist]
 # The recordings are for GitHub, and the README links them by absolute
 # URL; in the sdist they were most of its size. Their .tape sources stay.
-exclude = ["docs/*.mp4", "docs/*.gif"]
+# release-tests/ is the release campaign's record, not part of the package;
+# hatch reads only the root .gitignore, so its own .gitignore doesn't keep
+# it out.
+exclude = ["docs/*.mp4", "docs/*.gif", "release-tests/"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

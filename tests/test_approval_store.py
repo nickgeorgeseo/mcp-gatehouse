@@ -85,11 +85,24 @@ def test_memory_store_spends_each_nonce_once():
     assert isinstance(store, ApprovalStore)
 
 
-def test_memory_store_forgets_expired_nonces():
+def test_memory_store_forgets_expired_nonces_after_a_grace():
     store = MemoryApprovalStore()
-    assert store.spend("old", time.time() - 1) is True
-    assert store.spend("new", time.time() + 60) is True  # sweeps "old"
-    assert "old" not in store._used
+    assert store.spend("old", time.time() - 301) is True
+    assert store.spend("recent", time.time() - 1) is True
+    assert store.spend("new", time.time() + 60) is True  # sweeps "old" only
+    assert sorted(store._used) == ["new", "recent"]
+
+
+def test_memory_store_refuses_a_replay_after_the_clock_steps_back(monkeypatch):
+    """Swept at expiry, an approval could be spent again once an NTP step
+    puts the clock back before its expiry; the grace keeps it remembered."""
+    store = MemoryApprovalStore()
+    now = time.time()
+    assert store.spend("n", now + 10) is True
+    monkeypatch.setattr(time, "time", lambda: now + 20)
+    assert store.spend("other", now + 80) is True  # a sweep, past n's expiry
+    monkeypatch.setattr(time, "time", lambda: now)
+    assert store.spend("n", now + 10) is False
 
 
 def test_the_approver_needs_a_real_store():
@@ -163,14 +176,15 @@ def test_sqlite_store_spends_once_within_a_process(tmp_path):
     assert isinstance(store, ApprovalStore)
 
 
-def test_sqlite_store_sweeps_expired_nonces(tmp_path):
+def test_sqlite_store_sweeps_expired_nonces_after_a_grace(tmp_path):
     store = load_example().SqliteApprovalStore(tmp_path / "approvals.db")
-    assert store.spend("old", time.time() - 1) is True
+    assert store.spend("old", time.time() - 301) is True
+    assert store.spend("recent", time.time() - 1) is True
     assert store.spend("new", time.time() + 60) is True
     import sqlite3
 
-    rows = sqlite3.connect(store.path).execute("SELECT nonce FROM used_approvals").fetchall()
-    assert rows == [("new",)]
+    rows = sqlite3.connect(store.path).execute("SELECT nonce FROM used_approvals ORDER BY nonce").fetchall()
+    assert rows == [("new",), ("recent",)]
 
 
 def test_sqlite_store_survives_a_restart(tmp_path):

@@ -8,9 +8,17 @@ reach the audit log.
 
 from __future__ import annotations
 
+import dataclasses
+import datetime
 import enum
-from collections.abc import Awaitable, Callable, Mapping
+import ipaddress
+import json
+import math
+import pathlib
+import uuid
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
+from decimal import Decimal
 from typing import Any, Union
 
 
@@ -91,6 +99,13 @@ class ApprovalRequest:
     for showing: an approval given for one binding never runs a call with
     another, so a record that changed while a person decided is refused."""
 
+    call_id: str | None = None
+    """The ``call_id`` this call's audit lines carry, so an approval kept
+    elsewhere (a Slack thread, a ticket) can be matched to the trail. It is
+    new on every round of a round-trip approval: keep it out of an
+    ``ElicitationApprover(message=...)``, or the answer never matches the
+    question."""
+
 
 Approver = Callable[[ApprovalRequest], Union[bool, Awaitable[bool]]]
 
@@ -162,27 +177,33 @@ class Policy:
     always denies: there is no record yet to ask about."""
 
     def __post_init__(self) -> None:
-        # `not > 0` rather than `<= 0`, so NaN is rejected too.
-        if self.approval_timeout is not None and not self.approval_timeout > 0:
-            raise ValueError("approval_timeout must be a positive number of seconds, or None")
-        check_authorization_timeout(self.authorization_timeout)
+        # An approver may take as long as a person does: no upper bound.
+        _check_seconds("approval_timeout", self.approval_timeout, finite=False)
+        _check_authorization_timeout(self.authorization_timeout)
         object.__setattr__(
-            self, "on_authorization_timeout", check_on_authorization_timeout(self.on_authorization_timeout)
+            self, "on_authorization_timeout", _check_on_authorization_timeout(self.on_authorization_timeout)
         )
 
     def needs_approval(self, tier: AccessTier) -> bool:
         return tier in self.require_approval
 
 
-def check_authorization_timeout(value: Any) -> None:
-    """A positive, finite number of seconds, or ``None`` for no deadline."""
+def _check_seconds(name: str, value: Any, *, finite: bool) -> None:
+    """A positive number of seconds (finite, if asked), or ``None``. Not a
+    bool, and not NaN: ``0 < nan`` is false, so the range check refuses it."""
     if value is None:
         return
-    if isinstance(value, bool) or not isinstance(value, (int, float)) or not 0 < value < float("inf"):
-        raise ValueError("authorization_timeout must be a positive number of seconds, or None")
+    is_number = isinstance(value, (int, float)) and not isinstance(value, bool)
+    if not is_number or not value > 0 or (finite and not math.isfinite(value)):
+        raise ValueError(f"{name} must be a positive number of seconds, or None")
 
 
-def check_on_authorization_timeout(value: Any) -> Any:
+def _check_authorization_timeout(value: Any) -> None:
+    """A positive, finite number of seconds, or ``None`` for no deadline."""
+    _check_seconds("authorization_timeout", value, finite=True)
+
+
+def _check_on_authorization_timeout(value: Any) -> Any:
     """``Deny`` or ``Ask`` (the classes); ``None`` means ``Deny``."""
     from .authz import Ask, Deny  # authz imports this module
 
@@ -194,6 +215,10 @@ def check_on_authorization_timeout(value: Any) -> Any:
 
 
 REDACTED = "«redacted»"
+
+
+_OPAQUE_PREFIX = "«opaque:"
+"""How a redacted value that is shown only by its type starts."""
 
 
 def redact_arguments(arguments: Mapping[str, Any], keys: frozenset[str]) -> dict[str, Any]:
@@ -208,22 +233,28 @@ def redact_arguments(arguments: Mapping[str, Any], keys: frozenset[str]) -> dict
     secret, so unknown objects never pass through verbatim. The gate fails
     closed here too.
     """
-    import dataclasses as _dc
-    import datetime as _dt
-    from collections.abc import Sequence
-    from decimal import Decimal
-
     lowered = {_normalize_key(k) for k in keys}
 
     def scrub(value: Any) -> Any:
+        if isinstance(value, float) and not math.isfinite(value):
+            # JSON has no inf or nan: written raw, they'd make the audit
+            # line unreadable to strict parsers.
+            return str(value)
         if value is None or isinstance(value, (str, int, float, bool)):
             return value
+        if isinstance(value, enum.Enum):
+            # Its value, which the code defines: an approval's fingerprint
+            # must see a status go from "packed" to "picking".
+            return scrub(value.value)
         if isinstance(value, Decimal):
-            # Numbers and dates are shown as what they are: they can't carry
-            # text, and an approval's fingerprint must see an amount change.
+            # Numbers, dates and identifiers are shown as what they are:
+            # they can't carry text, and an approval's fingerprint must see
+            # an amount change.
             return str(value)
-        if isinstance(value, (_dt.date, _dt.time)):  # datetime is a date
+        if isinstance(value, (datetime.date, datetime.time)):  # datetime is a date
             return value.isoformat()
+        if isinstance(value, (uuid.UUID, ipaddress.IPv4Address, ipaddress.IPv6Address, pathlib.PurePath)):
+            return str(value)
         if isinstance(value, Mapping):
             return {
                 str(k): (REDACTED if _normalize_key(str(k)) in lowered else scrub(v))
@@ -234,25 +265,38 @@ def redact_arguments(arguments: Mapping[str, Any], keys: frozenset[str]) -> dict
             # bind to a fingerprint of the redacted record, which must read
             # the same in every worker process.
             return sorted((scrub(v) for v in value), key=_canonical)
-        if isinstance(value, (list, tuple)) or (
-            isinstance(value, Sequence) and not isinstance(value, bytes)
-        ):
+        if isinstance(value, tuple) and callable(getattr(value, "_asdict", None)):
+            # A NamedTuple: by field name, so a ``password`` field is masked.
+            return scrub(value._asdict())  # type: ignore[attr-defined]
+        if isinstance(value, (bytes, bytearray, memoryview)):
+            return f"{_OPAQUE_PREFIX}{type(value).__name__}»"
+        if isinstance(value, (list, tuple, Sequence)):
             return [scrub(v) for v in value]
-        if _dc.is_dataclass(value) and not isinstance(value, type):
-            return scrub(_dc.asdict(value))
+        if dataclasses.is_dataclass(value) and not isinstance(value, type):
+            return scrub(dataclasses.asdict(value))
         model_dump = getattr(value, "model_dump", None)  # pydantic v2
         if callable(model_dump):
             try:
                 return scrub(model_dump())
             except Exception:
-                return f"«opaque:{type(value).__name__}»"
-        return f"«opaque:{type(value).__name__}»"
+                return f"{_OPAQUE_PREFIX}{type(value).__name__}»"
+        return f"{_OPAQUE_PREFIX}{type(value).__name__}»"
 
     return scrub(dict(arguments))
 
 
+def _holds_opaque(value: Any) -> bool:
+    """Whether a redacted value has an opaque placeholder anywhere in it:
+    something the gate can show only by its type, and can't see change."""
+    if isinstance(value, str):
+        return value.startswith(_OPAQUE_PREFIX)
+    if isinstance(value, Mapping):
+        return any(_holds_opaque(v) for v in value.values())
+    if isinstance(value, list):
+        return any(_holds_opaque(v) for v in value)
+    return False
+
+
 def _canonical(value: Any) -> str:
     """One stable text for a JSON-shaped value, for sorting and fingerprints."""
-    import json
-
     return json.dumps(value, sort_keys=True, ensure_ascii=True, default=str)

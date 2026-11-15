@@ -36,6 +36,12 @@ How it holds:
   the call (`approval store error: OperationalError`). It can't tell a
   first use from a replay, so it fails closed.
 
+The table is created on first use. Postgres can't make a concurrent
+`CREATE TABLE IF NOT EXISTS` safe, so replicas starting together on a
+fresh database may collide; the store retries the create once, which
+finds the winner's table. In production, create the table (and its index
+on `expires`) in a migration before the replicas start.
+
 Each call opens and closes its own connection. Approvals are rare next
 to tool calls, so that is usually fine; put a connection pool behind
 `_connect` if it isn't.
@@ -70,6 +76,16 @@ class PostgresApprovalStore:
         self.sweep_grace = sweep_grace
         self.connect_timeout = connect_timeout
         self._table = sql.Identifier(table)
+        try:
+            self._create_table(table)
+        except (psycopg.errors.UniqueViolation, psycopg.errors.DuplicateTable, psycopg.errors.DuplicateObject):
+            # `IF NOT EXISTS` isn't safe under concurrency: two replicas
+            # starting on a fresh database can both find no table, and the
+            # second create fails. The other replica's create has committed
+            # by then, so once more finds the table and the index there.
+            self._create_table(table)
+
+    def _create_table(self, table: str) -> None:
         with self._connect() as conn:
             conn.execute(
                 sql.SQL(

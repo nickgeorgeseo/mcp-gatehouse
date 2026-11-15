@@ -46,7 +46,19 @@ class OpenGatehouse(Gatehouse):
         """
         from mcp_gatehouse.gatehouse import _build_spec
 
-        spec = _build_spec(fn, name, tier, authorize, None, self.consistency, frozenset(), self.policy)
+        spec = _build_spec(
+            fn,
+            name,
+            tier=tier,
+            authorize=authorize,
+            authorize_items=None,
+            consistency=self.consistency,
+            scopes=frozenset(),
+            policy=self.policy,
+            localns=None,
+            authorization_timeout=self.policy.authorization_timeout,
+            on_authorization_timeout=self.policy.on_authorization_timeout,
+        )
         return self._guard(spec)
 
 

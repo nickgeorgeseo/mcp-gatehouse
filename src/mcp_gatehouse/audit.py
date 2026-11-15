@@ -20,8 +20,10 @@ import io
 import json
 import os
 import queue
+import signal
 import sys
 import threading
+import time
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any, Protocol, TextIO, runtime_checkable
@@ -53,9 +55,18 @@ def _line(record: dict[str, Any]) -> str:
 class JsonlSink:
     """Append one JSON object per line to a file or a text stream.
 
-    Flushed on every write — an audit log that loses its tail in a crash
-    is not an audit log. A file opened here is closed by :meth:`close`; a
-    stream passed in is left to its owner.
+    A file opened here (``path=``) gets each record as one unbuffered
+    ``os.write`` of the whole line, in append mode, so the file only ever
+    holds whole lines. When a write fails part way (the disk is full), what
+    it wrote is cut off again before the error is raised: the record goes
+    to stderr with ``sink_error`` as with any failing sink, and never turns
+    up in the file later as well. Nothing is held back in a buffer, so a
+    crash loses no line already written. The file is closed by
+    :meth:`close`.
+
+    A stream passed in (``stream=``) is written and flushed on every
+    record, and left to its owner; a failure part way through is that
+    stream's to handle.
     """
 
     def __init__(
@@ -67,24 +78,57 @@ class JsonlSink:
             raise ValueError("provide exactly one of `path` or `stream`")
         self.path: Path | None = None
         """Absolute path of the log file, or ``None`` when writing to a stream."""
+        self._stream: TextIO | None = None
+        self._fd: int | None = None
+        self._lock = threading.Lock()
         if path is not None:
             p = Path(path).expanduser().absolute()
             p.parent.mkdir(parents=True, exist_ok=True)
-            self._stream: TextIO = p.open("a", encoding="utf-8")
-            self._owns_stream = True
+            self._fd = os.open(p, os.O_WRONLY | os.O_APPEND | os.O_CREAT | getattr(os, "O_CLOEXEC", 0), 0o666)
             self.path = p
         else:
             assert stream is not None
             self._stream = stream
-            self._owns_stream = False
 
     def write(self, record: dict[str, Any]) -> None:
-        self._stream.write(_line(record))
-        self._stream.flush()
+        if self._stream is not None:
+            self._stream.write(_line(record))
+            self._stream.flush()
+            return
+        data = _line(record).encode("utf-8")
+        with self._lock:
+            if self._fd is None:
+                raise ValueError("I/O operation on closed file")
+            _append_whole(self._fd, data)
 
     def close(self) -> None:
-        if self._owns_stream:
-            self._stream.close()
+        with self._lock:
+            fd, self._fd = self._fd, None
+        if fd is not None:
+            os.close(fd)
+
+
+def _append_whole(fd: int, data: bytes) -> None:
+    """Append ``data`` to the file, all of it or none of it.
+
+    ``os.write`` may write part of it and then fail (a full disk, a file
+    size limit). The bytes it did write would be a torn line, so they are
+    cut off again: the file goes back to its size before this record,
+    unless something else has appended since, in which case it is left
+    alone rather than cut into someone else's line."""
+    before = os.fstat(fd).st_size
+    written = 0
+    try:
+        while written < len(data):
+            written += os.write(fd, data[written:])
+    except OSError:
+        if written:
+            try:
+                if os.fstat(fd).st_size == before + written:
+                    os.ftruncate(fd, before)
+            except OSError:
+                pass  # the write's own error is the one to report
+        raise
 
 
 class CallableSink:
@@ -124,6 +168,15 @@ class BufferedSink:
     a sink nobody closed. A record written after close goes to stderr with
     ``sink_error: "sink closed"``.
 
+    Python's default SIGTERM ends the process without running exit hooks,
+    so a buffer created on the main thread installs a SIGTERM handler,
+    unless one is already set (yours is never replaced). On SIGTERM it
+    writes every record still queued to stderr with ``sink_error:
+    "terminated"``, then lets the default SIGTERM end the process. The
+    record being written at that moment goes to stderr too, so it may also
+    be in ``inner``. To drain into ``inner`` instead, handle SIGTERM
+    yourself and call :meth:`AuditLog.close` from it.
+
     Standard library only: one ``queue.Queue`` and one daemon thread.
     """
 
@@ -139,9 +192,12 @@ class BufferedSink:
         self._state = threading.Lock()  # write's check-and-put against close's flag
         self._closing = threading.Lock()
         self._closed = False
+        self._writing: Any = None  # the record the thread is handing to inner
+        self._terminating = False  # SIGTERM: the thread must hand nothing more to inner
         self._thread = threading.Thread(target=self._drain, name="mcp-gatehouse-audit", daemon=True)
         self._thread.start()
         _OPEN_BUFFERS.add(self)
+        _handle_sigterm()
 
     def write(self, record: dict[str, Any]) -> None:
         with self._state:
@@ -160,10 +216,57 @@ class BufferedSink:
             record = self._queue.get()
             if record is _STOP:
                 return
+            self._writing = record
+            if self._terminating:
+                # The process is being terminated and would end in the
+                # middle of this write. _spill sees the record here and
+                # puts it on stderr instead.
+                return
             try:
                 self.inner.write(record)
-            except Exception as exc:
+            except BaseException as exc:
+                # BaseException too: a CancelledError from a sink posting
+                # through a loop that is shutting down would otherwise end
+                # this thread, and every later record would queue unread.
                 _to_stderr(record, exc)
+            finally:
+                self._writing = None
+
+    def _spill(self) -> None:
+        """The process is being terminated: every record not yet written
+        goes to stderr, the one being written included.
+
+        Runs in a signal handler, which may have interrupted the main
+        thread anywhere, even inside this buffer's locks or a write to
+        stderr, so it takes no lock: flag assignments, items popped
+        straight off the queue's deque, and raw writes to file descriptor 2.
+
+        The thread keeps running meanwhile. Once it sees the flag it takes
+        at most one more record and stops before writing it, leaving it in
+        ``_writing``; so the queue and ``_writing`` are read again until a
+        pass finds nothing new, with a short pause between passes that
+        lets the thread get there."""
+        self._terminating = True
+        self._closed = True
+        spilled: dict[int, Any] = {}  # by identity; holding each keeps its id unique
+
+        def out(record: Any) -> None:
+            if record is not None and record is not _STOP and id(record) not in spilled:
+                spilled[id(record)] = record
+                _spill_line(record)
+
+        quiet = 0
+        while quiet < 2:
+            before = len(spilled)
+            out(self._writing)
+            while True:
+                try:
+                    out(self._queue.queue.popleft())
+                except IndexError:
+                    break
+            quiet = quiet + 1 if len(spilled) == before else 0
+            if quiet < 2:
+                time.sleep(0.01)
 
     def close(self) -> None:
         """Write everything queued so far, stop the thread, close ``inner``."""
@@ -172,12 +275,20 @@ class BufferedSink:
                 if self._closed:
                     return
                 self._closed = True
-            _OPEN_BUFFERS.discard(self)
-            # Nothing is queued after the flag. This put blocks while the
-            # queue is full: the thread is emptying it, and every record
-            # already accepted is written before the stop.
-            self._queue.put(_STOP)
+            # Nothing is queued after the flag. While the queue is full this
+            # waits for the thread to empty it, and every record already
+            # accepted is written before the stop; a thread that is gone
+            # can't, so then it doesn't wait.
+            while self._thread.is_alive():
+                try:
+                    self._queue.put(_STOP, timeout=0.1)
+                    break
+                except queue.Full:
+                    continue
             self._thread.join()
+            # Only now: a SIGTERM while this drains (at exit, say) must
+            # still find what is left of the queue.
+            _OPEN_BUFFERS.discard(self)
             close = getattr(self.inner, "close", None)
             if callable(close):
                 close()
@@ -186,6 +297,40 @@ class BufferedSink:
 # Buffers not yet closed. A plain set: the running thread holds its
 # buffer anyway, so a weak reference would keep nothing shorter.
 _OPEN_BUFFERS: "set[BufferedSink]" = set()
+
+
+def _handle_sigterm() -> None:
+    """Install the SIGTERM handler, if this is the main thread and nothing
+    else handles SIGTERM. A handler already there, the user's or a web
+    server's, is left alone."""
+    if not hasattr(signal, "SIGTERM") or threading.current_thread() is not threading.main_thread():
+        return
+    try:
+        if signal.getsignal(signal.SIGTERM) is signal.SIG_DFL:
+            signal.signal(signal.SIGTERM, _on_sigterm)
+    except (ValueError, OSError):
+        pass  # not allowed here (an embedded interpreter); exit hooks still run on a clean exit
+
+
+def _on_sigterm(signum: int, frame: Any) -> None:
+    """Records still queued go to stderr, then the default SIGTERM."""
+    for sink in list(_OPEN_BUFFERS):
+        try:
+            sink._spill()
+        except Exception:
+            pass
+    _OPEN_BUFFERS.clear()
+    signal.signal(signal.SIGTERM, signal.SIG_DFL)
+    os.kill(os.getpid(), signal.SIGTERM)
+
+
+def _spill_line(record: dict[str, Any]) -> None:
+    try:
+        data = _line({**record, "sink_error": "terminated"}).encode("utf-8")
+        while data:
+            data = data[os.write(2, data):]
+    except Exception:
+        pass  # nowhere left to write
 
 
 @atexit.register
@@ -224,8 +369,9 @@ class AuditLog:
         self._lock = threading.Lock()
         self.sink: AuditSink = sink if sink is not None else JsonlSink(path=path, stream=stream)
         """Where the records go."""
-        self.path: Path | None = getattr(self.sink, "path", None) if sink is None else None
-        """Absolute path of the log file, or ``None`` when not writing to one."""
+        self.path: Path | None = self.sink.path if isinstance(self.sink, JsonlSink) else None
+        """Absolute path of the log file, or ``None`` when not writing to one
+        (a stream, or a sink other than a ``JsonlSink`` on a file)."""
 
     def record(self, **event: Any) -> None:
         """Append one event. A ``ts`` field (UTC, ISO-8601) is added first."""

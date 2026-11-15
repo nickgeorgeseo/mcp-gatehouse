@@ -38,6 +38,7 @@ import os
 import sqlite3
 import sys
 import time
+from contextlib import closing
 
 
 
@@ -47,18 +48,25 @@ class SqliteApprovalStore:
     One short connection per call: SQLite's own file lock then serializes
     writers across threads and processes, and nothing is tied to a thread.
     A nonce is a primary key, so the first insert wins and every later one
-    changes no row. Expired nonces are swept on each call; the gate never
-    asks about one past its expiry anyway.
+    changes no row. Expired nonces are swept on each call, `sweep_grace`
+    seconds (default 300) after they expire: the gate never asks about one
+    past its expiry, but a clock that steps back could make one look
+    unexpired again.
 
     An unreadable or locked-for-too-long database raises, and the gate
     then denies the call (`approval store error: OperationalError`): it
     can't tell a first use from a replay, so it fails closed.
     """
 
-    def __init__(self, path: str | os.PathLike[str], *, timeout: float = 5.0) -> None:
+    def __init__(
+        self, path: str | os.PathLike[str], *, timeout: float = 5.0, sweep_grace: float = 300.0
+    ) -> None:
+        if not sweep_grace >= 0:
+            raise ValueError("sweep_grace must be zero or more seconds")
         self.path = os.fspath(path)
         self.timeout = timeout
-        with self._connect() as db:
+        self.sweep_grace = sweep_grace
+        with closing(self._connect()) as db:
             db.execute(
                 "CREATE TABLE IF NOT EXISTS used_approvals (nonce TEXT PRIMARY KEY, expires REAL NOT NULL)"
             )
@@ -70,8 +78,9 @@ class SqliteApprovalStore:
         return db
 
     def spend(self, nonce: str, expires: float) -> bool:
-        with self._connect() as db:
-            db.execute("DELETE FROM used_approvals WHERE expires <= ?", (time.time(),))
+        # closing(): a sqlite3 connection's own `with` commits but never closes.
+        with closing(self._connect()) as db:
+            db.execute("DELETE FROM used_approvals WHERE expires <= ?", (time.time() - self.sweep_grace,))
             inserted = db.execute(
                 "INSERT INTO used_approvals (nonce, expires) VALUES (?, ?) ON CONFLICT (nonce) DO NOTHING",
                 (nonce, expires),

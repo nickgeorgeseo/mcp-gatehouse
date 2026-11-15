@@ -182,3 +182,28 @@ async def test_two_replicas_sharing_the_key_and_the_store_run_an_approval_once(t
     assert not on_b.is_error
     assert replay_on_a.is_error and "already used" in replay_on_a.content[0].text
     assert ran == ["4417"]
+
+
+def test_replicas_starting_together_on_a_fresh_database_all_start(table):
+    # Postgres's CREATE TABLE IF NOT EXISTS races: two starts on a fresh
+    # database can both find no table, and the second create fails with
+    # UniqueViolation. The store retries once, so every replica starts.
+    module = load_example()
+    starters = 8
+    barrier = threading.Barrier(starters)
+    failures: list[BaseException] = []
+
+    def start() -> None:
+        barrier.wait()
+        try:
+            module.PostgresApprovalStore(DSN, table=table)
+        except BaseException as exc:
+            failures.append(exc)
+
+    threads = [threading.Thread(target=start) for _ in range(starters)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert failures == []
+    assert module.PostgresApprovalStore(DSN, table=table).spend("n", time.time() + 60)

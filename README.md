@@ -18,6 +18,8 @@ acts on, made by the server before the tool runs. If any of those is
 missing, the call doesn't run. Around that: permission tiers, approval
 gates, and an audit log of every call.
 
+![An agent wants to cancel order 4418. The gate asks three questions before any tool runs: who's asking (a verified caller), is it allowed (the policy says it's the caller's own order), and is it safe (a person approves). The approval card for cancel_order, marked destructive, is approved, and the call runs once and is logged. Everything else fails closed: no verified caller, someone else's order, a policy that hangs past 5 seconds, a change during approval. Every call writes one audit line. Ends on pip install mcp-gatehouse.](https://raw.githubusercontent.com/nickgeorgeseo/mcp-gatehouse/main/docs/explainer.gif)
+
 Most MCP servers hand the model every tool at full strength and keep no
 record of what it did. That's fine for a demo. It's not fine the day an
 agent has write access to your CRM, your books, or your order system.
@@ -36,11 +38,13 @@ pip install mcp-gatehouse
 > [migration steps](https://github.com/nickgeorgeseo/mcp-gatehouse/blob/main/CHANGELOG.md#breaking-authorization-is-a-runtime-invariant)
 > are one short list.
 
-![Claude Code is asked to cancel order 4418; the server's approval form appears in Claude Code, naming who the call is for, the arguments, and the order as the server loaded it; ticking Approve lets it run; the audit log shows the call pending, then ok](https://raw.githubusercontent.com/nickgeorgeseo/mcp-gatehouse/main/docs/claude-code-approval.gif)
+![Claude Code is asked to cancel order 4418; the server's approval form appears in Claude Code, naming who the call is for, the arguments, and the order as the server loaded it; ticking Approve lets it run. Asked to cancel order 4420, which belongs to someone else, the policy refuses it and no form appears. The audit log shows each call with its caller: pending, ok, then denied for someone else's order](https://raw.githubusercontent.com/nickgeorgeseo/mcp-gatehouse/main/docs/claude-code-approval.gif)
 
 The demo server in Claude Code: the model asks to cancel an order, the
-gate asks *you* in Claude Code's own UI, and the audit log records the
-call as asked, then done.
+gate asks *you* in Claude Code's own UI, and the call runs. Then it tries
+an order that isn't yours, and the policy refuses it before anyone is
+asked. The audit log has a line for every call, with who it was for and
+why it was refused.
 
 [![mcp-gatehouse demo on YouTube: the install, tiers, a cancel refused and one approved, and the audit log](https://img.youtube.com/vi/9_S4NAPcYjM/maxresdefault.jpg)](https://youtu.be/9_S4NAPcYjM)
 

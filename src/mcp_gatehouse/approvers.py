@@ -10,13 +10,14 @@ import hashlib
 import io
 import json
 import os
+import re
 import secrets
 import select
 import sys
 import threading
 import time
 from collections.abc import Awaitable, Callable
-from typing import Any, Literal, TextIO
+from typing import Any, Literal, Protocol, TextIO, runtime_checkable
 
 from mcp.types import (
     ElicitRequest,
@@ -26,9 +27,9 @@ from mcp.types import (
 )
 from mcp.server.elicitation import render_elicitation_schema
 from mcp_types.version import is_version_at_least
-from pydantic import BaseModel, Field, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
-from .policy import ApprovalRequest, Approver
+from .policy import ApprovalRequest, Approver, Caller
 
 # Approvers run in worker threads, so two gated calls can ask at once.
 # One prompt at a time, or the questions and answers interleave.
@@ -63,7 +64,7 @@ def terminal_approver(request: ApprovalRequest) -> bool:
                 return False
             tty.write(
                 f"\n⚠ approval needed → {request.tool} ({request.tier.value}) "
-                f"{request.arguments}\nallow? [y/N] "
+                f"{_arguments(request)}{_on_what(request)}{_for_whom(request.caller)}\nallow? [y/N] "
             )
             tty.flush()
             left = _seconds_left(request)
@@ -81,6 +82,63 @@ def terminal_approver(request: ApprovalRequest) -> bool:
         return False
     finally:
         _tty_lock.release()
+
+
+def _on_what(request: ApprovalRequest) -> str:
+    """The prompt's lines for the records the call acts on and why it was
+    asked, or nothing. Shown as single lines, so a record can't redraw the
+    prompt."""
+    lines = ""
+    if request.resources:
+        lines += "\n  on " + " | ".join(_one_line(line) for line in request.resources)
+    if request.reason:
+        lines += "\n  asked because: " + _one_line(request.reason)
+    return lines
+
+
+def _arguments(request: ApprovalRequest) -> str:
+    """The model's arguments as the prompt and the form show them: JSON on
+    one line, escaped like the record lines, so a value can't add a line
+    that passes for the record, and cut so a long one can't push the tool
+    and the record out of view."""
+    return _one_line(json.dumps(request.arguments, ensure_ascii=False, default=str), 400)
+
+
+def _one_line(text: str, limit: int = 200) -> str:
+    """``text`` on one line: line breaks, control and format characters
+    (bidi overrides among them) escaped, cut at ``limit``."""
+    shown = "".join(ch if ch.isprintable() else ch.encode("unicode_escape").decode("ascii") for ch in str(text))
+    return shown[:limit] + "…" if len(shown) > limit else shown
+
+
+def _caller_label(caller: Caller) -> str:
+    """Who the call is for, as an approver is shown it: "alice" via client
+    "claude-code", quoted and escaped so a crafted name can't pass for
+    someone else."""
+    user = "a user the token doesn't name" if caller.subject is None else _shown(caller.subject)
+    return f"for {user} via client {_shown(caller.client_id)}"
+
+
+def _for_whom(caller: Caller | None) -> str:
+    """The terminal prompt's "for whom" line, or nothing when no one signed in."""
+    return "" if caller is None else f"\n  {_caller_label(caller)}"
+
+
+# Long enough for an email address or a URL-shaped client ID; a name past
+# it is cut rather than allowed to push the rest of the prompt off screen.
+_NAME_LIMIT = 80
+
+
+def _shown(name: str) -> str:
+    """A name from a token, quoted so it can only ever read as itself.
+
+    JSON-quoted with everything outside printable ASCII escaped: no control
+    sequence can redraw the prompt, a quote in the name can't close the
+    quoting early and fake the rest of the line, and a look-alike or blank
+    Unicode character shows up as an escape instead of passing for a letter.
+    """
+    quoted = json.dumps(name[:_NAME_LIMIT], ensure_ascii=True).replace("\x7f", "\\u007f")
+    return quoted + "…" if len(name) > _NAME_LIMIT else quoted
 
 
 def _seconds_left(request: ApprovalRequest) -> float | None:
@@ -144,9 +202,63 @@ _MAX_APPROVAL_AGE = 3600.0
 Transport = Literal["back-channel", "round-trip"]
 
 
+@runtime_checkable
+class ApprovalStore(Protocol):
+    """Where used approvals are remembered, so each one runs its call once.
+
+    ``spend(nonce, expires)`` marks the approval ``nonce`` used and returns
+    ``True``, or returns ``False`` if it already was. ``expires`` is the
+    ``time.time()`` after which the nonce can be forgotten: past it, the
+    gate refuses the approval before asking the store. A store that raises
+    denies the call, logged as ``approval store error: <ExceptionType>``.
+
+    :class:`MemoryApprovalStore` is the default and remembers per process.
+    That is enough while the server's request-state key is per process
+    too, which is the MCP SDK's default: an approval minted before a
+    restart or by another replica fails the SDK's own check first. A
+    server that shares that key (``MCPServer(request_state_security=
+    RequestStateSecurity(keys=[...]))``) so approvals survive a restart
+    or work across replicas needs a store they all share, such as the
+    SQLite one in ``examples/approval_store_sqlite.py``.
+    """
+
+    def spend(self, nonce: str, expires: float) -> bool: ...
+
+
+# How long a spent approval is remembered past its expiry, for clock steps.
+_SWEEP_GRACE = 300.0
+
+
+class MemoryApprovalStore:
+    """Used approvals, remembered in this process. The default."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._used: dict[str, float] = {}  # nonce → when its approval expires
+
+    def spend(self, nonce: str, expires: float) -> bool:
+        now = time.time()
+        with self._lock:
+            # Past its expiry a nonce is refused before it gets here, so the
+            # record of it can go, but not at once: if the clock steps back
+            # (an NTP correction), an approval swept too early could pass
+            # the expiry check and be spent again.
+            for old in [n for n, exp in self._used.items() if exp + _SWEEP_GRACE <= now]:
+                del self._used[old]
+            if nonce in self._used:
+                return False
+            self._used[nonce] = expires
+            return True
+
+
+# One required box, nothing pre-ticked, so a client that accepts forms unseen
+# still can't approve by accident. The docstring is the schema's description
+# and the title its name: both reach the person, so they read as the form.
 class _ApprovalForm(BaseModel):
-    """The form the client shows. One required box, nothing pre-ticked, so
-    a client that accepts forms unseen still can't approve by accident."""
+    """Tick Approve to let this call run. Leave it, decline or cancel to refuse."""
+
+    # Strict: "yes", "true", "on" or 1 is a malformed answer, not a tick.
+    model_config = ConfigDict(title="Approval", strict=True)
 
     approve: bool = Field(
         title="Approve",
@@ -155,11 +267,23 @@ class _ApprovalForm(BaseModel):
 
 
 def _default_message(request: ApprovalRequest) -> str:
-    # Two lines, arguments on the second. Clients show only the start of a
-    # long message (Claude Code folds it after three lines), and what is
-    # being approved must never be in the folded part.
-    arguments = json.dumps(request.arguments, ensure_ascii=False, default=str)
-    return f"The AI wants to run {request.tool} ({request.tier.value}) with:\n{arguments}"
+    # The tool (and why it was asked, and for whom), its arguments, and the
+    # records it acts on, one per line. Clients show only the start of a
+    # long message (Claude Code folds it after three lines), so what is
+    # being approved comes first: the first three lines carry the tool, the
+    # arguments and the first record.
+    arguments = _arguments(request)
+    head = f"The AI wants to run {request.tool} ({request.tier.value}){_who(request.caller)} with:"
+    if request.reason:
+        head = f"Approval needed ({_one_line(request.reason, 120)}). {head}"
+    lines = [head, arguments]
+    lines.extend("on " + _one_line(line) for line in request.resources)
+    return "\n".join(lines)
+
+
+def _who(caller: Caller | None) -> str:
+    """The form's first line names who the call is for, unless no one signed in."""
+    return "" if caller is None else f" {_caller_label(caller)}"
 
 
 class ElicitationApprover:
@@ -180,8 +304,9 @@ class ElicitationApprover:
     round is checked before anything runs: the SDK seals the gate's state
     and binds it to the tool and its exact arguments, the answer must be
     to the question asked, within ``approval_timeout`` (an hour when none
-    is set), and each approval runs its call once. Single use is tracked
-    per process.
+    is set), and each approval runs its call once. Used approvals are
+    remembered in ``store``, per process by default; see
+    :class:`ApprovalStore` for when replicas need to share one.
 
     When the client can't be asked (it declares no form elicitation, or
     the tool runs its own multi-round flow), ``fallback`` decides. With no
@@ -198,12 +323,15 @@ class ElicitationApprover:
         fallback: Approver | None = None,
         *,
         message: Callable[[ApprovalRequest], str] | None = None,
+        store: ApprovalStore | None = None,
     ) -> None:
         self.fallback = fallback
         """Decides when the client can't be asked; ``None`` denies."""
         self._message = message or _default_message
-        self._used_lock = threading.Lock()
-        self._used: dict[str, float] = {}  # nonce → when its approval expires
+        if store is not None and not callable(getattr(store, "spend", None)):
+            raise TypeError("store must have a spend(nonce, expires) method")
+        self.store: ApprovalStore = store if store is not None else MemoryApprovalStore()
+        """Where used approvals are remembered."""
 
     def __call__(self, request: ApprovalRequest) -> bool | Awaitable[bool]:
         """Decide with no client to ask: the fallback's answer, or a refusal.
@@ -239,18 +367,22 @@ class ElicitationApprover:
     async def ask(self, request: ApprovalRequest, context: Any) -> bool:
         """Back-channel: send the form mid-call and wait for the answer."""
         result = await context.elicit(self._message(request), _ApprovalForm)
-        return result.action == "accept" and result.data.approve
+        return result.action == "accept" and result.data.approve is True
 
     def question(self, request: ApprovalRequest, timeout: float | None) -> InputRequiredResult:
         """Round trip, first round: hand the question back to the client."""
         message = self._message(request)
         age = _MAX_APPROVAL_AGE if timeout is None else timeout
         state = {
-            "v": 1,
-            "q": _digest(message),
+            "v": 2,
+            "q": _digest(message, request.binding),
             "nonce": secrets.token_urlsafe(16),
             "exp": time.time() + age,
         }
+        if request.call_id is not None:
+            # Which call asked, so the round that answers can say so in the
+            # audit trail. Not part of the digest: each round is its own call.
+            state["call"] = request.call_id
         form = ElicitRequest(
             params=ElicitRequestFormParams(
                 message=message,
@@ -271,16 +403,23 @@ class ElicitationApprover:
         try:
             state = json.loads(context.request_state or "")
             nonce, expires, asked = state["nonce"], float(state["exp"]), state["q"]
-            if state["v"] != 1 or not isinstance(nonce, str):
+            if state["v"] != 2 or not isinstance(nonce, str):
                 return None
         except (ValueError, TypeError, KeyError):
             return None
         reply = (context.input_responses or {}).get(_INPUT_KEY)
-        if reply is None or asked != _digest(self._message(request)):
+        if reply is None or asked != _digest(self._message(request), request.binding):
             return None
         if not time.time() < expires:
             return False, "approval timed out"
-        if not self._spend(nonce, expires):
+        try:
+            spent = self.store.spend(nonce, expires)
+        except Exception as exc:
+            # The store is the single-use guarantee. Without its answer the
+            # gate can't tell a first use from a replay, so it refuses. Type
+            # only, as with every other error in the trail.
+            return False, f"approval store error: {type(exc).__name__}"
+        if spent is not True:
             return False, "approval already used"
         if not isinstance(reply, ElicitResult):
             return False, "approver error: not an elicitation answer"
@@ -290,21 +429,31 @@ class ElicitationApprover:
             form = _ApprovalForm.model_validate(reply.content or {})
         except ValidationError:
             return False, "approver error: invalid approval form"
-        return (True, "") if form.approve else (False, "approver refused")
-
-    def _spend(self, nonce: str, expires: float) -> bool:
-        """Mark one approval used. ``False`` if it already was."""
-        now = time.time()
-        with self._used_lock:
-            # Past its expiry a nonce is refused before it gets here, so the
-            # record of it can go.
-            for old in [n for n, exp in self._used.items() if exp <= now]:
-                del self._used[old]
-            if nonce in self._used:
-                return False
-            self._used[nonce] = expires
-            return True
+        return (True, "") if form.approve is True else (False, "approver refused")
 
 
-def _digest(message: str) -> str:
-    return hashlib.sha256(message.encode("utf-8", "surrogatepass")).hexdigest()
+_CALL_ID = re.compile(r"[0-9a-f]{32}")
+
+
+def asking_call(context: Any) -> str | None:
+    """The ``call_id`` of the round that asked the question this round
+    answers, from the request state the client sent back; ``None`` when
+    there is none to read. Only for linking audit lines: the state is
+    sealed by the SDK, and a value that isn't a call id is ignored."""
+    try:
+        state = json.loads(context.request_state or "")
+        call = state.get("call") if isinstance(state, dict) else None
+    except (ValueError, TypeError, AttributeError):
+        return None
+    return call if isinstance(call, str) and _CALL_ID.fullmatch(call) else None
+
+
+def _digest(message: str, binding: str | None) -> str:
+    """The question asked, bound to the state it was asked about.
+
+    The binding (caller, reason, a fingerprint of each record) is part of
+    the digest whatever the message says, so a custom ``message=`` that
+    leaves the record out still can't carry an answer over to a record
+    that changed."""
+    text = message + "\0" + (binding or "")
+    return hashlib.sha256(text.encode("utf-8", "surrogatepass")).hexdigest()

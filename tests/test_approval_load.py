@@ -18,7 +18,10 @@ import pytest
 from mcp import Client
 from mcp.server.mcpserver import MCPServer
 
-from mcp_gatehouse import AccessTier, ApprovalRequest, AuditLog, Gatehouse, Policy, terminal_approver
+from mcp_gatehouse import AccessTier, ApprovalRequest, AuditLog, Caller, Policy, terminal_approver
+
+from _support import OpenGatehouse as Gatehouse
+from _support import signed_in, token
 from mcp_gatehouse import approvers
 from mcp_gatehouse import gatehouse as gatehouse_module
 
@@ -115,43 +118,95 @@ async def test_approval_timeout_is_an_audited_denial(is_async):
     assert event["reason"] == "approval timed out"
 
 
-@pytest.mark.anyio
-async def test_timed_out_approvals_give_back_their_thread():
-    """More approvals than the approver pool has threads, every one ignored
-    until it times out. The pool must be free again afterwards, or one
-    absent human would lock out every later approval."""
-    released = threading.Event()
-
-    def approver(request) -> bool:
-        if request.arguments["order_id"] == "quick":
-            return True
-        return released.wait(timeout=10)
-
+def two_approved_tools(approver, *, timeout):
+    """``cancel`` and ``refund`` both need the approver's yes."""
+    log = io.StringIO()
     mcp = MCPServer("t")
-    gk = Gatehouse(mcp, policy=Policy(approver=approver, approval_timeout=0.2))
+    gk = Gatehouse(mcp, policy=Policy(approver=approver, approval_timeout=timeout), audit=AuditLog(stream=log))
 
     @gk.tool(tier=AccessTier.DESTRUCTIVE)
     def cancel(order_id: str) -> str:
         return "cancelled"
 
-    results = []
+    @gk.tool(tier=AccessTier.DESTRUCTIVE)
+    def refund(order_id: str) -> str:
+        return "refunded"
+
+    return mcp, log
+
+
+@pytest.mark.anyio
+async def test_approvers_waiting_on_one_tool_leave_other_tools_approvals_alone(monkeypatch):
+    """Each tool has its own approver threads. With every one of
+    ``cancel``'s taken by an approval nobody has answered, an approval for
+    ``refund`` still runs at once."""
+    monkeypatch.setattr(gatehouse_module, "_APPROVER_THREADS", 2)
+    started, released = threading.Semaphore(0), threading.Event()
+
+    def approver(request) -> bool:
+        if request.tool == "refund":
+            return True
+        started.release()
+        return released.wait(timeout=10)
+
+    mcp, _ = two_approved_tools(approver, timeout=5)
     try:
         async with Client(mcp) as client:
-
-            async def call(order_id):
-                results.append(await client.call_tool("cancel", {"order_id": order_id}))
-
             async with anyio.create_task_group() as tg:
-                for i in range(gatehouse_module._APPROVER_THREADS + 1):
-                    tg.start_soon(call, str(i))
-            with anyio.fail_after(2):
-                quick = await client.call_tool("cancel", {"order_id": "quick"})
+                tg.start_soon(client.call_tool, "cancel", {"order_id": "1"})
+                tg.start_soon(client.call_tool, "cancel", {"order_id": "2"})
+                for _ in range(2):
+                    with anyio.fail_after(5):
+                        while not started.acquire(blocking=False):
+                            await anyio.sleep(0.01)
+                began = time.monotonic()
+                result = await client.call_tool("refund", {"order_id": "3"})
+                waited = time.monotonic() - began
+                released.set()
+        assert result.is_error is False
+        assert waited < 1, f"refund's approver waited {waited:.1f} s for a thread"
     finally:
         released.set()
 
-    assert all(r.is_error for r in results)
-    assert quick.is_error is False
-    assert quick.content[0].text == "cancelled"
+
+@pytest.mark.anyio
+async def test_timed_out_approver_threads_are_bounded_per_tool(monkeypatch, capsys):
+    """An approver still blocked when the approval times out is abandoned,
+    but its thread keeps the tool's place until it returns: one that
+    ignores ``request.deadline`` holds at most the tool's own threads, and
+    later approvals for that tool are refused at the timeout without
+    starting another. Once the threads return, the tool works again."""
+    monkeypatch.setattr(gatehouse_module, "_APPROVER_THREADS", 2)
+    entered: list[str] = []
+    released = threading.Event()
+
+    def approver(request) -> bool:
+        entered.append(request.arguments["order_id"])
+        if request.arguments["order_id"] == "quick":
+            return True
+        return released.wait(timeout=10)  # ignores request.deadline
+
+    mcp, log = two_approved_tools(approver, timeout=0.2)
+    try:
+        async with Client(mcp) as client:
+            for i in range(6):
+                result = await client.call_tool("cancel", {"order_id": str(i)})
+                assert result.is_error
+            assert len(entered) == 2  # only the tool's two threads ever started
+            assert [e["reason"] for e in events(log)] == ["approval timed out"] * 6
+            assert "sync approver for 'cancel' was abandoned" in capsys.readouterr().err
+            refund = await client.call_tool("refund", {"order_id": "quick"})
+            assert refund.is_error is False  # another tool has its own places
+            released.set()
+            with anyio.fail_after(5):
+                while True:  # the abandoned threads give their places back as they return
+                    quick = await client.call_tool("cancel", {"order_id": "quick"})
+                    if not quick.is_error:
+                        break
+                    await anyio.sleep(0.05)
+        assert quick.content[0].text == "cancelled"
+    finally:
+        released.set()
 
 
 @pytest.mark.anyio
@@ -266,13 +321,14 @@ async def test_signature_is_not_recomputed_per_call(monkeypatch):
     def lookup(order_id: str, verbose: bool = False) -> str:
         return f"order {order_id}"
 
-    guarded = gk._guard(lookup, "lookup", AccessTier.READ)
+    guarded = gk.guard(lookup, "lookup", AccessTier.READ)
 
     def no_signature(*args, **kwargs):
         raise AssertionError("inspect.signature called on the call path")
 
     monkeypatch.setattr(gatehouse_module.inspect, "signature", no_signature)
-    assert await guarded(order_id="1") == "order 1"
+    with signed_in(token("alice")):
+        assert await guarded(order_id="1") == "order 1"
 
 
 @pytest.mark.anyio
@@ -363,6 +419,28 @@ def test_terminal_prompt_takes_an_answer(operator, timeout):
 
 
 @needs_pty
+def test_terminal_prompt_names_the_caller(operator):
+    """On a server that signs callers in, the prompt says whose request it is,
+    between the call and the question."""
+    os.write(operator, b"y\n")
+    signed_in = ApprovalRequest(
+        tool="cancel", tier=AccessTier.DESTRUCTIVE, arguments={"order_id": "4417"},
+        deadline=time.monotonic() + 5, caller=Caller(client_id="support-agent", subject="alice"),
+    )
+    assert terminal_approver(signed_in) is True
+    shown = screen(operator)
+    assert 'for "alice" via client "support-agent"' in shown
+    assert shown.index("approval needed") < shown.index('for "alice"') < shown.index("allow?")
+
+
+@needs_pty
+def test_terminal_prompt_without_a_caller_is_unchanged(operator):
+    os.write(operator, b"y\n")
+    assert terminal_approver(request(time.monotonic() + 5)) is True
+    assert " for " not in screen(operator)
+
+
+@needs_pty
 def test_terminal_prompt_stays_off_a_full_screen_programs_terminal(pty_pair, capsys):
     """An MCP client's terminal UI keeps the terminal in raw mode, and a
     server it launched can still open that terminal. Prompting there drew
@@ -440,3 +518,28 @@ def test_terminal_prompt_needs_the_clients_session(own_session):
     else:
         assert "approval needed" in shown
         assert "timed out, denied" in shown
+
+
+@needs_pty
+def test_terminal_prompt_cuts_the_arguments_like_the_form(operator):
+    """The model's arguments are printed as the form shows them: JSON on one
+    line, cut at 400 characters, so a huge argument can't scroll the tool
+    name and the record off the terminal."""
+    huge = {f"k{i}": "x" * 20 for i in range(5000)}
+    asked = ApprovalRequest(
+        tool="cancel", tier=AccessTier.DESTRUCTIVE, arguments=huge, deadline=time.monotonic() + 5,
+        resources=("order: id=4417",),
+    )
+    answer: list[bool] = []
+    approving = threading.Thread(target=lambda: answer.append(terminal_approver(asked)))
+    approving.start()
+    shown = ""
+    while "allow?" not in shown:  # read as it's written: a pty's buffer is small
+        shown += screen(operator)
+    os.write(operator, b"y\n")
+    approving.join(5)
+    assert answer == [True]
+    header = next(line for line in shown.splitlines() if "approval needed" in line)
+    assert header.startswith('⚠ approval needed → cancel (destructive) {"k0": "xxxx')
+    assert header.endswith("…") and len(header) < 500
+    assert "on order: id=4417" in shown

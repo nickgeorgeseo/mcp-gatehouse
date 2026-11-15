@@ -66,7 +66,9 @@ async def test_a_sink_that_blocks_does_not_slow_the_call():
             took = time.monotonic() - began
         assert not first.is_error and not second.is_error
         assert took < 1.0  # the sink is still blocked in its first write
-        assert inner.entered.is_set() and inner.records == []
+        # The drain thread picks the first line up on its own schedule; on a
+        # busy runner that can be just after the calls return.
+        assert inner.entered.wait(timeout=2) and inner.records == []
     finally:
         inner.released.set()
         log.close()

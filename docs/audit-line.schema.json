@@ -35,7 +35,7 @@
     "continues": {
       "type": "string",
       "pattern": "^[0-9a-f]{32}$",
-      "description": "On the round that answers a round-trip approval: the call_id of the round that asked (its \"pending\" line). Present whatever the verdict, so an approval, a refusal and a replay all point back to the question."
+      "description": "On the round that answers a round-trip approval: the call_id of the round that asked (its \"pending\" line). Present whatever the verdict, so an approval, a refusal and a replay all point back to the question. That includes a stale answer's pending line, which asks again (reason \"approval asked again: resource changed while awaiting approval\")."
     },
     "timings_ms": {
       "type": "object",
@@ -131,6 +131,11 @@
       "const": true,
       "description": "A Scope was in force and the gate still had to withhold items: the query and the policy disagree. With withheld, only when true."
     },
+    "changed": {
+      "type": "array",
+      "items": {"type": "string"},
+      "description": "The fields that changed between what a person was asked about and the record when the call was checked again (\"order.total\"), and \"reason\" when the policy's reason did. Names only, never values. On the denied line with reason \"resource changed while awaiting approval\", and on the round trip's pending line with reason \"approval asked again: resource changed while awaiting approval\", which asks again instead of refusing. Empty when the gate had nothing to compare with (another replica asked, or over an hour ago)."
+    },
     "sink_error": {
       "type": "string",
       "description": "Only on the copy of a line written to stderr instead of the sink: the exception type when the sink raised, \"queue full\" when a BufferedSink had no room, \"sink closed\" when a BufferedSink was written to after close, \"terminated\" when SIGTERM ended the process with the record still in a BufferedSink (the one being written then may also be in the sink). Never in a sink's own output."
@@ -153,6 +158,13 @@
     {
       "if": {"required": ["scope_mismatch"]},
       "then": {"required": ["withheld"]}
+    },
+    {
+      "if": {"required": ["changed"]},
+      "then": {"anyOf": [
+        {"properties": {"outcome": {"const": "denied"}, "reason": {"const": "resource changed while awaiting approval"}}},
+        {"properties": {"outcome": {"const": "pending"}, "reason": {"const": "approval asked again: resource changed while awaiting approval"}}, "required": ["continues"]}
+      ]}
     },
     {
       "if": {"properties": {"tier": {"const": null}}},

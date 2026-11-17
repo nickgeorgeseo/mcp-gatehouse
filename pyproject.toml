@@ -7,7 +7,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "mcp-gatehouse"
-version = "0.6.0"
+version = "0.6.1"
 description = "Authorization as a runtime invariant for MCP servers: caller, policy and a decision on the record, checked in the server before every tool runs. Tiers, approval gates and an audit log around it."
 readme = "README.md"
 license = "MIT"

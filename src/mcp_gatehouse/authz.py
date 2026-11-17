@@ -167,11 +167,20 @@ class Load:
     act on, not just the arguments the model chose. Without it the approver
     sees the record's fields as the audit log would show them, secrets
     masked (``order: id=4417 · customer=Blue Ridge Cabinets · ...``).
+
+    ``changed_values`` decides whether, when a person is asked again because
+    the record changed, the change line shows a field's old and new values
+    (``order.total: 812.00 → 812.01``) or only its name (``order.total
+    changed``). By default it shows them, unless ``describe`` is set: then
+    you chose what the person sees, so the gate doesn't add fields of its
+    own. Pass ``True`` when the fields may be shown. A masked field never
+    shows its values either way.
     """
 
     loader: Callable[..., Any]
     fingerprint: Callable[[Any], Any] | None = None
     describe: Callable[[Any], str] | None = None
+    changed_values: bool | None = None
 
 
 @dataclass(frozen=True)

@@ -193,7 +193,9 @@ def build_server(
         # Writes carry the version they were checked at (OrderDesk.update).
         consistency=ConditionalWrite(),
     )
-    the_order = Load(desk.get, describe=describe)
+    # changed_values: describe= already shows the order's fields, so a
+    # change line may too ("order.total: 812.0 → 812.01"), not just name them.
+    the_order = Load(desk.get, describe=describe, changed_values=True)
 
     # Anyone signed in may list; what they see is decided order by order.
     @gatehouse.tool(tier=AccessTier.READ, authorize=any_caller, authorize_items=yours)

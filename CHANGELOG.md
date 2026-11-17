@@ -5,6 +5,38 @@ All notable changes to `mcp-gatehouse`. The public API (`Gatehouse`,
 with one deliberate exception: 0.6.0's authorization invariant is
 breaking, and its release notes say how to migrate.
 
+## 0.6.1 — 2026-11-16
+
+### A changed record says what changed
+
+An approval that no longer applies because its record changed was refused
+with "the record changed", and asking again showed the new record with
+nothing marking what was different, so a person would approve the second
+question as they had the first. Now:
+
+- The refusal names each field with its old and new value: `What changed:
+  order.total: 812.00 → 812.01.`
+- The next question about the same call (same tool, caller and arguments)
+  starts with `Changed since you were last asked: …`, in the client's form
+  and on the terminal. Over the 2026-07-28 round trip, where a stale answer
+  is asked again rather than refused, the question asked again does too.
+- That stale answer is now on the record: the round trip's `pending` line
+  reads `approval asked again: resource changed while awaiting approval`,
+  with `changed` and `continues`. Before, the log showed two ordinary
+  `pending` lines.
+- `ApprovalRequest.changes` carries the lines for custom approvers.
+- The audit line of the refusal lists the field names in `changed`. Names
+  only, never values.
+- `Load(changed_values=True)` lets a record with `describe=` show values in
+  its change lines. The demo uses it.
+
+A masked field is named without its values, and so is every field of a
+record whose `Load` has `describe=`, unless it passes
+`changed_values=True`. What changed is only shown: the approval still
+binds to the record's state exactly as before, and the question's digest
+leaves the change lines out, so the answer to a question that showed them
+still matches. The memory is per process and lasts an hour.
+
 ## 0.6.0 — 2026-11-15
 
 ### Breaking: authorization is a runtime invariant

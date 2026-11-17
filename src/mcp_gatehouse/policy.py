@@ -106,6 +106,16 @@ class ApprovalRequest:
     ``ElicitationApprover(message=...)``, or the answer never matches the
     question."""
 
+    changes: tuple[str, ...] = ()
+    """What changed since a person was last asked about this same call (same
+    tool, caller and arguments), one line per field: ``order.total: 812.00 →
+    812.01``. Empty on a first ask. Show it first: an approval that went
+    stale because the record changed is asked again, and without this the
+    second question looks just like the first. A masked field, or any field
+    of a record whose ``Load`` has ``describe=``, is named without its
+    values. Remembered per process for an hour, so a question asked on
+    another replica, or longer ago, has none."""
+
 
 Approver = Callable[[ApprovalRequest], Union[bool, Awaitable[bool]]]
 

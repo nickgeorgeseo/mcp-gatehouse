@@ -22,6 +22,7 @@ tier.
 from __future__ import annotations
 
 import asyncio
+import collections
 import collections.abc
 import contextvars
 import copy
@@ -55,7 +56,7 @@ from mcp.types import InputRequiredResult, ToolAnnotations
 from opentelemetry import trace as _otel_trace
 from pydantic import BaseModel
 
-from .approvers import ElicitationApprover, asking_call
+from .approvers import ElicitationApprover, _one_line, asking_call
 from .audit import AuditLog, NullAuditLog
 from .authz import (
     _TRANSACTION,
@@ -76,6 +77,7 @@ from .authz import (
     any_item,
 )
 from .policy import (
+    REDACTED,
     AccessTier,
     ApprovalRequest,
     Caller,
@@ -292,11 +294,15 @@ class _Call:
 class _Refused(Exception):
     """A step refused the call. Raised inside a transaction so it rolls back."""
 
-    def __init__(self, reason: str, message: str | None = None, *, outcome: str = "denied") -> None:
+    def __init__(
+        self, reason: str, message: str | None = None, *, outcome: str = "denied", **fields: Any
+    ) -> None:
         super().__init__(reason)
         self.reason = reason
         self.message = message
         self.outcome = outcome
+        self.fields = fields
+        """Extra fields for the audit line (``changed``)."""
 
 
 class _DeadlinePassed(Exception):
@@ -324,10 +330,79 @@ class _NeedsApproval(Exception):
     someone makes up their mind. ``via`` says how to ask.
     """
 
-    def __init__(self, request: ApprovalRequest, via: str) -> None:
+    def __init__(
+        self, request: ApprovalRequest, via: str, seen: _Seen | None = None, stale: list[str] | None = None
+    ) -> None:
         super().__init__(via)
         self.request = request
         self.via = via
+        self.seen = seen
+        self.stale = stale
+        """Asked again because an answer came back for a state that has
+        changed: the fields that changed (empty when unknown)."""
+
+
+@dataclasses.dataclass(frozen=True)
+class _Shown:
+    """One record as a person was asked about it."""
+
+    snapshot: Any
+    """Its redacted fields, as the audit log shows them."""
+    fingerprint: str | None
+    """A hash of ``Load(fingerprint=...)``'s value, when it has one: what it
+    sees may be secret, so only the hash is kept."""
+    values: bool
+    """Whether a change line may show this record's values: what
+    ``Load(changed_values=...)`` says, by default not when ``describe=``
+    chose what the person sees."""
+
+
+@dataclasses.dataclass(frozen=True)
+class _Seen:
+    """What a person was asked about: the reason and each record. Kept only
+    to say what changed. The binding, not this, decides whether an approval
+    applies."""
+
+    reason: str | None
+    records: dict[str, _Shown]
+
+
+@dataclasses.dataclass(frozen=True)
+class _Approved:
+    """An approval given in this call: the state it binds to, and what the
+    person saw, for saying what changed when it no longer applies."""
+
+    binding: str | None
+    seen: _Seen | None
+
+
+class _AskedMemory:
+    """What each call was last asked about, so asking again can show what
+    changed. Keyed by a hash of the tool, the caller and the arguments;
+    per process, bounded, and forgotten after an hour. Losing an entry only
+    loses the diff, never a check."""
+
+    _LIMIT = 1024
+    _TTL = 3600.0
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._entries: collections.OrderedDict[str, tuple[float, _Seen]] = collections.OrderedDict()
+
+    def get(self, key: str) -> _Seen | None:
+        now = time.monotonic()
+        with self._lock:
+            entry = self._entries.get(key)
+            if entry is None or entry[0] <= now:
+                return None
+            return entry[1]
+
+    def put(self, key: str, seen: _Seen) -> None:
+        with self._lock:
+            self._entries.pop(key, None)
+            self._entries[key] = (time.monotonic() + self._TTL, seen)
+            while len(self._entries) > self._LIMIT:
+                self._entries.popitem(last=False)
 
 
 class Gatehouse:
@@ -378,6 +453,7 @@ class Gatehouse:
         self._authorize_pool = anyio.CapacityLimiter(math.inf)
         self._authorize_places: dict[str, _Places] = {}
         self._approver_places: dict[str, _Places] = {}
+        self._asked = _AskedMemory()
         self._transaction_threads: dict[str, anyio.CapacityLimiter] = {}
         self._registry: dict[str, _Entry] = {}
         self._lock_down()
@@ -886,8 +962,8 @@ class Gatehouse:
                     event["duration_ms"] = timings.get("tool")
                 audit.record(call_id=call_id, tool=spec.name, tier=spec.tier.value, **event)
 
-            def denied(reason: str, message: str, outcome: str = "denied") -> GateDenied:
-                record(outcome=outcome, reason=reason, arguments=safe_args)
+            def denied(reason: str, message: str, outcome: str = "denied", **fields: Any) -> GateDenied:
+                record(outcome=outcome, reason=reason, arguments=safe_args, **fields)
                 return GateDenied(message)
 
             if spec.name in policy.deny:
@@ -906,14 +982,15 @@ class Gatehouse:
                 spec=spec, who=who, call_id=call_id, arguments=arguments, view=_read_only(arguments),
                 safe_args=safe_args, args=args, kwargs=kwargs, context=context,
             )
-            approved: str | None = None
+            approved: _Approved | None = None
             while True:
                 state.enter("authorizing")
                 try:
                     result = await gate._authorize_and_run(call, approved, state)
                 except _Refused as refusal:
                     raise denied(
-                        refusal.reason, refusal.message or _not_permitted_message(spec.name), refusal.outcome
+                        refusal.reason, refusal.message or _not_permitted_message(spec.name), refusal.outcome,
+                        **refusal.fields,
                     ) from None
                 except _NeedsApproval as need:
                     if approved is not None:  # pragma: no cover - the phase compares bindings
@@ -922,7 +999,7 @@ class Gatehouse:
                     question = await gate._obtain_approval(need, call, record, denied)
                     if question is not None:
                         return question
-                    approved = need.request.binding
+                    approved = _Approved(need.request.binding, need.seen)
                     continue
                 except Conflict:
                     record(
@@ -998,7 +1075,7 @@ class Gatehouse:
         guarded.__annotations__ = dict(spec.exposed_annotations)
         return guarded
 
-    async def _authorize_and_run(self, call: _Call, approved: str | None, state: _CallState) -> Any:
+    async def _authorize_and_run(self, call: _Call, approved: _Approved | None, state: _CallState) -> Any:
         """Load, authorize and run, inside the tool's transaction if it has one."""
         steps = self._steps(call, approved, state)
         transaction = call.spec.consistency if isinstance(call.spec.consistency, Transaction) else None
@@ -1032,7 +1109,9 @@ class Gatehouse:
             )
         return places
 
-    def _steps(self, call: _Call, approved: str | None, state: _CallState) -> Generator[Callable[[], Any], Any, Any]:
+    def _steps(
+        self, call: _Call, approved: _Approved | None, state: _CallState
+    ) -> Generator[Callable[[], Any], Any, Any]:
         """The call, step by step. Each ``yield`` hands the driver a callable
         to run (the user's loader, policy, tool, …) and gets its result back.
 
@@ -1163,7 +1242,8 @@ class Gatehouse:
         return tuple(kept) if isinstance(result, tuple) else kept
 
     def _settle_approval(
-        self, call: _Call, reason: str | None, loaded: dict[str, Any], approved: str | None, state: _CallState
+        self, call: _Call, reason: str | None, loaded: dict[str, Any], approved: _Approved | None,
+        state: _CallState,
     ) -> None:
         """Settle what can be settled now; raise ``_NeedsApproval`` for the rest.
 
@@ -1181,13 +1261,18 @@ class Gatehouse:
                 f"'{spec.name}' ({spec.tier.value}) requires approval and no approver "
                 "is configured. The gate fails closed.",
             )
-        request = self._approval_request(call, reason, loaded)
+        request, seen, changed = self._approval_request(call, reason, loaded)
         if approved is not None:
-            if approved != request.binding:
+            if approved.binding != request.binding:
+                fields, lines = _changes_between(approved.seen, seen)
+                if approved.seen is not None:
+                    # What the person approved, so asking again shows the
+                    # change against that, not against nothing.
+                    self._asked.put(_asked_key(call), approved.seen)
                 raise _Refused(
                     "resource changed while awaiting approval",
-                    f"'{spec.name}': the record changed while the approval was pending, so "
-                    "the approval no longer applies. Nothing was done.",
+                    _stale_approval_message(spec.name, lines),
+                    changed=fields,
                 )
             return
         if isinstance(approver, ElicitationApprover):
@@ -1200,7 +1285,13 @@ class Gatehouse:
                     why = f"approver error: {type(exc).__name__}"
                     raise _Refused(why, _approval_refused_message(spec.name, why)) from exc
                 if verdict is None:
-                    raise _NeedsApproval(request, "round-trip")
+                    raise _NeedsApproval(request, "round-trip", seen)
+                if verdict == "stale":
+                    # An answer to this call's question, about a state that
+                    # has changed: it never applies. Ask again, showing what
+                    # changed, and link the line to the question it answers.
+                    state.continues = asking_call(call.context)
+                    raise _NeedsApproval(request, "round-trip", seen, stale=changed)
                 # An answer to a question this gate asked: the line says
                 # which call asked it, so the two rounds read as one.
                 state.continues = asking_call(call.context)
@@ -1209,7 +1300,7 @@ class Gatehouse:
                     raise _Refused(why, _approval_refused_message(spec.name, why))
                 return
             if transport == "back-channel":
-                raise _NeedsApproval(request, "back-channel")
+                raise _NeedsApproval(request, "back-channel", seen)
             if approver.fallback is None:
                 raise _Refused(
                     "approval required, client cannot be asked",
@@ -1217,15 +1308,19 @@ class Gatehouse:
                     "client can't be asked for it (no form elicitation). "
                     "The gate fails closed.",
                 )
-            raise _NeedsApproval(request, "fallback")
-        raise _NeedsApproval(request, "approver")
+            raise _NeedsApproval(request, "fallback", seen)
+        raise _NeedsApproval(request, "approver", seen)
 
-    def _approval_request(self, call: _Call, reason: str | None, loaded: dict[str, Any]) -> ApprovalRequest:
+    def _approval_request(
+        self, call: _Call, reason: str | None, loaded: dict[str, Any]
+    ) -> tuple[ApprovalRequest, _Seen, list[str]]:
         """What the approver sees, and the binding that ties its answer to
-        this caller, this reason and these records in this state."""
+        this caller, this reason and these records in this state; and what
+        it was shown, kept to say what changed if it's asked again."""
         spec, policy = call.spec, self.policy
         lines: list[str] = []
         fingerprints: dict[str, Any] = {}
+        shown: dict[str, _Shown] = {}
         for load in spec.loads:
             found = loaded[load.name]
             # The record as the audit log would show it: fields, secrets masked.
@@ -1243,6 +1338,9 @@ class Gatehouse:
                     fingerprints[load.name] = load.marker.fingerprint(found)
                 except Exception as exc:
                     raise _Refused(f"fingerprint error: {type(exc).__name__}") from exc
+                custom: str | None = hashlib.sha256(
+                    _canonical(fingerprints[load.name]).encode("utf-8", "surrogatepass")
+                ).hexdigest()
             else:
                 # Opaque anywhere, not just at the top: a field the gate
                 # sees only by its type could change unnoticed while a
@@ -1254,6 +1352,14 @@ class Gatehouse:
                         "its record changes while it waits. The gate fails closed.",
                     )
                 fingerprints[load.name] = snapshot
+                custom = None
+            values = load.marker.changed_values
+            if values is None:
+                values = load.marker.describe is None
+            shown[load.name] = _Shown(snapshot, custom, bool(values))
+        seen = _Seen(reason, shown)
+        before = self._asked.get(_asked_key(call))
+        changed, changes = _changes_between(before, seen)
         binding = hashlib.sha256(
             _canonical(
                 {
@@ -1265,7 +1371,7 @@ class Gatehouse:
             ).encode("utf-8", "surrogatepass")
         ).hexdigest()
         timeout = policy.approval_timeout
-        return ApprovalRequest(
+        request = ApprovalRequest(
             tool=spec.name,
             tier=spec.tier,
             # Its own copy: nothing the approver does to these can change
@@ -1277,7 +1383,9 @@ class Gatehouse:
             resources=tuple(lines),
             binding=binding,
             call_id=call.call_id,
+            changes=tuple(changes),
         )
+        return request, seen, changed
 
     async def _obtain_approval(
         self,
@@ -1291,6 +1399,8 @@ class Gatehouse:
         request, spec = need.request, call.spec
         approver = self.policy.approver
         timeout = self.policy.approval_timeout
+        if need.seen is not None:
+            self._asked.put(_asked_key(call), need.seen)
         if need.via == "round-trip":
             assert isinstance(approver, ElicitationApprover)
             try:
@@ -1301,7 +1411,13 @@ class Gatehouse:
             # The call ends here for now, and the client calls again with the
             # answer. If it never does, this line is the record that it was
             # asked.
-            record(outcome="pending", reason="approval asked in client", arguments=call.safe_args)
+            if need.stale is not None:
+                record(
+                    outcome="pending", reason="approval asked again: resource changed while awaiting approval",
+                    arguments=call.safe_args, changed=need.stale,
+                )
+            else:
+                record(outcome="pending", reason="approval asked in client", arguments=call.safe_args)
             return question
         if need.via == "back-channel":
             assert isinstance(approver, ElicitationApprover)
@@ -1771,6 +1887,9 @@ def _build_spec(
     for param, marker in loads:
         if not callable(marker.loader):
             raise TypeError(f"{tool_name}: Load({marker.loader!r}) needs a callable loader")
+        if marker.changed_values is not None and not isinstance(marker.changed_values, bool):
+            # "no" or 0 would read as a choice, and a truthy one would show values.
+            raise TypeError(f"{tool_name}: {param.name!r}'s changed_values must be True, False or None")
         try:
             loader_params = inspect.signature(marker.loader).parameters.values()
         except (TypeError, ValueError) as exc:
@@ -2166,6 +2285,87 @@ def _correlation(context: Any) -> dict[str, Any]:
         fields["trace_id"] = _otel_trace.format_trace_id(span.trace_id)
         fields["span_id"] = _otel_trace.format_span_id(span.span_id)
     return fields
+
+
+def _asked_key(call: _Call) -> str:
+    """Which call a question was about: the tool, the caller and the exact
+    arguments, hashed, so the memory of what was asked holds no argument."""
+    text = _canonical({"tool": call.spec.name, "caller": _caller_entry(call.who), "arguments": call.arguments})
+    return hashlib.sha256(text.encode("utf-8", "surrogatepass")).hexdigest()
+
+
+_ABSENT = object()
+
+
+def _changes_between(before: _Seen | None, after: _Seen) -> tuple[list[str], list[str]]:
+    """What changed from what a person was asked about to now: the field
+    paths (``order.total``, for the audit line) and one line each for
+    showing (``order.total: 812.00 → 812.01``). A masked field, or a field
+    of a record whose ``Load`` keeps values back (``describe=`` without
+    ``changed_values=True``), is named without its values. Nothing when
+    there's nothing to compare with."""
+    if before is None:
+        return [], []
+    fields: list[str] = []
+    lines: list[str] = []
+
+    def add(path: str, was: Any, now: Any, values: bool) -> None:
+        fields.append(path)
+        if values:
+            lines.append(f"{path}: {_change_value(was)} → {_change_value(now)}")
+        else:
+            lines.append(f"{path} changed")
+
+    if before.reason != after.reason:
+        add("reason", before.reason, after.reason, True)
+    for name, now in after.records.items():
+        was = before.records.get(name)
+        if was is None or was == now:
+            continue
+        found = False
+        if isinstance(was.snapshot, Mapping) and isinstance(now.snapshot, Mapping):
+            keys = [*was.snapshot, *(k for k in now.snapshot if k not in was.snapshot)]
+            for key in keys:
+                a, b = was.snapshot.get(key, _ABSENT), now.snapshot.get(key, _ABSENT)
+                if _canonical_or_absent(a) == _canonical_or_absent(b):
+                    continue
+                found = True
+                add(f"{name}.{key}", a, b, now.values and REDACTED not in (a, b))
+        elif _canonical(was.snapshot) != _canonical(now.snapshot):
+            found = True
+            opaque = any(isinstance(v, str) and v.startswith(_OPAQUE_PREFIX) for v in (was.snapshot, now.snapshot))
+            add(name, was.snapshot, now.snapshot, now.values and not opaque)
+        if not found:
+            # Only the fingerprint moved: a masked field, or one that only
+            # Load(fingerprint=...) sees.
+            fields.append(name)
+            lines.append(f"{name}: a field that isn't shown changed")
+    return fields, lines
+
+
+def _canonical_or_absent(value: Any) -> str | None:
+    return None if value is _ABSENT else _canonical(value)
+
+
+def _change_value(value: Any) -> str:
+    """One value in a change line: strings as they are, the rest as compact
+    JSON, on one line and cut short."""
+    if value is _ABSENT:
+        return "(none)"
+    shown = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False, default=str)
+    return _one_line(shown, 80)
+
+
+def _stale_approval_message(tool_name: str, changes: list[str]) -> str:
+    """What the model is told when the record changed under an approval:
+    nothing ran, what changed, and that a second try asks the person again."""
+    message = (
+        f"'{tool_name}': the record changed while the approval was pending, so "
+        "the approval no longer applies. Nothing was done."
+    )
+    if changes:
+        message += " What changed: " + _one_line("; ".join(changes), 600) + "."
+    return message + " Calling again asks the person again, showing them what changed."
 
 
 def _caller_entry(who: _Who) -> dict[str, Any]:

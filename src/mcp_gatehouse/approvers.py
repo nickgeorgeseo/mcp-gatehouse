@@ -6,6 +6,7 @@ returns ``True`` to allow — these are the ones worth not rewriting.
 
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import io
 import json
@@ -89,11 +90,26 @@ def _on_what(request: ApprovalRequest) -> str:
     asked, or nothing. Shown as single lines, so a record can't redraw the
     prompt."""
     lines = ""
+    if request.changes:
+        lines += "\n  changed since you were last asked: " + _changes(request)
     if request.resources:
         lines += "\n  on " + " | ".join(_one_line(line) for line in request.resources)
     if request.reason:
         lines += "\n  asked because: " + _one_line(request.reason)
     return lines
+
+
+def _changes(request: ApprovalRequest) -> str:
+    """What changed since the person was last asked, on one line."""
+    return _one_line("; ".join(request.changes), 300)
+
+
+def _unchanged(request: ApprovalRequest) -> ApprovalRequest:
+    """The request as a first ask would see it. The question's digest is
+    taken over this, so the answer to a question that showed what changed
+    still matches on the round that brings it, when nothing has changed
+    since and ``changes`` is empty. The binding still covers every record."""
+    return dataclasses.replace(request, changes=()) if request.changes else request
 
 
 def _arguments(request: ApprovalRequest) -> str:
@@ -276,6 +292,10 @@ def _default_message(request: ApprovalRequest) -> str:
     head = f"The AI wants to run {request.tool} ({request.tier.value}){_who(request.caller)} with:"
     if request.reason:
         head = f"Approval needed ({_one_line(request.reason, 120)}). {head}"
+    if request.changes:
+        # First, before the tool: a second question that reads like the
+        # first gets the same answer without a look at what changed.
+        head = f"Changed since you were last asked: {_changes(request)}. {head}"
     lines = [head, arguments]
     lines.extend("on " + _one_line(line) for line in request.resources)
     return "\n".join(lines)
@@ -375,9 +395,13 @@ class ElicitationApprover:
         age = _MAX_APPROVAL_AGE if timeout is None else timeout
         state = {
             "v": 2,
-            "q": _digest(message, request.binding),
+            "q": _digest(self._message(_unchanged(request)), request.binding),
             "nonce": secrets.token_urlsafe(16),
             "exp": time.time() + age,
+            # The state the question was about, so an answer that comes back
+            # after the record changed can be told from no answer at all.
+            # A hash: it says nothing about the record.
+            "b": request.binding,
         }
         if request.call_id is not None:
             # Which call asked, so the round that answers can say so in the
@@ -393,12 +417,14 @@ class ElicitationApprover:
             input_requests={_INPUT_KEY: form}, request_state=json.dumps(state)
         )
 
-    def answer(self, request: ApprovalRequest, context: Any) -> tuple[bool, str] | None:
+    def answer(self, request: ApprovalRequest, context: Any) -> tuple[bool, str] | Literal["stale"] | None:
         """Round trip, later round: read the client's answer.
 
         Returns ``None`` when there is nothing to read — first round, or an
-        answer to some other question — so the gate asks (again). Otherwise
-        ``(allowed, reason)``, the reason saying why not.
+        answer to some other question — so the gate asks (again), and
+        ``"stale"`` when the answer is to this call's question but the state
+        it was asked about has changed since, so the gate asks again and
+        says so. Otherwise ``(allowed, reason)``, the reason saying why not.
         """
         try:
             state = json.loads(context.request_state or "")
@@ -408,7 +434,12 @@ class ElicitationApprover:
         except (ValueError, TypeError, KeyError):
             return None
         reply = (context.input_responses or {}).get(_INPUT_KEY)
-        if reply is None or asked != _digest(self._message(request), request.binding):
+        if reply is None:
+            return None
+        if asked != _digest(self._message(_unchanged(request)), request.binding):
+            bound = state.get("b")
+            if isinstance(bound, str) and bound != request.binding:
+                return "stale"
             return None
         if not time.time() < expires:
             return False, "approval timed out"

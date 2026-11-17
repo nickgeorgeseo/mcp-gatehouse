@@ -292,7 +292,7 @@ which orders exist. The audit log records the real reason (`not found:
 order`, `policy: not the owner`). `Deny(..., message=...)` tells the model
 more, when that's safe to say.
 
-`Load(loader, describe=..., fingerprint=...)`:
+`Load(loader, describe=..., fingerprint=..., changed_values=...)`:
 
 - The loader's parameters name the tool's arguments it loads from. A
   loader that returns `None` means not found.
@@ -308,6 +308,29 @@ more, when that's safe to say.
   to only a masked field (a rotated `api_key`, say) goes unseen; return
   it from `fingerprint` if it matters. On a tier that requires approval, a record must be a Pydantic
   model, a dataclass or a mapping, or have a `fingerprint`.
+- A refusal for a changed record says what changed, and asking again
+  shows the person the same thing first, so the second question doesn't
+  read like the first:
+
+  ```text
+  'cancel_order': the record changed while the approval was pending, so the
+  approval no longer applies. Nothing was done. What changed: order.total:
+  812.00 → 812.01. Calling again asks the person again, showing them what changed.
+
+  Changed since you were last asked: order.total: 812.00 → 812.01. The AI wants to run cancel_order …
+  ```
+
+  Over the 2026-07-28 round trip there is no refusal: a stale answer is
+  asked again the same way, and its `pending` line says so (`approval
+  asked again: resource changed while awaiting approval`). A masked field
+  is named without its values (`order.api_key changed`), and so is every
+  field of a record whose `Load` has `describe`, since you chose what the
+  person sees; pass `changed_values=True` when its fields may be shown. A
+  change only `fingerprint` sees reads `order: a field that isn't shown
+  changed`. Custom approvers get the lines in `ApprovalRequest.changes`,
+  and the audit line lists the field names in `changed`. What was asked is
+  remembered per process for an hour: a question asked on another replica,
+  or longer ago, still binds the same way but shows no changes.
 
 #### Deadlines
 
@@ -575,7 +598,7 @@ field is ever written.
 | `call_id` | string, 32 hex | always: the gate's id for the call, the same on every line it writes. `ApprovalRequest.call_id` carries it to the approver |
 | `request_id` | string | when a live request is behind the call: its JSON-RPC id, cut to 128 characters. The client's choice, unique only per session |
 | `trace_id`, `span_id` | string, 32 and 16 hex | when the call runs in an OpenTelemetry trace: the client's `traceparent`, or a trace a configured OpenTelemetry SDK started |
-| `continues` | string, 32 hex | on the round that answers a round-trip approval: the `call_id` of the `pending` line that asked, whatever the verdict |
+| `continues` | string, 32 hex | on the round that answers a round-trip approval: the `call_id` of the `pending` line that asked, whatever the verdict. That includes the `pending` line of a stale answer, which asks again |
 | `tool` | string | always |
 | `tier` | `"read"`, `"write"`, `"destructive"` or `null` | always; `null` only for an ungated tool |
 | `outcome` | `"ok"`, `"denied"`, `"error"`, `"conflict"`, `"pending"`, `"cancelled"` | always |
@@ -593,6 +616,7 @@ field is ever written.
 | `withheld` | integer | `ok` lines of a tool with an item policy: items the caller may not see, removed |
 | `filter_errors` | integer | with `withheld`, when the item policy raised on some items |
 | `scope_mismatch` | `true` | with `withheld`, when a `Scope` was in force: the query and the policy disagree |
+| `changed` | array of strings | denials with reason `resource changed while awaiting approval`, and the round trip's `pending` line that asks again: the fields that changed since the person was asked (`order.total`, or `reason`), names only |
 | `sink_error` | string | only on the stderr copy of a line that didn't reach the sink: the exception type when the sink raised, `"queue full"`, `"sink closed"` or `"terminated"` from a `BufferedSink` |
 
 The outcomes: `ok`, the tool ran. `denied`, the gate refused, and `reason`

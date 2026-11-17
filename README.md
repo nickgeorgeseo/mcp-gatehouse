@@ -332,6 +332,8 @@ more, when that's safe to say.
   remembered per process for an hour: a question asked on another replica,
   or longer ago, still binds the same way but shows no changes.
 
+<p align="center"><img src="https://raw.githubusercontent.com/nickgeorgeseo/mcp-gatehouse/main/docs/approval-binding.gif" width="432" alt="You approve cancelling order 4417 at $812.00. While you decide, the server's record changes to $812.01. You click Approve and the call is refused: what changed, order.total 812.00 to 812.01, and nothing ran. Asked again, the approval card leads with a banner, Changed since you were last asked: order.total: 812.00 to 812.01, and the order shows $812.01. The audit log line says denied, resource changed while awaiting approval, with changed: order.total. Ends on mcp-gatehouse 0.6.1, pip install mcp-gatehouse."></p>
+
 #### Deadlines
 
 A call gets five seconds to load its records and reach a decision: the

@@ -188,6 +188,42 @@ log shows it:
 | Item filtering | tools returning a list of records | `authorize_items=` | `authorize_items=any_item` | `items: "open"` |
 | Check and write in one unit | WRITE/DESTRUCTIVE tools that `Load` | `consistency=` (per tool, or on the `Gatehouse`) | `consistency=AcceptRace("why")` | `consistency: "accept-race"` and the reason |
 
+### Signing callers in over HTTP
+
+Signing callers in is the SDK's job, and the gate reads what it verified.
+Give the server a `token_verifier` and `AuthSettings`, and set
+`resource_server_url` to the server's public URL:
+
+```python
+from mcp.server.auth.settings import AuthSettings
+from mcp.server.mcpserver import MCPServer
+
+mcp = MCPServer(
+    "orders",
+    token_verifier=verifier,  # yours: signature, issuer, audience, expiry
+    auth=AuthSettings(
+        issuer_url="https://login.example.com",
+        resource_server_url="https://orders.example.com/mcp",
+        # True: the SDK also refuses a token whose AccessToken.resource
+        # isn't this URL. False: your verifier checks the audience itself.
+        validate_token_resource=True,
+    ),
+)
+```
+
+With `resource_server_url` set, the SDK serves the server's OAuth
+Protected Resource Metadata (RFC 9728) at
+`/.well-known/oauth-protected-resource` plus the server's path (here
+`/.well-known/oauth-protected-resource/mcp`), and names that URL in the
+`WWW-Authenticate` header of every 401. That is how a client finds your
+identity provider. With `resource_server_url=None` tokens are still
+checked, but there is no metadata and the 401 points nowhere, so a client
+that follows the MCP authorization spec can't work out where to sign in.
+
+The authorization server's own metadata, including the PKCE methods it
+supports (`code_challenge_methods_supported`, which clients expect to list
+`S256`), is published by your identity provider, not by this server.
+
 ### Where it sits
 
 Three layers can say no to a tool call. They see different things, and

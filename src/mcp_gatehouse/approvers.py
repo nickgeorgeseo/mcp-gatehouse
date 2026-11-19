@@ -30,6 +30,7 @@ from mcp.server.elicitation import render_elicitation_schema
 from mcp_types.version import is_version_at_least
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
+from ._text import escaped
 from .policy import ApprovalRequest, Approver, Caller
 
 # Approvers run in worker threads, so two gated calls can ask at once.
@@ -121,9 +122,10 @@ def _arguments(request: ApprovalRequest) -> str:
 
 
 def _one_line(text: str, limit: int = 200) -> str:
-    """``text`` on one line: line breaks, control and format characters
-    (bidi overrides among them) escaped, cut at ``limit``."""
-    shown = "".join(ch if ch.isprintable() else ch.encode("unicode_escape").decode("ascii") for ch in str(text))
+    """``text`` on one line: line breaks and every character a person
+    can't see (control and format characters, bidi overrides and variation
+    selectors among them) escaped, cut at ``limit``."""
+    shown = escaped(str(text))
     return shown[:limit] + "…" if len(shown) > limit else shown
 
 

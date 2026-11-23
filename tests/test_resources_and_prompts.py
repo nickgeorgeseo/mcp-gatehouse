@@ -9,10 +9,13 @@ verified caller may read.
 
 from __future__ import annotations
 
+from typing import Annotated
+
 import pytest
 from mcp import Client, MCPError
 from mcp.server.mcpserver import MCPServer
 from mcp.server.mcpserver.resources import TextResource
+from pydantic import Field
 
 from mcp_gatehouse import AccessTier, Deny, Gatehouse, any_caller
 
@@ -141,3 +144,82 @@ def test_open_resource_needs_its_uri():
         @gk.open_resource
         def pricing() -> str:
             return ""
+
+
+# --- what the model is told about them ------------------------------------------
+
+
+def a_resource(gk, text):
+    @gk.open_resource("docs://pricing", description=text)
+    def pricing() -> str:
+        return "standard: 10/month"
+
+
+def a_resource_from_its_docstring(gk, text):
+    def pricing() -> str:
+        return "standard: 10/month"
+
+    pricing.__doc__ = text
+    gk.open_resource("docs://pricing")(pricing)
+
+
+def a_template(gk, text):
+    @gk.open_resource("docs://{page}", title=text)
+    def page(page: str) -> str:
+        return page
+
+
+def a_prompt(gk, text):
+    @gk.open_prompt(name="triage", description=text)
+    def triage(topic: str) -> str:
+        return topic
+
+
+def a_prompts_argument(gk, text):
+    def triage(topic: str) -> str:
+        return topic
+
+    triage.__annotations__["topic"] = Annotated[str, Field(description=text)]
+    gk.open_prompt(name="triage")(triage)
+
+
+@pytest.mark.parametrize(
+    "register, refusal",
+    [
+        (a_resource, "resource docs://pricing: refusing to register: {} in the description"),
+        (a_resource_from_its_docstring, "resource docs://pricing: refusing to register: {} in the description"),
+        (a_template, "resource docs://{{page}}: refusing to register: {} in the title"),
+        (a_prompt, "prompt triage: refusing to register: {} in the description"),
+        (a_prompts_argument, "prompt triage: refusing to register: {} in the description of argument 'topic'"),
+    ],
+    ids=lambda value: getattr(value, "__name__", ""),
+)
+@pytest.mark.parametrize(
+    "char, named",
+    [("\u200b", "U+200B ZERO WIDTH SPACE"), ("\u202e", "U+202E RIGHT-TO-LEFT OVERRIDE"), ("\U000e0100", "U+E0100 VARIATION SELECTOR-17")],
+    ids=["zero-width", "bidi", "variation-selector"],
+)
+async def test_an_open_resource_or_prompt_with_a_character_nobody_can_see_is_refused(register, refusal, char, named):
+    mcp = MCPServer("t")
+    gk = OpenGatehouse(mcp)
+    with pytest.raises(RuntimeError) as refused:
+        register(gk, f"Current{char} prices.")
+    message = str(refused.value)
+    assert message == refusal.format("text the model reads has characters a reviewer can't see: " + named)
+    assert char not in message
+    async with Client(mcp) as client:  # and it isn't served
+        assert (await client.list_resources()).resources == []
+        assert (await client.list_resource_templates()).resource_templates == []
+        assert (await client.list_prompts()).prompts == []
+
+
+async def test_ordinary_text_on_an_open_resource_and_prompt_is_accepted():
+    mcp = MCPServer("t")
+    gk = OpenGatehouse(mcp)
+    a_resource(gk, "Tarifs — 料金表 👍\nMis à jour chaque lundi.")
+    a_prompt(gk, "Trie une demande — 問い合わせ")
+    async with Client(mcp) as client:
+        (resource,) = (await client.list_resources()).resources
+        (prompt,) = (await client.list_prompts()).prompts
+    assert resource.description == "Tarifs — 料金表 👍\nMis à jour chaque lundi."
+    assert prompt.description == "Trie une demande — 問い合わせ"

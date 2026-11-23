@@ -56,6 +56,7 @@ from mcp.types import InputRequiredResult, ToolAnnotations
 from opentelemetry import trace as _otel_trace
 from pydantic import BaseModel
 
+from . import _text
 from .approvers import ElicitationApprover, _one_line, asking_call
 from .audit import AuditLog, NullAuditLog
 from .authz import (
@@ -482,7 +483,9 @@ class Gatehouse:
             )
         resources, prompts = self._other_registries()
         self._check_extensions()
+        self._check_server_text()
         self._manager: Any = manager
+        self._others: tuple[Any, Any] = (resources, prompts)
         server._mcp_gatehouse = self  # type: ignore[attr-defined]
         gate = self
 
@@ -564,6 +567,19 @@ class Gatehouse:
                 "policy and no audit line; put what they serve behind a tool registered with "
                 "@gatehouse.tool(...)."
             )
+
+    def _check_server_text(self) -> None:
+        """Refuse a server whose own text has characters a reviewer can't see.
+
+        Its name, its instructions and the rest of what it says about itself
+        go to every client that connects, and the instructions go to the
+        model. They are fixed when the server is made, so checking here
+        covers them.
+        """
+        said = ("name", "title", "description", "instructions", "version", "website_url", "icons")
+        problem = _unseen_text({f"the server's {what.replace('_', ' ')}": getattr(self.server, what, None) for what in said})
+        if problem:
+            raise ValueError(problem)
 
     def _other_registries(self) -> tuple[Any, Any]:
         """The server's resource and prompt registries, checked before the
@@ -676,13 +692,64 @@ class Gatehouse:
 
     def _register_open(self, make: Callable[[], Callable[[F], F]]) -> Callable[[F], F]:
         def decorator(fn: F) -> F:
+            before = self._open_entries()  # kept, so no new entry can reuse an id
+            known = {id(entry) for _, entry in before}
             registering = _REGISTERING.set(self)
             try:
-                return make()(fn)
+                registered = make()(fn)
             finally:
                 _REGISTERING.reset(registering)
+            for kind, entry in self._open_entries():
+                if id(entry) not in known:
+                    self._verify_open(kind, entry)
+            return registered
 
         return decorator
+
+    def _open_entries(self) -> list[tuple[str, Any]]:
+        """Every resource, template and prompt on the server, as it stands."""
+        resources, prompts = self._others
+        return (
+            [("resource", resource) for resource in resources.list_resources()]
+            + [("resource", template) for template in resources.list_templates()]
+            + [("prompt", prompt) for prompt in prompts.list_prompts()]
+        )
+
+    def _verify_open(self, kind: str, entry: Any) -> None:
+        """Read a resource or prompt back from the server and refuse it if
+        what the server lists for it has characters a reviewer can't see.
+
+        Only what is listed: what a read returns is made per request, and
+        the gate doesn't look inside it.
+        """
+        label = "?"
+        try:
+            if kind == "prompt":
+                label = entry.name
+                served = {"the name": entry.name}
+                for argument in entry.arguments or ():
+                    of = f"of argument '{_text.escaped(str(argument.name))}'"
+                    served |= {f"the name {of}": argument.name, f"the description {of}": argument.description}
+            else:
+                label = str(getattr(entry, "uri_template", None) or entry.uri)
+                served = {"the URI": label, "the name": entry.name, "the MIME type": entry.mime_type}
+                served["the metadata (_meta)"] = entry.meta
+            served |= {"the title": entry.title, "the description": entry.description, "the icons": entry.icons}
+            problem = _unseen_text(served)
+        except Exception as exc:  # pragma: no cover - only on an SDK the gate doesn't know
+            problem = f"what was registered couldn't be read back ({type(exc).__name__})"
+        if problem:
+            try:
+                if kind == "prompt":
+                    self.server.remove_prompt(entry.name)
+                else:
+                    # The SDK has no call that takes a resource back out.
+                    for registry in (self._others[0]._resources, self._others[0]._templates):
+                        for key in [key for key, kept in registry.items() if kept is entry]:
+                            del registry[key]
+            except Exception:
+                pass
+            raise RuntimeError(f"{kind} {_text.escaped(label)}: refusing to register: {problem}")
 
     def _gated(self, name: str) -> bool | None:
         """``True`` if the gate's own guard is what would run for ``name``;
@@ -872,11 +939,17 @@ class Gatehouse:
 
     def _verify_registration(self, spec: _ToolSpec, guarded: Callable[..., Any]) -> None:
         """Read the tool back from the server and check the gate is what runs,
-        and that nothing the gate fills is something the model can send.
+        that nothing the gate fills is something the model can send, and
+        that what the model is told about the tool is what a person
+        reviewing it can see.
 
         A future SDK that put a ``Load`` parameter into the input schema
         would let the model hand the tool its own "loaded" record. That must
         stop the server, not slip through.
+
+        The text is checked here, as the server will list it, because the
+        arguments to ``tool()`` aren't all of it: the description defaults
+        to the docstring, and a parameter's comes from its ``Field``.
         """
         problems: list[str] = []
         try:
@@ -904,6 +977,21 @@ class Gatehouse:
                 expected = spec.ctx_param or _CONTEXT_PARAM
                 if tool.context_kwarg != expected:
                     problems.append(f"the SDK injects its Context into {tool.context_kwarg!r}, not {expected!r}")
+                # The annotations are left out: the gate builds them, and
+                # their one string is the title.
+                unseen = _unseen_text(
+                    {
+                        "the name": tool.name,
+                        "the title": tool.title,
+                        "the description": tool.description,
+                        "the input schema": tool.parameters,
+                        "the output schema": tool.output_schema,
+                        "the icons": tool.icons,
+                        "the metadata (_meta)": tool.meta,
+                    }
+                )
+                if unseen:
+                    problems.append(unseen)
         except Exception as exc:  # pragma: no cover - only on an SDK the gate doesn't know
             problems.append(f"the registered tool couldn't be read back ({type(exc).__name__})")
         if problems:
@@ -912,7 +1000,7 @@ class Gatehouse:
                 self.server.remove_tool(spec.name)
             except Exception:
                 pass
-            raise RuntimeError(f"{spec.name}: refusing to register: " + "; ".join(problems))
+            raise RuntimeError(f"{_text.escaped(spec.name)}: refusing to register: " + "; ".join(problems))
 
     # --- the guard -----------------------------------------------------------
 
@@ -1980,6 +2068,57 @@ def _build_spec(
         # the call's one multi-round channel, so the gate can't ask over it.
         round_trip=not _runs_own_rounds(fn),
     )
+
+
+# How much of a refusal's detail fits on its one line.
+_CHARACTERS_NAMED = 3
+_PLACES_NAMED = 4
+
+
+def _unseen_text(served: Mapping[str, Any]) -> str | None:
+    """The characters in ``served`` a person reviewing it couldn't see, as
+    one line saying which and where, or ``None``.
+
+    ``served`` is what the server lists for a tool, a resource, a prompt or
+    itself, each part under what to call it. Every string inside counts:
+    a schema is walked all the way down, keys included. The characters are
+    named by code point and never written out.
+    """
+    places = [
+        f"{_listed([_text.named(ch) for ch in found])} in {_place(part, path, is_key)}"
+        for part, value in served.items()
+        for path, text, is_key in _text.strings(value)
+        if (found := _text.unseen(text))
+    ]
+    if not places:
+        return None
+    more = len(places) - _PLACES_NAMED
+    if more > 0:
+        places[_PLACES_NAMED:] = [f"and {more} more place{'s' if more > 1 else ''}"]
+    return "text the model reads has characters a reviewer can't see: " + "; ".join(places)
+
+
+def _listed(names: list[str]) -> str:
+    if len(names) > _CHARACTERS_NAMED:
+        return ", ".join(names[:_CHARACTERS_NAMED]) + f" and {len(names) - _CHARACTERS_NAMED} more"
+    return " and ".join([", ".join(names[:-1]), names[-1]] if len(names) > 1 else names)
+
+
+def _place(part: str, path: tuple[str | int, ...], is_key: bool) -> str:
+    """Where a string is, for a person: "the description", "the description
+    of parameter 'order_id'", or the part and the path inside it."""
+    if not path:
+        return part
+    if part == "the input schema" and path[0] == "properties" and len(path) > 1:
+        parameter = _text.escaped(str(path[1]))
+        if len(path) == 2 and is_key:
+            return f"the name of parameter '{parameter}'"
+        if len(path) == 3 and not is_key and path[2] in ("description", "title", "default"):
+            return f"the {path[2]} of parameter '{parameter}'"
+    at = ""
+    for step in path:
+        at += f"[{step}]" if isinstance(step, int) else ("." if at else "") + _text.escaped(str(step))
+    return f"{part}, at {at}" + (" (the key itself)" if is_key else "")
 
 
 def _exposed_signature(

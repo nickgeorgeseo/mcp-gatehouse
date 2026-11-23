@@ -177,6 +177,30 @@ place, and that nothing gets around them:
 - Nothing the gate fills can come from the model. A `Load` parameter never
   appears in the input schema, and registration fails if the SDK would put
   it there.
+- A tool whose text for the model has a character nobody reviewing it can
+  see raises at registration. That's the name, title and description, and
+  every string in the input and output schema: parameter descriptions,
+  enum values, defaults. The characters are zero-width ones, bidi
+  overrides, the tag block, variation selectors, control characters other
+  than newline and tab, every space but the plain one, and private-use or
+  unassigned code points. The error names the place and the code point
+  (`U+200B ZERO WIDTH SPACE in the description of parameter 'order_id'`)
+  and never prints the character. Open resources and prompts get the same
+  check on what the server lists for them, and the server's name and
+  instructions get it when the gate is created.
+
+  This catches text that came from somewhere else (a pasted docstring, a
+  description built from config or a database, generated code) and that
+  nobody could see on review. It doesn't stop the server's author, who
+  can take the check out, and it reads only what the server lists, not
+  what a tool returns, a resource reads or a prompt renders. Accented
+  letters, CJK, dashes and plain emoji pass. Some of what is refused is
+  legitimate text, and there is no opt-out yet: the zero-width non-joiner
+  in Persian, the joiner (U+200D) and U+FE0F in emoji sequences, the
+  no-break space French puts before a colon, the ideographic space in
+  Japanese, a carriage return from a file with Windows line endings.
+  "Unassigned" means unassigned in the Unicode tables of the Python you
+  run, so an emoji newer than those is refused too.
 
 Each requirement has a way out, but only one you write down, and the audit
 log shows it:
